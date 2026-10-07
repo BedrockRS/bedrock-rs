@@ -52,6 +52,9 @@ pub const CONTROL_QUEUE: usize = 16;
 /// The message a session kicked by a newer login shows.
 pub const LOGGED_IN_ELSEWHERE: &str = "You logged in from another location.";
 
+/// The message players see when the server stops.
+pub const SERVER_CLOSED: &str = "Server closed";
+
 /// The sessions of logged-in players, by verified UUID.
 #[derive(Debug, Default)]
 pub struct Logins {
@@ -96,6 +99,14 @@ impl Logins {
                 message,
             }),
         )
+    }
+
+    /// Disconnects every logged-in player, as the server stops.
+    pub fn close_all(&self) {
+        self.send_all(&Control::Kick(KickNotice {
+            reason: DisconnectReason::SHUTDOWN,
+            message: SERVER_CLOSED.to_owned(),
+        }));
     }
 
     /// Tells the session logged in as `uuid` to do something. Returns whether
@@ -190,6 +201,22 @@ mod tests {
                 message: "bye".into()
             })
         );
+    }
+
+    #[test]
+    fn closing_disconnects_everyone() {
+        let logins = Logins::new();
+        let (first, mut first_controls) = mpsc::channel(1);
+        let (second, mut second_controls) = mpsc::channel(1);
+        let _first = logins.claim(Uuid::new_v4(), first);
+        let _second = logins.claim(Uuid::new_v4(), second);
+        logins.close_all();
+        let closed = Control::Kick(KickNotice {
+            reason: DisconnectReason::SHUTDOWN,
+            message: SERVER_CLOSED.into(),
+        });
+        assert_eq!(first_controls.try_recv().unwrap(), closed);
+        assert_eq!(second_controls.try_recv().unwrap(), closed);
     }
 
     #[test]

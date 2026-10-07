@@ -1,16 +1,126 @@
 //! The server console: one line per log event, as
 //! `<YY/MM/DD HH:MM:SS.SSS> LEVEL [source] message`, with Minecraft's `§`
-//! colour codes shown as terminal colours.
+//! colour codes shown as terminal colours, and the `> ` line commands are
+//! typed into.
 
 use std::fmt::{self, Write as _};
+use std::io;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bedrockrs_plugins::{PLUGIN_FIELD, PLUGIN_TARGET};
 use chrono::{DateTime, Local};
+use rustyline_async::{Readline, ReadlineError, ReadlineEvent, SharedWriter};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::registry::LookupSpan;
+
+/// What the console's input line shows.
+const PROMPT: &str = "> ";
+
+/// Where log lines go: straight to stdout, or above the `> ` line while a
+/// [`Prompt`] is open, so they never break into what is being typed.
+#[derive(Clone, Default)]
+pub struct ConsoleOutput {
+    prompt: Arc<Mutex<Option<SharedWriter>>>,
+}
+
+impl ConsoleOutput {
+    fn set_prompt(&self, writer: Option<SharedWriter>) {
+        *self.prompt.lock().unwrap_or_else(PoisonError::into_inner) = writer;
+    }
+}
+
+impl<'a> MakeWriter<'a> for ConsoleOutput {
+    type Writer = ConsoleWriter;
+
+    fn make_writer(&'a self) -> ConsoleWriter {
+        ConsoleWriter(
+            self.prompt
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        )
+    }
+}
+
+/// Writes one log line; see [`ConsoleOutput`].
+pub struct ConsoleWriter(Option<SharedWriter>);
+
+impl io::Write for ConsoleWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // The formatter writes each line, newline included, in one call, so
+        // the prompt's writer never holds half a line.
+        if let Some(prompt) = &mut self.0 {
+            if prompt.write(buf).is_ok() {
+                return Ok(buf.len());
+            }
+            // Its queue is full: better an untidy prompt than a lost line.
+            self.0 = None;
+        }
+        io::stdout().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+/// The console's `> ` input line, with editing and history (up and down).
+/// Log lines written through its [`ConsoleOutput`] appear above it.
+pub struct Prompt {
+    readline: Readline,
+    output: ConsoleOutput,
+}
+
+/// Something typed into the [`Prompt`].
+pub enum PromptInput {
+    /// A command.
+    Line(String),
+    /// Ctrl+C, which stops the server.
+    Stop,
+}
+
+impl Prompt {
+    /// Shows the prompt and sends `output`'s lines above it. Needs a
+    /// terminal for both input and output.
+    pub fn open(output: &ConsoleOutput) -> Result<Self, ReadlineError> {
+        let (mut readline, writer) = Readline::new(PROMPT.into())?;
+        // Keep typed commands on screen, but not one cut short by Ctrl+C.
+        readline.should_print_line_on(true, false);
+        output.set_prompt(Some(writer));
+        Ok(Self {
+            readline,
+            output: output.clone(),
+        })
+    }
+
+    /// Waits for the next command or Ctrl+C. Cancel-safe, so it can wait
+    /// in a `select!`; log lines are only drawn while it waits.
+    pub async fn next(&mut self) -> Result<PromptInput, ReadlineError> {
+        loop {
+            match self.readline.readline().await? {
+                ReadlineEvent::Line(line) => {
+                    if !line.trim().is_empty() {
+                        self.readline.add_history_entry(line.clone());
+                        return Ok(PromptInput::Line(line));
+                    }
+                }
+                ReadlineEvent::Interrupted => return Ok(PromptInput::Stop),
+                ReadlineEvent::Eof => {}
+            }
+        }
+    }
+
+    /// Draws the lines still waiting, removes the prompt and gives the
+    /// terminal back, so later lines go straight to stdout.
+    pub fn close(mut self) {
+        self.output.set_prompt(None);
+        let _ = self.readline.flush();
+    }
+}
 
 const RESET: &str = "\x1b[0m";
 /// Bright black: the timestamp and field names.

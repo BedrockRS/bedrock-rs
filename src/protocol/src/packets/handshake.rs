@@ -169,6 +169,7 @@ impl DisconnectReason {
     pub const KICKED: Self = Self(55);
     pub const LOGGED_IN_OTHER_LOCATION: Self = Self(43);
     pub const RESOURCE_PACK_PROBLEM: Self = Self(58);
+    pub const SHUTDOWN: Self = Self(68);
     pub const BAD_PACKET: Self = Self(90);
 }
 

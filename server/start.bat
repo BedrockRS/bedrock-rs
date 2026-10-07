@@ -4,6 +4,5 @@ cd /d "%~dp0"
 
 cargo run --release --manifest-path ..\Cargo.toml
 
-echo.
-echo Server stopped.
-pause
+rem Keep the window open only if the server failed, so the error can be read.
+if errorlevel 1 pause

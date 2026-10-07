@@ -50,6 +50,8 @@ snap = "1.1.2"
 
 # Console timestamps, in local time
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# The console's `> ` input line, kept below the log lines
+rustyline-async = "0.4.9"
 
 # Diagnostics & errors
 anyhow = "1.0.104"

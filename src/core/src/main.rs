@@ -18,7 +18,8 @@
 //!
 //! Commands typed into the console run with every permission, with or without
 //! their `/`: `op <player>` makes the first operator, and `stop` stops the
-//! server, as Ctrl+C does. Operators are kept in `ops.json`.
+//! server, as Ctrl+C does. Operators are kept in `ops.json`. In a terminal,
+//! commands are typed at a `> ` prompt below the log, with history.
 //!
 //! [`config`]: bedrockrs_core::config
 
@@ -27,12 +28,13 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use bedrockrs_core::auth::Authenticator;
 use bedrockrs_core::commands::Sender;
 use bedrockrs_core::config::{CONFIG_FILE, Config};
-use bedrockrs_core::console::ConsoleFormat;
+use bedrockrs_core::console::{ConsoleFormat, ConsoleOutput, Prompt, PromptInput};
 use bedrockrs_core::game_rules::GameRules;
 use bedrockrs_core::ops::{OPS_FILE, Operators};
 use bedrockrs_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
@@ -42,7 +44,12 @@ use bedrockrs_core::world::World;
 use bedrockrs_net::{Connection, Listener, ListenerConfig, ServerStatus};
 use bedrockrs_plugins::{PluginConfig, PluginHost};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
+
+/// Longest the server waits, as it stops, for players' sessions to show them
+/// they were disconnected and save them.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,9 +63,11 @@ async fn main() -> anyhow::Result<()> {
     };
     // Colours only for a terminal, and never with NO_COLOR set (no-color.org).
     let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let output = ConsoleOutput::default();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .event_format(ConsoleFormat { ansi })
+        .with_writer(output.clone())
         .init();
     if loaded.created {
         tracing::info!("Created {CONFIG_FILE} with the default settings");
@@ -140,40 +149,103 @@ async fn main() -> anyhow::Result<()> {
         identity = listener.key_fingerprint(),
         "NetherNet"
     );
-    let mut console = console_lines();
+    let mut console = Console::open(&output);
     tracing::info!("Type '/help' in the console for a list of commands");
+    let mut sessions = JoinSet::new();
 
     loop {
         tokio::select! {
             connection = listener.accept() => match connection {
                 Some(connection) => {
-                    tokio::spawn(serve(connection, Arc::clone(&server)));
+                    sessions.spawn(serve(connection, Arc::clone(&server)));
                 }
                 None => break,
             },
+            // Sessions that ended are forgotten.
+            Some(_) = sessions.join_next() => {}
             // Run here rather than in a task of its own, so what a command
             // prints comes before what it causes, such as stopping.
-            Some(line) = console.recv() => {
-                for line in server.run_command(&Sender::Console, &line).await.lines {
-                    if line.success {
-                        tracing::info!("{}", line.text);
-                    } else {
-                        tracing::warn!("{}", line.text);
+            input = console.next() => match input {
+                PromptInput::Line(line) => {
+                    for line in server.run_command(&Sender::Console, &line).await.lines {
+                        if line.success {
+                            tracing::info!("{}", line.text);
+                        } else {
+                            tracing::warn!("{}", line.text);
+                        }
                     }
                 }
-            }
-            () = server.stop_requested() => {
-                tracing::info!("Server stopped");
-                break;
-            }
+                PromptInput::Stop => break,
+            },
+            () = server.stop_requested() => break,
             result = tokio::signal::ctrl_c() => {
                 result.context("Failed to listen for Ctrl+C")?;
-                tracing::info!("Server stopped");
                 break;
             }
         }
     }
+    console.close();
+    // Players are shown why they were disconnected, rather than timing out,
+    // and saved as they leave.
+    server.logins.close_all();
+    let ended = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+    if ended.is_err() {
+        tracing::debug!(sessions = sessions.len(), "sessions still open at shutdown");
+    }
+    tracing::info!("Server stopped");
     Ok(())
+}
+
+/// Where console commands come from.
+enum Console {
+    /// The `> ` prompt, when the server runs in a terminal.
+    Prompt(Box<Prompt>),
+    /// Plain lines from stdin, as when input is piped in.
+    Lines(mpsc::Receiver<String>),
+    /// No more input.
+    Closed,
+}
+
+impl Console {
+    fn open(output: &ConsoleOutput) -> Self {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            match Prompt::open(output) {
+                Ok(prompt) => return Self::Prompt(Box::new(prompt)),
+                Err(err) => tracing::warn!("Couldn't show the console prompt: {err}"),
+            }
+        }
+        Self::Lines(console_lines())
+    }
+
+    /// The next thing typed. Never returns once input has ended.
+    async fn next(&mut self) -> PromptInput {
+        let input = match self {
+            Self::Prompt(prompt) => prompt.next().await.map_err(|err| {
+                tracing::warn!("Couldn't read the console, so console commands are off: {err}");
+            }),
+            Self::Lines(lines) => lines.recv().await.map(PromptInput::Line).ok_or(()),
+            Self::Closed => Err(()),
+        };
+        match input {
+            Ok(input) => input,
+            Err(()) => {
+                if let Self::Prompt(prompt) = std::mem::replace(self, Self::Closed) {
+                    prompt.close();
+                }
+                std::future::pending().await
+            }
+        }
+    }
+
+    /// Removes the prompt, if there is one, so the terminal is left as it was.
+    fn close(self) {
+        if let Self::Prompt(prompt) = self {
+            prompt.close();
+        }
+    }
 }
 
 /// Lines typed into the console, read on a thread of their own. Stops when

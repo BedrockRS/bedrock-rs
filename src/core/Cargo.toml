@@ -26,6 +26,7 @@ bedrockrs_net.workspace = true
 bedrockrs_plugins.workspace = true
 bedrockrs_protocol.workspace = true
 reqwest.workspace = true
+rustyline-async.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
