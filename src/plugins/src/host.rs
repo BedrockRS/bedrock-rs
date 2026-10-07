@@ -348,8 +348,8 @@ impl Plugins {
         let renamed_from = previous
             .map(|running| running.manifest.name.clone())
             .filter(|previous| *previous != name);
-        let chunk_name = plugin.main_path.display().to_string();
-        match self.engine.load(&name, &chunk_name, &plugin.source) {
+        let main = Path::new(&plugin.manifest.main);
+        match self.engine.load(&name, folder, main, &plugin.source) {
             Ok(_) => {
                 if let Some(old) = renamed_from {
                     self.engine.unload(&old);
@@ -503,6 +503,42 @@ mod tests {
         fs::write(directory.join("greet").join("main.luau"), r#"print("v2")"#).unwrap();
         wait_until("the plugin was not reloaded", || {
             messages.lock().unwrap().contains(&"greeter: v2".to_owned())
+        });
+
+        drop(host);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn saving_a_required_module_reloads_the_plugin() {
+        let directory = plugin_directory("modules");
+        write_plugin(
+            &directory,
+            "split",
+            "split",
+            r#"print(require("./lib/words").greeting)"#,
+        );
+        let words = directory.join("split").join("lib").join("words.luau");
+        fs::create_dir_all(words.parent().unwrap()).unwrap();
+        fs::write(&words, r#"return { greeting = "v1" }"#).unwrap();
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&messages);
+        let output: Output = Arc::new(move |_, _, message| {
+            sink.lock().unwrap().push(message.to_owned());
+        });
+        let config = PluginConfig {
+            directory: directory.clone(),
+            ..PluginConfig::default()
+        };
+        let (actions, _) = tokio_mpsc::channel(1);
+        let host = PluginHost::with_output(config, output, actions).unwrap();
+        assert_eq!(*messages.lock().unwrap(), ["v1"]);
+
+        // Only the module changes; the entry script stays the same.
+        fs::write(&words, r#"return { greeting = "v2" }"#).unwrap();
+        wait_until("the plugin was not reloaded", || {
+            messages.lock().unwrap().contains(&"v2".to_owned())
         });
 
         drop(host);

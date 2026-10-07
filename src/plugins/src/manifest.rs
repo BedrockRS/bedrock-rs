@@ -54,13 +54,53 @@ pub enum ManifestError {
     Invalid(String),
 }
 
-/// A plugin folder read from disk: its manifest and entry script.
+/// A plugin folder read from disk: its manifest, entry script, and the other
+/// scripts it may `require`, so a change to any of them reloads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSource {
     pub manifest: Manifest,
     /// Where the entry script is, for error messages.
     pub main_path: PathBuf,
     pub source: String,
+    /// Every `.luau` and `.lua` file in the folder and below, by path, with
+    /// its contents. Symbolic links are skipped.
+    pub modules: Vec<(PathBuf, String)>,
+}
+
+/// Most scripts a plugin folder may hold, so a stray huge folder cannot make
+/// every rescan read it all.
+const MAX_SCRIPTS: usize = 1024;
+
+/// Reads the scripts in `folder` and below into `scripts`.
+fn read_scripts(folder: &Path, scripts: &mut Vec<(PathBuf, String)>) -> Result<(), ManifestError> {
+    let read_error = |path: &Path, source| ManifestError::Read {
+        path: path.to_owned(),
+        source,
+    };
+    let entries = fs::read_dir(folder).map_err(|source| read_error(folder, source))?;
+    for entry in entries {
+        let entry = entry.map_err(|source| read_error(folder, source))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|source| read_error(&path, source))?;
+        if kind.is_dir() {
+            read_scripts(&path, scripts)?;
+        } else if kind.is_file()
+            && path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("luau") || extension.eq_ignore_ascii_case("lua")
+            })
+        {
+            if scripts.len() == MAX_SCRIPTS {
+                return Err(ManifestError::Invalid(format!(
+                    "the plugin folder holds more than {MAX_SCRIPTS} scripts"
+                )));
+            }
+            let source = fs::read_to_string(&path).map_err(|source| read_error(&path, source))?;
+            scripts.push((path, source));
+        }
+    }
+    Ok(())
 }
 
 impl Manifest {
@@ -132,10 +172,14 @@ impl PluginSource {
             path: main_path.clone(),
             source,
         })?;
+        let mut modules = Vec::new();
+        read_scripts(folder, &mut modules)?;
+        modules.sort();
         Ok(Some(Self {
             manifest,
             main_path,
             source,
+            modules,
         }))
     }
 }

@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn definitions_become_command_trees() {
         let (mut engine, _) = engine();
-        engine.load("warps", "warps.luau", WARP).unwrap();
+        engine.load_script("warps", "warps.luau", WARP).unwrap();
         let commands = engine.commands();
         assert_eq!(commands.len(), 1);
         let spec = &commands[0].spec;
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn handlers_get_their_arguments_and_reply() {
         let (mut engine, _) = engine();
-        engine.load("warps", "warps.luau", WARP).unwrap();
+        engine.load_script("warps", "warps.luau", WARP).unwrap();
 
         let reply =
             engine.run_command(&call(&[], vec![("name", ArgValue::String("spawn".into()))]));
@@ -571,7 +571,7 @@ mod tests {
     fn the_context_describes_the_call() {
         let (mut engine, _) = engine();
         engine
-            .load(
+            .load_script(
                 "who",
                 "who.luau",
                 r#"
@@ -612,7 +612,7 @@ mod tests {
     fn late_replies_reach_the_player_as_chat() {
         let (mut engine, mut actions) = engine();
         engine
-            .load(
+            .load_script(
                 "later",
                 "later.luau",
                 r#"
@@ -675,7 +675,7 @@ mod tests {
         ] {
             let (mut engine, _) = engine();
             let err = engine
-                .load("bad", "bad.luau", &format!("server.command({definition})"))
+                .load_script("bad", "bad.luau", &format!("server.command({definition})"))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(expected), "{definition}: {err}");
@@ -683,7 +683,7 @@ mod tests {
 
         let (mut engine, _) = engine();
         let err = engine
-            .load(
+            .load_script(
                 "twice",
                 "twice.luau",
                 r#"for _ = 1, 2 do server.command({ name = "x", run = print }) end"#,
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn unloading_a_plugin_removes_its_commands() {
         let (mut engine, _) = engine();
-        engine.load("warps", "warps.luau", WARP).unwrap();
+        engine.load_script("warps", "warps.luau", WARP).unwrap();
         assert_eq!(engine.commands().len(), 1);
         engine.unload("warps");
         assert!(engine.commands().is_empty());

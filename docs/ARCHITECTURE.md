@@ -1154,8 +1154,18 @@ DTLS, SCTP, and multi-segment messages both ways.
   2. `print` and a `log.{trace,debug,info,warn,error}` table, installed before
      sandboxing so scripts cannot replace them. Output goes to `tracing` under the
      `plugin` target through a swappable `Output` sink.
-  3. `Lua::sandbox(true)`: read-only libraries and globals, with script writes kept local.
-  4. An interrupt that aborts any call running past the execution limit (1 s by default).
+  3. `require`, confined to the plugin's folder (`luau_require::PluginRequirer`), in
+     place of mlua's default, which follows paths and `.luaurc` aliases anywhere on
+     disk. Modules are tracked as names below the folder, so `../` stops at its top;
+     every file is checked after following links (`canonicalize`) to be inside it;
+     configuration files are never read. Chunk names stay `@plugins/<folder>/<path>`,
+     which `reset` maps back to a module (a folder's `init.luau` being the folder).
+     Modules are cached per VM, and load inside the calling script's deadline.
+  4. `Lua::sandbox(true)`: read-only libraries and globals, with script writes kept local.
+  5. An interrupt that aborts any call running past the execution limit (1 s by default).
+
+  `PluginSource` carries every `.luau`/`.lua` file in the folder (up to 1024, links
+  skipped), so saving a required module reloads the plugin like its entry script.
 - **JS/TS (`js` feature):** a `deno_core` `JsRuntime`. TypeScript is transpiled on load
   with `deno_ast`, so there is still no build step. Pulls a prebuilt V8 of more than
   100 MB.

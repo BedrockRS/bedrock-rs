@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::Level;
 
 use crate::luau_commands::{self, Registered};
+use crate::luau_require::PluginRequirer;
 use crate::{
     Action, CommandCall, CommandReply, DAMAGE_CAUSES, Event, GAME_MODE_VALUES, Output, Player,
     PluginCommand,
@@ -63,18 +65,33 @@ impl LuauEngine {
         }
     }
 
-    /// Runs `source` as plugin `name` in a fresh VM. The new VM replaces a running
-    /// plugin of the same name only if the script succeeds. Returns whether it did.
-    pub fn load(&mut self, name: &str, chunk_name: &str, source: &str) -> mlua::Result<bool> {
-        let plugin = self.create_plugin(name)?;
+    /// Runs `source`, the script `main` in the plugin's `folder`, as plugin
+    /// `name` in a fresh VM, where `require` loads modules from that folder.
+    /// The new VM replaces a running plugin of the same name only if the
+    /// script succeeds. Returns whether it did.
+    pub fn load(
+        &mut self,
+        name: &str,
+        folder: &Path,
+        main: &Path,
+        source: &str,
+    ) -> mlua::Result<bool> {
+        let plugin = self.create_plugin(name, folder)?;
         plugin.run(self.limits.execution, || {
             plugin
                 .lua
                 .load(source)
-                .set_name(format!("@{chunk_name}"))
+                .set_name(PluginRequirer::chunk_name(folder, main))
                 .exec()
         })?;
         Ok(self.plugins.insert(name.to_owned(), plugin).is_some())
+    }
+
+    /// Runs `source` as plugin `name` from a script called `main` in the
+    /// working directory, for tests.
+    #[cfg(test)]
+    pub fn load_script(&mut self, name: &str, main: &str, source: &str) -> mlua::Result<bool> {
+        self.load(name, Path::new("."), Path::new(main), source)
     }
 
     /// Stops plugin `name`, dropping its VM. Returns whether it was running.
@@ -141,10 +158,14 @@ impl LuauEngine {
         cancelled.get()
     }
 
-    fn create_plugin(&self, name: &str) -> mlua::Result<Plugin> {
+    fn create_plugin(&self, name: &str, folder: &Path) -> mlua::Result<Plugin> {
         let lua = Lua::new();
         lua.set_memory_limit(self.limits.memory)?;
         // Globals become read-only once sandboxed, so install ours first.
+        // mlua's own `require` reads anywhere on disk; the plugin's stays in
+        // its folder.
+        let require = lua.create_require_function(PluginRequirer::new(folder))?;
+        lua.globals().raw_set("require", require)?;
         install_output(&lua, name, &self.output)?;
         let commands = Registered::default();
         install_server(&lua, &self.actions, &self.roster, &commands)?;
@@ -606,7 +627,7 @@ mod tests {
     fn print_formats_arguments_like_luau() {
         let (mut engine, lines) = default_engine();
         engine
-            .load(
+            .load_script(
                 "hello",
                 "hello.luau",
                 r#"
@@ -628,7 +649,7 @@ mod tests {
     fn log_functions_use_their_levels() {
         let (mut engine, lines) = default_engine();
         engine
-            .load(
+            .load_script(
                 "levels",
                 "levels.luau",
                 r#"log.warn("careful") log.error("broken", 1)"#,
@@ -653,7 +674,7 @@ mod tests {
     fn luau_syntax_and_type_annotations_are_supported() {
         let (mut engine, lines) = default_engine();
         engine
-            .load(
+            .load_script(
                 "typed",
                 "typed.luau",
                 "local count: number = 2\ncount += 1\nprint(`count is {count}`)",
@@ -666,7 +687,7 @@ mod tests {
     fn sandbox_makes_libraries_read_only() {
         let (mut engine, _) = default_engine();
         let err = engine
-            .load("vandal", "vandal.luau", "string.upper = nil")
+            .load_script("vandal", "vandal.luau", "string.upper = nil")
             .unwrap_err();
         assert!(err.to_string().contains("readonly"), "{err}");
     }
@@ -674,8 +695,10 @@ mod tests {
     #[test]
     fn plugins_do_not_share_globals() {
         let (mut engine, lines) = default_engine();
-        engine.load("a", "a.luau", r#"shared = "from a""#).unwrap();
-        engine.load("b", "b.luau", "print(shared)").unwrap();
+        engine
+            .load_script("a", "a.luau", r#"shared = "from a""#)
+            .unwrap();
+        engine.load_script("b", "b.luau", "print(shared)").unwrap();
         assert_eq!(messages(&lines), vec!["nil"]);
     }
 
@@ -684,7 +707,7 @@ mod tests {
         let (mut engine, _) = default_engine();
         let started = Instant::now();
         let err = engine
-            .load("spin", "spin.luau", "while true do end")
+            .load_script("spin", "spin.luau", "while true do end")
             .unwrap_err();
         assert!(err.to_string().contains("execution time limit"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -698,7 +721,7 @@ mod tests {
             execution: Duration::from_secs(5),
         });
         let err = engine
-            .load(
+            .load_script(
                 "hog",
                 "hog.luau",
                 "local t = {} for i = 1, 1e7 do t[i] = string.rep('x', 64) .. i end",
@@ -710,10 +733,18 @@ mod tests {
     #[test]
     fn failed_reload_keeps_the_running_version() {
         let (mut engine, _) = default_engine();
-        assert!(!engine.load("hello", "hello.luau", "print('v1')").unwrap());
-        assert!(engine.load("hello", "hello.luau", "print(").is_err());
+        assert!(
+            !engine
+                .load_script("hello", "hello.luau", "print('v1')")
+                .unwrap()
+        );
+        assert!(engine.load_script("hello", "hello.luau", "print(").is_err());
         assert_eq!(engine.names(), vec!["hello"]);
-        assert!(engine.load("hello", "hello.luau", "print('v2')").unwrap());
+        assert!(
+            engine
+                .load_script("hello", "hello.luau", "print('v2')")
+                .unwrap()
+        );
         assert!(engine.unload("hello"));
         assert!(!engine.unload("hello"));
     }
@@ -722,7 +753,7 @@ mod tests {
     fn join_handlers_get_the_player_and_can_broadcast() {
         let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
         engine
-            .load(
+            .load_script(
                 "welcome",
                 "welcome.luau",
                 r#"
@@ -753,7 +784,7 @@ mod tests {
     fn unknown_events_are_rejected() {
         let (mut engine, _) = default_engine();
         let err = engine
-            .load(
+            .load_script(
                 "typo",
                 "typo.luau",
                 r#"server.on("player_joined", function() end)"#,
@@ -766,7 +797,7 @@ mod tests {
     fn a_failing_handler_does_not_stop_the_others() {
         let (mut engine, lines) = default_engine();
         engine
-            .load(
+            .load_script(
                 "a",
                 "a.luau",
                 r#"
@@ -776,7 +807,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .load(
+            .load_script(
                 "b",
                 "b.luau",
                 r#"server.on("player_join", function(event) local player = event.player print("b saw", player.name) end)"#,
@@ -790,7 +821,7 @@ mod tests {
     fn runaway_handlers_are_stopped() {
         let (mut engine, lines) = default_engine();
         engine
-            .load(
+            .load_script(
                 "spin",
                 "spin.luau",
                 r#"
@@ -811,8 +842,12 @@ mod tests {
         let source = |version: &str| {
             format!(r#"server.on("player_join", function() print("{version}") end)"#)
         };
-        engine.load("hello", "hello.luau", &source("v1")).unwrap();
-        engine.load("hello", "hello.luau", &source("v2")).unwrap();
+        engine
+            .load_script("hello", "hello.luau", &source("v1"))
+            .unwrap();
+        engine
+            .load_script("hello", "hello.luau", &source("v2"))
+            .unwrap();
         engine.dispatch(&steve_joins());
         assert_eq!(messages(&lines), ["v2"]);
     }
@@ -821,11 +856,11 @@ mod tests {
     fn broadcast_rejects_empty_messages_and_the_api_is_read_only() {
         let (mut engine, _) = default_engine();
         let err = engine
-            .load("empty", "empty.luau", r#"server.broadcast("")"#)
+            .load_script("empty", "empty.luau", r#"server.broadcast("")"#)
             .unwrap_err();
         assert!(err.to_string().contains("empty message"), "{err}");
         let err = engine
-            .load("vandal", "vandal.luau", "server.broadcast = nil")
+            .load_script("vandal", "vandal.luau", "server.broadcast = nil")
             .unwrap_err();
         assert!(err.to_string().contains("readonly"), "{err}");
     }
@@ -841,7 +876,7 @@ mod tests {
     fn chat_can_be_cancelled_and_later_handlers_see_it() {
         let (mut engine, lines) = default_engine();
         engine
-            .load(
+            .load_script(
                 "filter",
                 "filter.luau",
                 r#"
@@ -852,7 +887,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .load(
+            .load_script(
                 "logger",
                 "logger.luau",
                 r#"
@@ -878,7 +913,7 @@ mod tests {
     fn quit_and_block_events_describe_what_happened() {
         let (mut engine, lines) = default_engine();
         engine
-            .load(
+            .load_script(
                 "watch",
                 "watch.luau",
                 r#"
@@ -918,7 +953,7 @@ mod tests {
     fn players_can_be_messaged_and_kicked_through_their_methods() {
         let (mut engine, _, mut actions) = engine_with_actions(DEFAULT_LIMITS);
         engine
-            .load(
+            .load_script(
                 "moderator",
                 "moderator.luau",
                 r#"
@@ -967,7 +1002,7 @@ mod tests {
     fn player_methods_check_their_arguments_and_players_are_read_only() {
         let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
         engine
-            .load(
+            .load_script(
                 "careless",
                 "careless.luau",
                 r#"
@@ -1000,7 +1035,7 @@ mod tests {
     fn online_players_can_be_looked_up_by_uuid() {
         let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
         engine
-            .load(
+            .load_script(
                 "lookup",
                 "lookup.luau",
                 r#"
@@ -1053,7 +1088,7 @@ mod tests {
         // A plugin loaded later sees who is already online.
         engine.dispatch(&steve_joins());
         engine
-            .load(
+            .load_script(
                 "late",
                 "late.luau",
                 r#"print(server.player("174319cc-f69f-30d8-a279-6ace57f2011e").name)"#,
@@ -1066,7 +1101,7 @@ mod tests {
     fn damage_can_be_cancelled_and_health_changed() {
         let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
         engine
-            .load(
+            .load_script(
                 "medic",
                 "medic.luau",
                 r#"
@@ -1149,7 +1184,7 @@ mod tests {
     fn joins_and_quits_can_replace_the_vanilla_message() {
         let (mut engine, _, mut actions) = engine_with_actions(DEFAULT_LIMITS);
         engine
-            .load(
+            .load_script(
                 "greeter",
                 "greeter.luau",
                 r#"

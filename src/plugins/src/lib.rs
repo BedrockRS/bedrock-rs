@@ -29,6 +29,8 @@ mod host;
 mod luau;
 #[cfg(feature = "luau")]
 mod luau_commands;
+#[cfg(feature = "luau")]
+mod luau_require;
 mod manifest;
 mod output;
 
