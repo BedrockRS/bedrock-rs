@@ -140,7 +140,7 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
     serve(&mut connection, &server, &mut session, &mut joined).await;
     // However the session ended, remember where the player left.
     if let Some((uuid, player)) = session.saved_player() {
-        tracing::info!(%uuid, "{} left the game", session.player());
+        tracing::info!("{} left the game", session.player());
         server.save_player(uuid, &player);
     }
     // Plugins that heard of the join hear of the quit, and may replace
@@ -589,7 +589,7 @@ async fn send<'a>(
             .await
             .is_ok(),
         Err(err) => {
-            tracing::warn!(network_id = connection.network_id(), %err, "failed to encode a batch");
+            tracing::warn!("Couldn't encode packets for a client: {err}");
             false
         }
     }
@@ -969,7 +969,7 @@ impl Session {
     fn die(&mut self, cause: DamageCause) -> Reply {
         self.health.set(0.0);
         self.fall_distance = 0.0;
-        tracing::info!(uuid = %self.uuid, cause = cause.name(), "{} died", self.player);
+        tracing::debug!(uuid = %self.uuid, cause = cause.name(), "{} died", self.player);
         let mut packets = vec![
             self.health_attribute().encode(),
             ActorEvent::new(self.entity_id, ActorEvent::DEATH).encode(),
@@ -1012,7 +1012,7 @@ impl Session {
         self.fall_distance = 0.0;
         self.flying = self.game_mode == GameMode::Spectator;
         self.movement = self.spawn_movement();
-        tracing::info!(uuid = %self.uuid, "{} respawned", self.player);
+        tracing::debug!(uuid = %self.uuid, "{} respawned", self.player);
         let mut packets = vec![
             Respawn {
                 position: self.movement.position,
@@ -1148,7 +1148,7 @@ impl Session {
             GameMode::Spectator => true,
             _ => self.flying && mode.may_fly(),
         };
-        tracing::info!(uuid = %self.uuid, "{}'s game mode is now {}", self.player, mode.name());
+        tracing::info!("{}'s game mode is now {}", self.player, mode.name());
         if !self.stage.in_world() {
             return Reply::default();
         }
@@ -1281,9 +1281,8 @@ impl Session {
     ) -> Result<Reply, SessionError> {
         if request.client_protocol != PROTOCOL_VERSION {
             tracing::info!(
-                client_protocol = request.client_protocol,
-                server_protocol = PROTOCOL_VERSION,
-                "rejecting a client on another protocol version"
+                "Turned away a client on protocol {}; this server runs protocol {PROTOCOL_VERSION} ({GAME_VERSION})",
+                request.client_protocol
             );
             let status = if request.client_protocol < PROTOCOL_VERSION {
                 PlayStatusCode::LoginFailedClient
@@ -1320,7 +1319,7 @@ impl Session {
         self.skin = match client_skin(&request.client_data) {
             Ok(skin) => Some(Arc::new(skin)),
             Err(err) => {
-                tracing::warn!(%err, "not using a client's skin");
+                tracing::warn!("Couldn't use a player's skin, so they get the default one: {err}");
                 None
             }
         };
@@ -1340,7 +1339,9 @@ impl Session {
         let claims = match result {
             Ok(claims) => claims,
             Err(err) => {
-                tracing::info!(%err, "rejecting a player who could not be authenticated");
+                tracing::info!(
+                    "Turned away a player whose Microsoft account couldn't be verified: {err}"
+                );
                 return Reply::disconnect(
                     DisconnectReason::NOT_AUTHENTICATED,
                     format!("BedrockRS: could not verify your Microsoft account.\n{err}"),
@@ -1358,10 +1359,7 @@ impl Session {
                 .and_then(|key| bedrockrs_net::identity::parse_public_key(key).ok())
                 .is_some_and(|key| key == identity.public_key);
             if !matches {
-                tracing::warn!(
-                    xuid = ?claims.xuid,
-                    "Login key does not match the key proven during signaling"
-                );
+                tracing::warn!("Turned away a login that doesn't match its connection");
                 return Reply::disconnect(
                     DisconnectReason::NOT_AUTHENTICATED,
                     "BedrockRS: your login does not match this connection.",
@@ -1392,7 +1390,10 @@ impl Session {
                 match GameMode::from_name(name) {
                     Some(mode) => self.game_mode = mode,
                     None => {
-                        tracing::warn!(uuid = %self.uuid, mode = %name, "ignoring an unknown saved game mode")
+                        tracing::warn!(
+                            "Ignored {}'s saved game mode {name:?}, which doesn't exist",
+                            self.player
+                        )
                     }
                 }
             }
@@ -1586,7 +1587,7 @@ impl Session {
 
     fn initialized(&mut self, packet: SetLocalPlayerAsInitialized) -> Reply {
         if packet.entity_runtime_id != self.entity_id {
-            tracing::warn!(
+            tracing::debug!(
                 runtime_id = packet.entity_runtime_id,
                 "client initialized an unexpected entity"
             );
@@ -1595,7 +1596,8 @@ impl Session {
             return Reply::default();
         }
         self.stage = Stage::InGame;
-        tracing::info!(uuid = %self.uuid, "{} joined the game", self.player);
+        tracing::info!("{} joined the game", self.player);
+        tracing::debug!(uuid = %self.uuid, "joined");
         // What they hold goes in with them: a slot chosen while the world
         // was loading had nobody to tell yet.
         self.shown_held = self

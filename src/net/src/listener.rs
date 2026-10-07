@@ -174,7 +174,7 @@ impl Listener {
         let router = signaling::router(sessions, status_updates, negotiation_timeout);
         tasks.push(tokio::spawn(async move {
             if let Err(err) = axum::serve(tcp, router).await {
-                tracing::error!(%err, "NetherNet signaling server failed");
+                tracing::error!("The server stopped accepting connections: {err}");
             }
         }));
 
@@ -435,7 +435,7 @@ fn local_candidates(
             .iter()
             .find(|addr| addr.is_ipv4() == ip.is_ipv4())
         else {
-            tracing::warn!(%ip, "no media socket of the same address family; not advertising");
+            tracing::warn!("Can't advertise {ip}: no network address of the same kind is in use");
             continue;
         };
         let addr = SocketAddr::new(ip, base.port());

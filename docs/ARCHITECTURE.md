@@ -1188,8 +1188,9 @@ DTLS, SCTP, and multi-segment messages both ways.
 
   ```toml
   [logs]
-  chat = true           # the `chat` target at info, or off
-  system_noise = false  # our crates at debug and libraries at info, instead of info and warn
+  level = "info"  # error, warn, info, debug or trace: our crates and plugins at it,
+                  # libraries a step quieter (warn up to info, then info, then debug)
+  chat = true     # the `chat` target at info, or off
 
   [players]
   default_game_mode = "creative"  # for players joining for the first time
@@ -1197,7 +1198,14 @@ DTLS, SCTP, and multi-segment messages both ways.
 
   `[logs]` becomes the log filter, e.g. `warn,bedrockrs=info,plugin=info,chat=info`
   (targets match by prefix, so `bedrockrs` covers every crate). `RUST_LOG`, when set,
-  replaces it. Network settings and the world directory are still environment
+  replaces it. `system_noise = true`, from before `level`, still means `debug`, with a
+  warning to switch.
+- **Console lines (2026-10-07):** info, warnings and errors are plain sentences that
+  stand on their own ("Opened world: world", "Listening on 0.0.0.0:19132", "Steve
+  joined the game"). Structured fields only show on DEBUG and TRACE lines. The
+  server's own lines are tagged `[BedrockRS]` in Minecraft's gold, the plugin system's
+  `[Plugins]`; plugin output (`[hello]`), chat and libraries keep their own tags, in
+  cyan. Routine activity and the details behind a line go to debug. Network settings and the world directory are still environment
   variables.
 
 ## 5. Approved decisions (2026-09-25)

@@ -158,8 +158,8 @@ To make yourself an operator, join the server and type `op <your name>` in the c
 
 ```toml
 [logs]
+level = "info"                  # error, warn, info, debug or trace
 chat = true                     # show chat in the console
-system_noise = false            # show routine internal activity
 
 [players]
 default_game_mode = "creative"  # for players joining for the first time

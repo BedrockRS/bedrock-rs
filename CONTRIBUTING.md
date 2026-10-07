@@ -130,7 +130,7 @@ A good bug report includes:
 * BedrockRS version or commit
 * Operating system
 * Minecraft: Bedrock Edition version and platform
-* Relevant console output (turn on `system_noise` in `bedrockrs.toml` for more detail)
+* Relevant console output (set `level = "debug"` under `[logs]` in `bedrockrs.toml` for more detail)
 
 For crashes, please include the full panic message and backtrace (`RUST_BACKTRACE=1`).
 

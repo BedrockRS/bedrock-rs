@@ -114,7 +114,7 @@ impl Operators {
             .collect();
         let text = serde_json::to_string_pretty(&entries).expect("operators serialize");
         if let Err(err) = fs::write(path, text + "\n") {
-            tracing::error!(path = %path.display(), %err, "failed to save the operators");
+            tracing::error!("Couldn't save the operators to {}: {err}", path.display());
         }
     }
 

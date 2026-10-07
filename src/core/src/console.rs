@@ -1,6 +1,6 @@
 //! The server console: one line per log event, as
-//! `<YY/MM/DD HH:MM:SS.SSS> LEVEL [target] message key=value…`, with Minecraft's
-//! `§` colour codes shown as terminal colours.
+//! `<YY/MM/DD HH:MM:SS.SSS> LEVEL [source] message`, with Minecraft's `§`
+//! colour codes shown as terminal colours.
 
 use std::fmt::{self, Write as _};
 
@@ -16,6 +16,11 @@ const RESET: &str = "\x1b[0m";
 /// Bright black: the timestamp and field names.
 const GREY: &str = "\x1b[90m";
 const CYAN: &str = "\x1b[36m";
+/// Minecraft's gold (`§6`), for the server's own `[BedrockRS]` tag.
+const ORANGE: &str = "\x1b[38;2;255;170;0m";
+
+/// The tag of the server's own lines.
+const SERVER_TAG: &str = "BedrockRS";
 
 /// How timestamps are written (chrono's `strftime` syntax); `%.3f` is milliseconds.
 const TIMESTAMP: &str = "%y/%m/%d %H:%M:%S%.3f";
@@ -25,9 +30,12 @@ const TIMESTAMP: &str = "%y/%m/%d %H:%M:%S%.3f";
 /// - the local time, grey;
 /// - the level in three letters, green, yellow or red for INF, WRN and ERR
 ///   (blue DBG, magenta TRC);
-/// - the target in cyan brackets: the plugin's name for plugin output, and
-///   otherwise the crate that logged, `bedrockrs` for the server's core;
-/// - the message, then any other fields as grey `key=` and their value.
+/// - where the line comes from, in brackets: `BedrockRS` in orange for the
+///   server's own lines, and in cyan `Plugins` for the plugin system, the
+///   plugin's name for plugin output, `chat` for chat, and the library for
+///   libraries;
+/// - the message. On DEBUG and TRACE lines, any other fields follow as grey
+///   `key=` and their value; other lines are meant to read on their own.
 ///
 /// `§` codes in messages and values become ANSI colours, or are removed
 /// when the console does not take colours.
@@ -84,14 +92,18 @@ impl ConsoleFormat {
         if self.ansi {
             write!(
                 out,
-                "{GREY}<{time}>{RESET} {}{level_name}{RESET} {CYAN}[{label}]{RESET} ",
+                "{GREY}<{time}>{RESET} {}{level_name}{RESET} ",
                 level_colour(level)
             )?;
+            let colour = if label == SERVER_TAG { ORANGE } else { CYAN };
+            write!(out, "{colour}[{label}]{RESET} ")?;
         } else {
-            write!(out, "<{time}> {level_name} [{label}] ")?;
+            write!(out, "<{time}> {level_name} ")?;
+            write!(out, "[{label}] ")?;
         }
         out.write_str(&colourize(&fields.message, self.ansi))?;
-        for (name, value) in &fields.others {
+        let details = matches!(level, Level::DEBUG | Level::TRACE);
+        for (name, value) in fields.others.iter().filter(|_| details) {
             if self.ansi {
                 write!(out, " {GREY}{name}={RESET}{}", colourize(value, true))?;
             } else {
@@ -102,11 +114,13 @@ impl ConsoleFormat {
     }
 }
 
-/// What logged an event, from its target: the crate, with the server's core
-/// (`bedrockrs_core`, and the `bedrockrs` binary) shown as `bedrockrs`.
+/// Where an event comes from, from its target: `Plugins` for the plugin
+/// system, `BedrockRS` for the rest of the server, otherwise the crate (or
+/// `chat`) that logged it.
 fn source(target: &str) -> &str {
     match target.split("::").next().unwrap_or(target) {
-        "bedrockrs_core" => "bedrockrs",
+        "bedrockrs_plugins" => "Plugins",
+        name if name.starts_with("bedrockrs") => SERVER_TAG,
         name => name,
     }
 }
@@ -307,25 +321,48 @@ mod tests {
             ),
             "<26/09/26 14:30:05.123> INF [hello] Hello from Luau!\n"
         );
+        // The server's own lines need no source, and only debugging shows
+        // the details.
         assert_eq!(
             line(
                 false,
                 Level::INFO,
                 "bedrockrs_core::session",
-                "player logged in",
-                &[]
+                "Steve joined the game",
+                &[("uuid", "1234")]
             ),
-            "<26/09/26 14:30:05.123> INF [bedrockrs] player logged in\n"
+            "<26/09/26 14:30:05.123> INF [BedrockRS] Steve joined the game\n"
         );
         assert_eq!(
             line(
                 false,
-                Level::WARN,
+                Level::DEBUG,
                 "bedrockrs_net::listener",
                 "§cslow",
                 &[("peers", "2")]
             ),
-            "<26/09/26 14:30:05.123> WRN [bedrockrs_net] slow peers=2\n"
+            "<26/09/26 14:30:05.123> DBG [BedrockRS] slow peers=2\n"
+        );
+        assert_eq!(
+            line(
+                false,
+                Level::INFO,
+                "bedrockrs_plugins::host",
+                "Loaded plugin: hello (1.3.0, Mistvale Studios)",
+                &[]
+            ),
+            "<26/09/26 14:30:05.123> INF [Plugins] Loaded plugin: hello (1.3.0, Mistvale Studios)\n"
+        );
+        assert_eq!(
+            line(
+                false,
+                Level::INFO,
+                "str0m::ice",
+                "ICE ready",
+                &[("pair", "x")]
+            ),
+            "<26/09/26 14:30:05.123> INF [str0m] ICE ready\n",
+            "libraries keep their name"
         );
         assert_eq!(
             line(false, Level::ERROR, "chat", "[broadcast] hi", &[]),
@@ -334,16 +371,25 @@ mod tests {
     }
 
     #[test]
+    fn the_server_tag_is_orange() {
+        assert_eq!(
+            line(true, Level::INFO, "bedrockrs", "Opened world: world", &[]),
+            "\x1b[90m<26/09/26 14:30:05.123>\x1b[0m \x1b[32mINF\x1b[0m \
+             \x1b[38;2;255;170;0m[BedrockRS]\x1b[0m Opened world: world\n"
+        );
+    }
+
+    #[test]
     fn each_part_has_its_colour() {
         assert_eq!(
             line(
                 true,
-                Level::INFO,
-                "bedrockrs",
+                Level::DEBUG,
+                "str0m",
                 "§eWelcome",
                 &[("players", "2")]
             ),
-            "\x1b[90m<26/09/26 14:30:05.123>\x1b[0m \x1b[32mINF\x1b[0m \x1b[36m[bedrockrs]\x1b[0m \
+            "\x1b[90m<26/09/26 14:30:05.123>\x1b[0m \x1b[34mDBG\x1b[0m \x1b[36m[str0m]\x1b[0m \
              \x1b[0m\x1b[38;2;255;255;85mWelcome\x1b[0m \x1b[90mplayers=\x1b[0m2\n"
         );
     }

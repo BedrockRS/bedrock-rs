@@ -218,7 +218,10 @@ impl Online {
 
     fn send(&self, packet: Bytes) {
         if let Err(TrySendError::Full(_)) = self.outbound.try_send(packet) {
-            tracing::warn!(player = %self.profile.name, "dropped a packet for a player who is not keeping up");
+            tracing::warn!(
+                "{} isn't keeping up, so a packet to them was dropped",
+                self.profile.name
+            );
         }
     }
 }
@@ -455,8 +458,8 @@ impl Players {
         let text = Text::system(message);
         if text.message.is_empty() || text.message.len() > Text::MAX_MESSAGE_LEN {
             tracing::warn!(
-                len = text.message.len(),
-                "not sending a message that is empty or too long"
+                "Didn't send a message that is empty or too long ({} bytes)",
+                text.message.len()
             );
             return false;
         }
@@ -513,8 +516,8 @@ impl Players {
     fn broadcast_text(&self, text: Text) {
         if text.message.is_empty() || text.message.len() > Text::MAX_MESSAGE_LEN {
             tracing::warn!(
-                len = text.message.len(),
-                "not broadcasting a message that is empty or too long"
+                "Didn't broadcast a message that is empty or too long ({} bytes)",
+                text.message.len()
             );
             return;
         }

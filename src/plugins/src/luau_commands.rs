@@ -110,7 +110,11 @@ pub(crate) fn run(lua: &Lua, call: &CommandCall) -> mlua::Result<CommandReply> {
         Ok(Value::String(text)) => reply.push_ok(text.to_str()?.to_owned()),
         Ok(_) => {}
         Err(err) => {
-            tracing::error!(command = %call.command, "command handler failed: {err}");
+            tracing::error!(
+                "Plugin {} failed running /{}: {err}",
+                call.plugin,
+                call.command
+            );
             reply.push_error(HANDLER_FAILED);
         }
     }

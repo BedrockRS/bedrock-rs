@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use mlua::{Function, Lua, MultiValue, Table, Value, VmState};
@@ -23,6 +23,40 @@ const HANDLERS: &str = "bedrockrs.handlers";
 
 /// What a kicked player is shown when the plugin gives no reason.
 const DEFAULT_KICK_REASON: &str = "You were kicked from the server.";
+
+/// Lines a loading plugin printed, while it loads; `None` once it has.
+type Hold = Arc<Mutex<Option<Vec<(Level, String)>>>>;
+
+/// Output that goes into `hold` while it holds lines, and to `output` after.
+fn held_back(output: &Output, hold: &Hold) -> Output {
+    let (output, hold) = (Arc::clone(output), Arc::clone(hold));
+    Arc::new(move |plugin, level, message| {
+        let mut held = hold.lock().unwrap_or_else(PoisonError::into_inner);
+        match held.as_mut() {
+            Some(lines) => lines.push((level, message.to_owned())),
+            None => {
+                drop(held);
+                output(plugin, level, message);
+            }
+        }
+    })
+}
+
+/// What a plugin printed while it loaded, released when this is dropped.
+#[must_use = "the plugin's output comes out when this is dropped"]
+pub(crate) struct HeldOutput {
+    plugin: String,
+    lines: Vec<(Level, String)>,
+    output: Output,
+}
+
+impl Drop for HeldOutput {
+    fn drop(&mut self) {
+        for (level, message) in self.lines.drain(..) {
+            (self.output)(&self.plugin, level, &message);
+        }
+    }
+}
 
 /// Resource limits applied to every plugin VM.
 #[derive(Debug, Clone, Copy)]
@@ -69,29 +103,47 @@ impl LuauEngine {
     /// `name` in a fresh VM, where `require` loads modules from that folder.
     /// The new VM replaces a running plugin of the same name only if the
     /// script succeeds. Returns whether it did.
+    ///
+    /// What the script prints while it loads is held back, so the caller can
+    /// first say whether it loaded: it comes out when the [`HeldOutput`] is
+    /// dropped.
     pub fn load(
         &mut self,
         name: &str,
         folder: &Path,
         main: &Path,
         source: &str,
-    ) -> mlua::Result<bool> {
-        let plugin = self.create_plugin(name, folder)?;
-        plugin.run(self.limits.execution, || {
-            plugin
-                .lua
-                .load(source)
-                .set_name(PluginRequirer::chunk_name(folder, main))
-                .exec()
-        })?;
-        Ok(self.plugins.insert(name.to_owned(), plugin).is_some())
+    ) -> (mlua::Result<bool>, HeldOutput) {
+        let hold: Hold = Arc::new(Mutex::new(Some(Vec::new())));
+        let result = self.create_plugin(name, folder, &hold).and_then(|plugin| {
+            plugin.run(self.limits.execution, || {
+                plugin
+                    .lua
+                    .load(source)
+                    .set_name(PluginRequirer::chunk_name(folder, main))
+                    .exec()
+            })?;
+            Ok(self.plugins.insert(name.to_owned(), plugin).is_some())
+        });
+        // From now on the plugin prints as it goes.
+        let lines = hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        let held = HeldOutput {
+            plugin: name.to_owned(),
+            lines,
+            output: Arc::clone(&self.output),
+        };
+        (result, held)
     }
 
     /// Runs `source` as plugin `name` from a script called `main` in the
-    /// working directory, for tests.
+    /// working directory, for tests; what it prints comes out right away.
     #[cfg(test)]
     pub fn load_script(&mut self, name: &str, main: &str, source: &str) -> mlua::Result<bool> {
-        self.load(name, Path::new("."), Path::new(main), source)
+        self.load(name, Path::new("."), Path::new(main), source).0
     }
 
     /// Stops plugin `name`, dropping its VM. Returns whether it was running.
@@ -128,9 +180,15 @@ impl LuauEngine {
             return CommandReply::error(format!("/{} is no longer available.", call.command));
         };
         plugin
-            .run(self.limits.execution, || luau_commands::run(&plugin.lua, call))
+            .run(self.limits.execution, || {
+                luau_commands::run(&plugin.lua, call)
+            })
             .unwrap_or_else(|err| {
-                tracing::error!(plugin = %call.plugin, command = %call.command, "command failed: {err}");
+                tracing::error!(
+                    "Plugin {} failed running /{}: {err}",
+                    call.plugin,
+                    call.command
+                );
                 CommandReply::error("An error occurred while running this command.")
             })
     }
@@ -158,7 +216,7 @@ impl LuauEngine {
         cancelled.get()
     }
 
-    fn create_plugin(&self, name: &str, folder: &Path) -> mlua::Result<Plugin> {
+    fn create_plugin(&self, name: &str, folder: &Path, hold: &Hold) -> mlua::Result<Plugin> {
         let lua = Lua::new();
         lua.set_memory_limit(self.limits.memory)?;
         // Globals become read-only once sandboxed, so install ours first.
@@ -166,7 +224,8 @@ impl LuauEngine {
         // its folder.
         let require = lua.create_require_function(PluginRequirer::new(folder))?;
         lua.globals().raw_set("require", require)?;
-        install_output(&lua, name, &self.output)?;
+        let output = held_back(&self.output, hold);
+        install_output(&lua, name, &output)?;
         let commands = Registered::default();
         install_server(&lua, &self.actions, &self.roster, &commands)?;
         lua.sandbox(true)?;
@@ -202,9 +261,8 @@ impl Plugin {
             Ok(handlers) => handlers,
             Err(err) => {
                 tracing::error!(
-                    plugin,
-                    event = event.name(),
-                    "failed to look up handlers: {err}"
+                    "Couldn't find plugin {plugin}'s {} handlers: {err}",
+                    event.name()
                 );
                 return;
             }
@@ -216,16 +274,15 @@ impl Plugin {
             Ok(payload) => payload,
             Err(err) => {
                 tracing::error!(
-                    plugin,
-                    event = event.name(),
-                    "failed to build the event: {err}"
+                    "Couldn't give plugin {plugin} the {} event: {err}",
+                    event.name()
                 );
                 return;
             }
         };
         for handler in handlers {
             if let Err(err) = self.run(limit, || handler.call::<()>(&payload)) {
-                tracing::error!(plugin, event = event.name(), "event handler failed: {err}");
+                tracing::error!("Plugin {plugin}'s {} handler failed: {err}", event.name());
             }
         }
     }
@@ -1211,5 +1268,41 @@ mod tests {
             uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
         });
         assert!(!engine.dispatch(&quit), "the vanilla message stays");
+    }
+
+    #[test]
+    fn output_while_loading_waits_for_the_load_to_be_told() {
+        let (mut engine, lines, _) = engine_with_actions(DEFAULT_LIMITS);
+        let (result, held) = engine.load(
+            "hello",
+            Path::new("."),
+            Path::new("hello.luau"),
+            r#"
+                print("loading")
+                server.on("player_join", function() print("joined") end)
+            "#,
+        );
+        result.unwrap();
+        assert!(
+            messages(&lines).is_empty(),
+            "held until the load is reported"
+        );
+        drop(held);
+        assert_eq!(messages(&lines), ["loading"]);
+
+        // Afterwards the plugin prints as it goes.
+        engine.dispatch(&steve_joins());
+        assert_eq!(messages(&lines), ["loading", "joined"]);
+
+        // A script that fails still has its output shown, after the error.
+        let (result, held) = engine.load(
+            "broken",
+            Path::new("."),
+            Path::new("broken.luau"),
+            r#"print("almost") error("no")"#,
+        );
+        assert!(result.is_err());
+        drop(held);
+        assert_eq!(messages(&lines).last().unwrap(), "almost");
     }
 }

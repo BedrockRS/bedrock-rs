@@ -266,7 +266,7 @@ fn announce_commands(
     match actions.try_send(Action::SetCommands(commands.clone())) {
         Ok(()) => *announced = commands,
         Err(tokio_mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!("the server is not keeping up; plugin commands will be updated later");
+            tracing::warn!("The server isn't keeping up; plugin commands will be updated later");
         }
         // The server is shutting down.
         Err(tokio_mpsc::error::TrySendError::Closed(_)) => *announced = commands,
@@ -306,20 +306,19 @@ impl Plugins {
                         self.unload(&folder);
                     } else if self.warned.insert(folder.clone()) {
                         tracing::warn!(
-                            folder = %folder.display(),
-                            "ignoring a plugin folder without a {MANIFEST_FILE}"
+                            "Ignored the folder {}: it has no {MANIFEST_FILE}",
+                            folder.display()
                         );
                     }
                 }
                 Err(err) => match self.running.get(&folder) {
                     Some(running) => tracing::error!(
-                        plugin = %running.manifest.name,
-                        "failed to reload plugin, keeping the running version: {err}"
+                        "Couldn't reload plugin {}, so it keeps running its previous version: {err}",
+                        running.manifest.name
                     ),
-                    None => tracing::error!(
-                        folder = %folder.display(),
-                        "failed to load plugin: {err}"
-                    ),
+                    None => {
+                        tracing::error!("Couldn't load the plugin in {}: {err}", folder.display())
+                    }
                 },
             }
         }
@@ -338,10 +337,9 @@ impl Plugins {
             .find(|(other, running)| *other != folder && running.manifest.name == name)
         {
             tracing::error!(
-                plugin = %name,
-                folder = %folder.display(),
-                other = %other.display(),
-                "not loading a plugin with the same name as another"
+                "Didn't load the plugin in {}: plugin {name} is already loaded from {}",
+                folder.display(),
+                other.display()
             );
             return;
         }
@@ -349,34 +347,39 @@ impl Plugins {
             .map(|running| running.manifest.name.clone())
             .filter(|previous| *previous != name);
         let main = Path::new(&plugin.manifest.main);
-        match self.engine.load(&name, folder, main, &plugin.source) {
+        // The plugin's own output while loading comes after the line saying
+        // whether it loaded.
+        let (result, held) = self.engine.load(&name, folder, main, &plugin.source);
+        match result {
             Ok(_) => {
                 if let Some(old) = renamed_from {
                     self.engine.unload(&old);
                 }
                 let manifest = &plugin.manifest;
                 tracing::info!(
-                    plugin = %name,
-                    version = %manifest.version,
-                    author = %manifest.author,
-                    "{} plugin: {}",
-                    if previous.is_some() { "reloaded" } else { "loaded" },
-                    manifest.description
+                    "{} plugin: {name} ({}, {})",
+                    if previous.is_some() {
+                        "Reloaded"
+                    } else {
+                        "Loaded"
+                    },
+                    manifest.version,
+                    manifest.author
                 );
                 self.running.insert(folder.to_owned(), plugin);
             }
             Err(err) if previous.is_some() => tracing::error!(
-                plugin = %name,
-                "failed to reload plugin, keeping the running version: {err}"
+                "Couldn't reload plugin {name}, so it keeps running its previous version: {err}"
             ),
-            Err(err) => tracing::error!(plugin = %name, "failed to load plugin: {err}"),
+            Err(err) => tracing::error!("Couldn't load plugin {name}: {err}"),
         }
+        drop(held);
     }
 
     fn unload(&mut self, folder: &Path) {
         if let Some(plugin) = self.running.remove(folder) {
             self.engine.unload(&plugin.manifest.name);
-            tracing::info!(plugin = %plugin.manifest.name, "unloaded plugin");
+            tracing::info!("Unloaded plugin: {}", plugin.manifest.name);
         }
     }
 
@@ -386,7 +389,10 @@ impl Plugins {
         let entries = match fs::read_dir(&self.directory) {
             Ok(entries) => entries,
             Err(err) => {
-                tracing::error!(directory = %self.directory.display(), %err, "failed to list plugins");
+                tracing::error!(
+                    "Couldn't list the plugins in {}: {err}",
+                    self.directory.display()
+                );
                 return Vec::new();
             }
         };
@@ -400,8 +406,8 @@ impl Plugins {
                 && self.warned.insert(path.clone())
             {
                 tracing::warn!(
-                    file = %path.display(),
-                    "ignoring a loose script: plugins live in their own folder with a {MANIFEST_FILE}"
+                    "Ignored {}: plugins live in their own folder with a {MANIFEST_FILE}",
+                    path.display()
                 );
             }
         }
@@ -428,7 +434,7 @@ fn watch(
                     let _ = commands.send(Command::Changed);
                 }
             }
-            Err(err) => tracing::warn!(%err, "plugin file watcher error"),
+            Err(err) => tracing::warn!("Watching the plugins for changes failed: {err}"),
         })
         .map_err(watch_error)?;
     watcher

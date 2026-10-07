@@ -167,7 +167,7 @@ impl GameRules {
         if let Some(path) = &self.path {
             let text = serde_json::to_string_pretty(&*values).expect("game rules serialize");
             if let Err(err) = fs::write(path, text + "\n") {
-                tracing::error!(path = %path.display(), %err, "failed to save the game rules");
+                tracing::error!("Couldn't save the game rules to {}: {err}", path.display());
             }
         }
         Some(*values)

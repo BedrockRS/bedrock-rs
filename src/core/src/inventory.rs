@@ -257,11 +257,18 @@ impl Inventory {
             let mut placed = Vec::new();
             for stack in stacks {
                 let Some(index) = slots(usize::from(stack.slot)) else {
-                    tracing::warn!(slot = stack.slot, item = %stack.item, "ignoring an item saved in a slot that does not exist");
+                    tracing::warn!(
+                        "Ignored {} saved in slot {}, which doesn't exist",
+                        stack.item,
+                        stack.slot
+                    );
                     continue;
                 };
                 let Some(item) = items().by_name(&stack.item) else {
-                    tracing::warn!(item = %stack.item, "ignoring a saved item the server does not know");
+                    tracing::warn!(
+                        "Ignored the saved item {}, which the server doesn't know",
+                        stack.item
+                    );
                     continue;
                 };
                 let count = stack.count.clamp(1, item.max_stack);

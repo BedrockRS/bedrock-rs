@@ -97,7 +97,7 @@ impl UdpMux {
     /// dropped and str0m's retransmissions recover.
     pub fn send(&self, source: SocketAddr, destination: SocketAddr, data: &[u8]) {
         let Some(socket) = self.sockets.get(&source) else {
-            tracing::warn!(%source, "no NetherNet socket bound for transmit source");
+            tracing::warn!("Couldn't send from {source}: no socket is bound there");
             return;
         };
         match socket.try_send_to(data, destination) {
@@ -153,7 +153,7 @@ async fn read_loop(mux: Arc<UdpMux>, socket: Arc<UdpSocket>, local: SocketAddr) 
                 continue;
             }
             Err(err) => {
-                tracing::error!(%local, %err, "NetherNet UDP socket failed");
+                tracing::error!("The network socket on {local} failed: {err}");
                 return;
             }
         };

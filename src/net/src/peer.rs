@@ -407,7 +407,7 @@ impl Peer {
                     self.pending.push_back(segment);
                 }
             }
-            Err(err) => tracing::warn!(peer = self.id, %err, "dropping outgoing message"),
+            Err(err) => tracing::warn!("Dropped a message to a client: {err}"),
         }
         self.flush()
     }

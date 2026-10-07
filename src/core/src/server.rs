@@ -149,7 +149,7 @@ impl Server {
         match self.world.save() {
             Ok(0) => {}
             Ok(saved) => tracing::debug!(saved, "saved changed chunks"),
-            Err(err) => tracing::error!(%err, "failed to save the world"),
+            Err(err) => tracing::error!("Couldn't save the world: {err}"),
         }
         // Where everyone online is, in case the server stops without them leaving.
         for (uuid, player) in self.players.saved() {
@@ -160,7 +160,7 @@ impl Server {
     /// Saves where a player is, logging a failure.
     pub fn save_player(&self, uuid: Uuid, player: &SavedPlayer) {
         if let Err(err) = self.world.save_player(uuid, player) {
-            tracing::error!(%uuid, %err, "failed to save a player");
+            tracing::error!("Couldn't save player {uuid}: {err}");
         }
     }
 
@@ -309,8 +309,10 @@ impl Server {
                 let Some(uuid) = plugin_player(&player) else {
                     return;
                 };
+                let name = self.players.name_of(uuid);
                 if self.logins.kick(uuid, reason.clone()) {
-                    tracing::info!(%uuid, %reason, "a plugin kicked a player");
+                    let name = name.unwrap_or_else(|| uuid.to_string());
+                    tracing::info!("A plugin kicked {name}: {reason}");
                 } else {
                     tracing::debug!(%uuid, "a plugin kicked a player who is not online");
                 }
@@ -320,7 +322,9 @@ impl Server {
                     return;
                 };
                 let Some(mode) = GameMode::resolve(&mode, self.default_game_mode) else {
-                    tracing::warn!(mode, "a plugin asked for a game mode that does not exist");
+                    tracing::warn!(
+                        "A plugin asked for the game mode {mode:?}, which doesn't exist"
+                    );
                     return;
                 };
                 if !self.logins.send(uuid, Control::SetGameMode(mode)) {
@@ -344,7 +348,7 @@ impl Server {
                     return;
                 };
                 let Some(cause) = DamageCause::from_name(&cause) else {
-                    tracing::warn!(cause, "a plugin used a damage cause that does not exist");
+                    tracing::warn!("A plugin used the damage cause {cause:?}, which doesn't exist");
                     return;
                 };
                 if !self.logins.send(uuid, Control::Damage { cause, amount }) {
@@ -365,10 +369,7 @@ impl Server {
 fn plugin_player(uuid: &str) -> Option<Uuid> {
     let parsed = Uuid::parse_str(uuid).ok();
     if parsed.is_none() {
-        tracing::warn!(
-            uuid,
-            "a plugin named a player by something that is not a UUID"
-        );
+        tracing::warn!("A plugin named a player by {uuid:?}, which isn't a UUID");
     }
     parsed
 }

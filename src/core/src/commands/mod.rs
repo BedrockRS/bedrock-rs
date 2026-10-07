@@ -63,10 +63,10 @@ impl Sender {
         }
     }
 
-    /// The name logs and messages call the sender by.
+    /// The name logs call the sender by, at the start of a sentence.
     pub fn name(&self) -> &str {
         match self {
-            Self::Console => "the console",
+            Self::Console => "The console",
             Self::Player(player) => &player.name,
         }
     }
@@ -148,17 +148,19 @@ impl Commands {
         for PluginCommand { plugin, mut spec } in commands {
             if let Some(holder) = all.iter().find(|other| other.answers_to(&spec.name)) {
                 tracing::warn!(
-                    plugin,
-                    command = %spec.name,
-                    taken_by = %holder.spec.name,
-                    "not adding a plugin command whose name is taken"
+                    "Didn't add /{} from plugin {plugin}: the name is taken by /{}",
+                    spec.name,
+                    holder.spec.name
                 );
                 continue;
             }
             spec.aliases.retain(|alias| {
                 let taken = all.iter().any(|other| other.answers_to(alias));
                 if taken {
-                    tracing::warn!(plugin, command = %spec.name, alias, "dropping an alias that is taken");
+                    tracing::warn!(
+                        "Dropped the alias /{alias} of /{} from plugin {plugin}: it is taken",
+                        spec.name
+                    );
                 }
                 !taken && *alias != spec.name
             });
@@ -212,7 +214,10 @@ impl Server {
             Ok(matched) => matched,
             Err(problem) => return CommandReply::error(problem),
         };
-        tracing::info!("{} ran /{line}", sender.name());
+        // The console already shows what it typed.
+        if let Sender::Player(player) = sender {
+            tracing::info!("{} ran /{line}", player.name);
+        }
         match &command.owner {
             Owner::Builtin(builtin) => builtin.run(self, sender, &matched),
             Owner::Plugin(plugin) => {
@@ -229,7 +234,10 @@ impl Server {
                     Ok(Some(reply)) => reply,
                     Ok(None) => unknown(),
                     Err(_) => {
-                        tracing::warn!(plugin, command = %command.spec.name, "a plugin took too long over a command");
+                        tracing::warn!(
+                            "Plugin {plugin} took too long to answer /{}",
+                            command.spec.name
+                        );
                         CommandReply::error("The command took too long to answer.")
                     }
                 }

@@ -4,7 +4,6 @@
 -- `plugin.json` next to it names the plugin and its entry script.
 
 print("Hello from Luau!")
-log.info(`hello loaded at {os.date("%H:%M:%S")} ({_VERSION})`)
 
 -- Words nobody sees in chat. Messages containing one are cancelled.
 local BLOCKED_WORDS = { "badword" }

@@ -58,9 +58,8 @@ fn run(server: &Server, stop: &AtomicBool) {
         let spent = started.elapsed();
         if spent > TICK_DURATION {
             tracing::warn!(
-                tick,
-                mspt = spent.as_millis(),
-                "tick took longer than 50 ms"
+                "Can't keep up: tick {tick} took {} ms, more than the 50 it has",
+                spent.as_millis()
             );
         }
 

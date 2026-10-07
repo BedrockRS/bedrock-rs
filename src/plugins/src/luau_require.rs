@@ -267,7 +267,8 @@ mod tests {
             actions,
         );
         let folder = base.join("plugins").join("req");
-        let result = engine.load("req", &folder, Path::new("main.luau"), main);
+        let (result, held) = engine.load("req", &folder, Path::new("main.luau"), main);
+        drop(held);
         let printed = printed.lock().unwrap().clone();
         (result, printed)
     }

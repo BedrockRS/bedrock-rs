@@ -18,12 +18,13 @@ pub const DEFAULT_CONFIG: &str = r#"# BedrockRS configuration.
 # Settings left out keep their default. Restart the server after editing.
 
 [logs]
+# How much the console shows: "error", "warn", "info", "debug" or "trace".
+# "info" shows what happens on the server; "debug" adds routine activity and
+# details for finding problems, such as when reporting a bug.
+level = "info"
 # Show player chat, plugin broadcasts, private plugin messages and chat that
 # plugins cancelled in the console.
 chat = true
-# Show routine internal activity: connections, logins, chunk streaming and
-# saves, refused actions, and the libraries the server is built on.
-system_noise = false
 
 [players]
 # The game mode of players joining for the first time: survival, creative,
@@ -68,15 +69,64 @@ fn game_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<GameMode, D::
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Logs {
+    /// How much the console shows; see [`Logs::level`] when it is left out.
+    #[serde(default, deserialize_with = "log_level")]
+    pub level: Option<LogLevel>,
     pub chat: bool,
-    pub system_noise: bool,
+    /// Replaced by `level`; `true` still means `debug`.
+    #[serde(default)]
+    system_noise: Option<bool>,
+}
+
+/// How much the console shows, from least to most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub const ALL: [Self; 5] = [
+        Self::Error,
+        Self::Warn,
+        Self::Info,
+        Self::Debug,
+        Self::Trace,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+fn log_level<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<LogLevel>, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    LogLevel::ALL
+        .into_iter()
+        .find(|level| level.name().eq_ignore_ascii_case(&name))
+        .map(Some)
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown log level {name:?}; expected error, warn, info, debug or trace"
+            ))
+        })
 }
 
 impl Default for Logs {
     fn default() -> Self {
         Self {
+            level: Some(LogLevel::Info),
             chat: true,
-            system_noise: false,
+            system_noise: None,
         }
     }
 }
@@ -135,19 +185,41 @@ impl Config {
 }
 
 impl Logs {
+    /// How much the console shows: `level`, or without it `info` (`debug`
+    /// for a file from before `level`, with `system_noise = true`).
+    pub fn level(&self) -> LogLevel {
+        match (self.level, self.system_noise) {
+            (Some(level), _) => level,
+            (None, Some(true)) => LogLevel::Debug,
+            (None, _) => LogLevel::Info,
+        }
+    }
+
+    /// Whether the file still uses `system_noise`, which `level` replaced.
+    pub fn uses_system_noise(&self) -> bool {
+        self.system_noise.is_some()
+    }
+
     /// The `tracing` filter these settings stand for, in `RUST_LOG` syntax.
     ///
-    /// BedrockRS's own crates (whose targets all start with `bedrockrs`) log at
-    /// info; routine activity is logged at debug, which `system_noise` shows,
-    /// along with info from the libraries underneath. Chat has its own
-    /// `chat` target.
+    /// BedrockRS's own crates (whose targets all start with `bedrockrs`) and
+    /// plugins log at the level; the libraries underneath stay a step
+    /// quieter, so debugging the server is not buried in theirs. Chat has its
+    /// own `chat` target, at info.
     pub fn filter(&self) -> String {
-        let (libraries, ours) = if self.system_noise {
-            ("info", "debug")
-        } else {
-            ("warn", "info")
+        let ours = self.level();
+        let libraries = match ours {
+            LogLevel::Error => LogLevel::Error,
+            LogLevel::Warn | LogLevel::Info => LogLevel::Warn,
+            LogLevel::Debug => LogLevel::Info,
+            LogLevel::Trace => LogLevel::Debug,
         };
-        let chat = if self.chat { "info" } else { "off" };
+        let chat = if self.chat && ours >= LogLevel::Info {
+            "info"
+        } else {
+            "off"
+        };
+        let (ours, libraries) = (ours.name(), libraries.name());
         format!("{libraries},bedrockrs={ours},plugin={ours},chat={chat}")
     }
 }
@@ -164,9 +236,9 @@ mod tests {
     #[test]
     fn missing_settings_keep_their_defaults() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
-        let config = Config::parse("[logs]\nsystem_noise = true").unwrap();
-        assert!(config.logs.chat);
-        assert!(config.logs.system_noise);
+        let config = Config::parse("[logs]\nchat = false").unwrap();
+        assert!(!config.logs.chat);
+        assert_eq!(config.logs.level(), LogLevel::Info);
     }
 
     #[test]
@@ -190,11 +262,32 @@ mod tests {
             Logs::default().filter(),
             "warn,bedrockrs=info,plugin=info,chat=info"
         );
-        let quiet = Logs {
-            chat: false,
-            system_noise: true,
-        };
-        assert_eq!(quiet.filter(), "info,bedrockrs=debug,plugin=debug,chat=off");
+        let debug = Config::parse("[logs]\nlevel = \"DEBUG\"\nchat = false").unwrap();
+        assert_eq!(
+            debug.logs.filter(),
+            "info,bedrockrs=debug,plugin=debug,chat=off"
+        );
+        let quiet = Config::parse("[logs]\nlevel = \"warn\"").unwrap();
+        assert_eq!(
+            quiet.logs.filter(),
+            "warn,bedrockrs=warn,plugin=warn,chat=off",
+            "chat is info, so it goes quiet too"
+        );
+        let err = Config::parse("[logs]\nlevel = \"loud\"").unwrap_err();
+        assert!(err.to_string().contains("unknown log level"), "{err}");
+    }
+
+    #[test]
+    fn system_noise_still_means_debug() {
+        let old = Config::parse("[logs]\nsystem_noise = true").unwrap();
+        assert_eq!(old.logs.level(), LogLevel::Debug);
+        assert!(old.logs.uses_system_noise());
+        let off = Config::parse("[logs]\nsystem_noise = false").unwrap();
+        assert_eq!(off.logs.level(), LogLevel::Info);
+        // An explicit level wins.
+        let both = Config::parse("[logs]\nsystem_noise = true\nlevel = \"warn\"").unwrap();
+        assert_eq!(both.logs.level(), LogLevel::Warn);
+        assert!(!Config::default().logs.uses_system_noise());
     }
 
     #[test]

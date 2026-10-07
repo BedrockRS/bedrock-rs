@@ -93,7 +93,7 @@ impl ServerIdentity {
                         source,
                     }
                 })?;
-                tracing::info!(path = %path.display(), "generated a new NetherNet identity key");
+                tracing::info!("Generated a new identity key in {}", path.display());
                 Ok(identity)
             }
             Err(source) => Err(IdentityError::Read {

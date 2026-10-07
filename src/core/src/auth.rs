@@ -202,7 +202,9 @@ impl Authenticator {
                 }
                 // Stale keys still verify tokens signed with them.
                 Err(err) if cache.keys.contains_key(kid) => {
-                    tracing::warn!(%err, "could not refresh signing keys; using cached ones");
+                    tracing::warn!(
+                        "Couldn't refresh the Microsoft sign-in keys, so the cached ones are used: {err}"
+                    );
                 }
                 Err(err) => return Err(err),
             }

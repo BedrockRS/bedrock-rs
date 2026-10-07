@@ -69,7 +69,7 @@ impl Logins {
     pub fn claim(&self, uuid: Uuid, controls: Controls) -> LoginClaim<'_> {
         let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some((_, older)) = self.active().insert(uuid, (id, controls)) {
-            tracing::info!(%uuid, "the player logged in again; kicking the older session");
+            tracing::debug!(%uuid, "the player logged in again; kicking the older session");
             let _ = older.try_send(Control::Kick(KickNotice {
                 reason: DisconnectReason::LOGGED_IN_OTHER_LOCATION,
                 message: LOGGED_IN_ELSEWHERE.to_owned(),
@@ -105,7 +105,7 @@ impl Logins {
             return false;
         };
         if controls.try_send(control).is_err() {
-            tracing::warn!(%uuid, "a session is not keeping up with what it is told");
+            tracing::warn!("The session of player {uuid} isn't keeping up with the server");
         }
         true
     }

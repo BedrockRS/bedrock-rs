@@ -168,7 +168,7 @@ impl Builtin {
                     return CommandReply::error(format!("{name} is already an operator."));
                 }
                 server.logins.send(uuid, Control::SetOperator(true));
-                tracing::info!(%uuid, "{} made {name} an operator", sender.name());
+                tracing::info!("{} made {name} an operator", sender.name());
                 CommandReply::ok(format!("Made {name} an operator."))
             }
             Self::Deop => {
@@ -179,7 +179,7 @@ impl Builtin {
                     return CommandReply::error(format!("{name} is not an operator."));
                 }
                 server.logins.send(uuid, Control::SetOperator(false));
-                tracing::info!(%uuid, "{} took away {name}'s operator status", sender.name());
+                tracing::info!("{} took away {name}'s operator status", sender.name());
                 CommandReply::ok(format!("{name} is no longer an operator."))
             }
             Self::Stop => {

@@ -61,35 +61,48 @@ async fn main() -> anyhow::Result<()> {
         .event_format(ConsoleFormat { ansi })
         .init();
     if loaded.created {
-        tracing::info!("created {CONFIG_FILE} with the default settings");
+        tracing::info!("Created {CONFIG_FILE} with the default settings");
     }
 
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        game = bedrockrs_protocol::GAME_VERSION,
+        "Starting BedrockRS {} for Minecraft: Bedrock Edition {}",
+        env!("CARGO_PKG_VERSION"),
+        bedrockrs_protocol::GAME_VERSION
+    );
+    tracing::debug!(
         protocol = bedrockrs_protocol::PROTOCOL_VERSION,
         tps = bedrockrs_core::TICKS_PER_SECOND,
-        "BedrockRS"
+        "versions"
     );
+    if loaded.config.logs.uses_system_noise() {
+        tracing::warn!(
+            "system_noise in {CONFIG_FILE} is replaced by level: use level = \"debug\" instead"
+        );
+    }
 
     let (actions, plugin_actions) = mpsc::channel(PLUGIN_ACTION_QUEUE);
     let plugins = PluginHost::start(PluginConfig::default(), actions)
         .context("failed to start the plugin host")?;
-    tracing::info!(loaded = ?plugins.loaded(), "plugins ready");
+    tracing::debug!(loaded = ?plugins.loaded(), "plugins ready");
     let world_directory = env_value::<PathBuf>("BEDROCKRS_WORLD_DIR")?
         .unwrap_or_else(|| PathBuf::from("worlds/world"));
     let world = World::open(&world_directory)
-        .with_context(|| format!("failed to open the world in {}", world_directory.display()))?;
-    tracing::info!(
+        .with_context(|| format!("Failed to open the world in {}", world_directory.display()))?;
+    let world_name = world_directory.file_name().map_or_else(
+        || world_directory.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    tracing::info!("Opened world: {world_name}");
+    tracing::debug!(
         directory = %world_directory.display(),
         saved_chunks = world.saved_chunks(),
-        "world loaded"
+        "world"
     );
     let authenticator = if env_value::<bool>("BEDROCKRS_AUTHENTICATION")?.unwrap_or(true) {
-        Authenticator::online().context("failed to set up player authentication")?
+        Authenticator::online().context("Failed to set up player authentication")?
     } else {
         tracing::warn!(
-            "player authentication is OFF: anyone can join as anyone. Only use this for offline testing"
+            "Player authentication is OFF: anyone can join as anyone. Only use this for offline testing"
         );
         Authenticator::offline()
     };
@@ -107,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     // Stops when dropped, as `main` returns.
     let _game_loop =
-        TickLoop::start(Arc::clone(&server)).context("failed to start the game loop")?;
+        TickLoop::start(Arc::clone(&server)).context("Failed to start the game loop")?;
 
     let status = ServerStatus {
         name: "BedrockRS".into(),
@@ -120,15 +133,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut listener = Listener::bind(listener_config()?, status)
         .await
-        .context("failed to start the NetherNet listener")?;
-    tracing::info!(
-        signaling = %listener.signaling_addr(),
+        .context("Failed to start the NetherNet listener")?;
+    tracing::info!("Listening on {}", listener.signaling_addr());
+    tracing::debug!(
         media = ?listener.media_addrs(),
         identity = listener.key_fingerprint(),
-        "NetherNet listening"
+        "NetherNet"
     );
     let mut console = console_lines();
-    tracing::info!("type help in the console for a list of commands");
+    tracing::info!("Type '/help' in the console for a list of commands");
 
     loop {
         tokio::select! {
@@ -138,25 +151,24 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => break,
             },
+            // Run here rather than in a task of its own, so what a command
+            // prints comes before what it causes, such as stopping.
             Some(line) = console.recv() => {
-                let server = Arc::clone(&server);
-                tokio::spawn(async move {
-                    for line in server.run_command(&Sender::Console, &line).await.lines {
-                        if line.success {
-                            tracing::info!("{}", line.text);
-                        } else {
-                            tracing::warn!("{}", line.text);
-                        }
+                for line in server.run_command(&Sender::Console, &line).await.lines {
+                    if line.success {
+                        tracing::info!("{}", line.text);
+                    } else {
+                        tracing::warn!("{}", line.text);
                     }
-                });
+                }
             }
             () = server.stop_requested() => {
-                tracing::info!("shutting down");
+                tracing::info!("Server stopped");
                 break;
             }
             result = tokio::signal::ctrl_c() => {
-                result.context("failed to listen for Ctrl+C")?;
-                tracing::info!("shutting down");
+                result.context("Failed to listen for Ctrl+C")?;
+                tracing::info!("Server stopped");
                 break;
             }
         }
@@ -179,7 +191,7 @@ fn console_lines() -> mpsc::Receiver<String> {
             }
         });
     if let Err(err) = reader {
-        tracing::warn!(%err, "failed to read the console; console commands are off");
+        tracing::warn!("Couldn't read the console, so console commands are off: {err}");
     }
     received
 }
