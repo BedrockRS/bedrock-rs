@@ -1,0 +1,19 @@
+# Build output
+/target/
+
+# Python bytecode from the data scripts
+__pycache__/
+
+# Server runtime files: created when the server runs, never committed.
+# Plugins and the start scripts in server/ are tracked.
+/server/bedrockrs.toml
+/server/keys/
+/server/worlds/*
+!/server/worlds/.gitkeep
+*.pem
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
