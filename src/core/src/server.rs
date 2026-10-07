@@ -14,8 +14,10 @@ use uuid::Uuid;
 use crate::auth::Authenticator;
 use crate::blocks::palette;
 use crate::commands::Commands;
+use crate::damage::DamageCause;
 use crate::entities::{self, ItemEntities, ItemStack, PickedUp};
 use crate::game_mode::GameMode;
+use crate::game_rules::GameRules;
 use crate::items::items;
 use crate::logins::{Control, Logins};
 use crate::ops::Operators;
@@ -47,6 +49,8 @@ pub struct Server {
     pub ops: Operators,
     /// The game mode of players who have not played here before.
     pub default_game_mode: GameMode,
+    /// The world's game rules.
+    pub game_rules: GameRules,
     /// The last tick the game loop ran; 0 before the first.
     tick: AtomicU64,
     /// Signalled when something asks the server to stop.
@@ -65,6 +69,7 @@ impl Server {
             commands: Commands::new(),
             ops: Operators::in_memory(),
             default_game_mode: GameMode::Creative,
+            game_rules: GameRules::in_memory(),
             tick: AtomicU64::new(0),
             stop: Notify::new(),
         }
@@ -79,6 +84,39 @@ impl Server {
     pub fn with_default_game_mode(mut self, mode: GameMode) -> Self {
         self.default_game_mode = mode;
         self
+    }
+
+    /// Keeps game rules in `rules` rather than in memory.
+    pub fn with_game_rules(mut self, rules: GameRules) -> Self {
+        self.game_rules = rules;
+        self
+    }
+
+    /// Scatters what a dying player carried around where they died.
+    pub fn drop_death_items(&self, feet: Vec3, stacks: &[ItemStack]) {
+        for stack in stacks {
+            let entity_id = self.players.allocate_entity_id();
+            let (position, velocity) = entities::death_drop(feet, entity_id ^ self.current_tick());
+            self.items.spawn(
+                entity_id,
+                *stack,
+                position,
+                velocity,
+                entities::PICKUP_DELAY,
+            );
+        }
+    }
+
+    /// Tells everyone how a player died, in their own language, if the
+    /// `showdeathmessages` rule allows. Logged in English either way.
+    pub fn announce_death(&self, player: &str, cause: DamageCause) {
+        tracing::info!(target: "chat", "{}", cause.death_message_english(player));
+        if self.game_rules.values().showdeathmessages {
+            self.players.broadcast_translation(
+                &format!("%{}", cause.death_message()),
+                &[player.to_owned()],
+            );
+        }
     }
 
     /// Asks the server to stop, as `/stop` does.
@@ -289,6 +327,30 @@ impl Server {
                     tracing::debug!(%uuid, "a plugin set the game mode of a player who is not online");
                 }
             }
+            Action::SetHealth { player, health } => {
+                let Some(uuid) = plugin_player(&player) else {
+                    return;
+                };
+                if !self.logins.send(uuid, Control::SetHealth(health)) {
+                    tracing::debug!(%uuid, "a plugin set the health of a player who is not online");
+                }
+            }
+            Action::Damage {
+                player,
+                amount,
+                cause,
+            } => {
+                let Some(uuid) = plugin_player(&player) else {
+                    return;
+                };
+                let Some(cause) = DamageCause::from_name(&cause) else {
+                    tracing::warn!(cause, "a plugin used a damage cause that does not exist");
+                    return;
+                };
+                if !self.logins.send(uuid, Control::Damage { cause, amount }) {
+                    tracing::debug!(%uuid, "a plugin hurt a player who is not online");
+                }
+            }
             Action::SetCommands(commands) => {
                 if self.commands.set_plugin_commands(commands) {
                     tracing::debug!("plugin commands changed; telling every player");
@@ -379,6 +441,7 @@ mod tests {
             inventory: Default::default(),
             held: (bedrockrs_protocol::packets::ItemInstance::EMPTY, 0),
             game_mode: crate::game_mode::GameMode::Creative,
+            health: 20.0,
             outbound,
         });
         (membership, queue)

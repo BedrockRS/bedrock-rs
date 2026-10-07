@@ -33,6 +33,7 @@ use bedrockrs_core::auth::Authenticator;
 use bedrockrs_core::commands::Sender;
 use bedrockrs_core::config::{CONFIG_FILE, Config};
 use bedrockrs_core::console::ConsoleFormat;
+use bedrockrs_core::game_rules::GameRules;
 use bedrockrs_core::ops::{OPS_FILE, Operators};
 use bedrockrs_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use bedrockrs_core::session;
@@ -93,10 +94,12 @@ async fn main() -> anyhow::Result<()> {
         Authenticator::offline()
     };
     let ops = Operators::open(Path::new(OPS_FILE))?;
+    let game_rules = GameRules::open(&world_directory)?;
     let server = Arc::new(
         Server::new(world, plugins.dispatcher(), authenticator)
             .with_operators(ops)
-            .with_default_game_mode(loaded.config.players.default_game_mode),
+            .with_default_game_mode(loaded.config.players.default_game_mode)
+            .with_game_rules(game_rules),
     );
     tokio::spawn(server::apply_plugin_actions(
         Arc::clone(&server),

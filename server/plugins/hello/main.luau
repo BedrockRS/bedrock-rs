@@ -14,15 +14,12 @@ local BLOCKED_WORDS = { "badword" }
 -- `server.player(uuid)` to find them again while they are online.
 local newest: string? = nil
 
--- Welcome everyone who spawns into the world.
-server.on("player_join", function(player)
-	server.broadcast(`§eWelcome to BedrockRS, {player.name}!`)
-	player.send_message("§7Only you can see this. Try §f/hello§7.")
-	newest = player.uuid
-end)
-
-server.on("player_quit", function(player)
-	server.broadcast(`§e{player.name} left the game`)
+-- Everyone sees vanilla's "joined the game" message; the new player also
+-- gets a hint only they can see. (`event.cancel()` here would stop vanilla's
+-- message, to broadcast one of your own instead.)
+server.on("player_join", function(event)
+	event.player.send_message("§7Only you can see this. Try §f/hello§7.")
+	newest = event.player.uuid
 end)
 
 server.on("player_chat", function(event)

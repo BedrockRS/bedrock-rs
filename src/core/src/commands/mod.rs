@@ -244,6 +244,7 @@ mod tests {
 
     use super::*;
     use crate::auth::Authenticator;
+    use crate::damage::DamageCause;
     use crate::game_mode::GameMode;
     use crate::logins::Control;
     use crate::world::World;
@@ -370,5 +371,69 @@ mod tests {
             );
             assert!(received.try_recv().is_err(), "{line}");
         }
+    }
+
+    #[tokio::test]
+    async fn kill_and_gamerule_work_as_in_vanilla() {
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        );
+        let uuid = Uuid::new_v4();
+        let (controls, mut received) = tokio::sync::mpsc::channel(8);
+        let _claim = server.logins.claim(uuid, controls);
+        let steve = Sender::Player(PlayerSender {
+            uuid,
+            name: "Steve".into(),
+            operator: true,
+        });
+
+        let reply = server.run_command(&steve, "/kill").await;
+        assert_eq!(reply.lines[0].text, "Killed Steve");
+        assert_eq!(
+            received.try_recv().unwrap(),
+            Control::Damage {
+                cause: DamageCause::SelfDestruct,
+                amount: f32::MAX
+            }
+        );
+        assert!(
+            !server
+                .run_command(&Sender::Console, "kill")
+                .await
+                .succeeded()
+        );
+
+        let listed = server.run_command(&steve, "/gamerule").await;
+        assert!(
+            listed.lines[0].text.contains("keepinventory = false"),
+            "{listed:?}"
+        );
+        let reply = server
+            .run_command(&steve, "/gamerule keepInventory true")
+            .await;
+        assert_eq!(
+            reply.lines[0].text,
+            "Game rule keepinventory has been updated to true"
+        );
+        assert!(server.game_rules.values().keepinventory);
+        let Control::GameRules(values) = received.try_recv().unwrap() else {
+            panic!("every player hears of the change");
+        };
+        assert!(values.keepinventory);
+        let reply = server.run_command(&steve, "/gamerule keepinventory").await;
+        assert_eq!(reply.lines[0].text, "keepinventory = true");
+        // Setting it to what it is tells nobody.
+        server
+            .run_command(&steve, "/gamerule keepinventory true")
+            .await;
+        assert!(received.try_recv().is_err());
+        assert!(
+            !server
+                .run_command(&steve, "/gamerule dofiretick false")
+                .await
+                .succeeded()
+        );
     }
 }

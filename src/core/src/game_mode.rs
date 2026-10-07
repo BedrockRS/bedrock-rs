@@ -99,6 +99,11 @@ impl GameMode {
         matches!(self, Self::Creative | Self::Spectator)
     }
 
+    /// Whether the player can be hurt, other than by commands.
+    pub const fn takes_damage(self) -> bool {
+        matches!(self, Self::Survival | Self::Adventure)
+    }
+
     /// Whether the player picks up items and is seen by other players.
     pub const fn is_present(self) -> bool {
         !matches!(self, Self::Spectator)

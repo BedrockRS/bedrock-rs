@@ -16,6 +16,9 @@ pub mod input_flag {
     pub const MISSED_SWING: i32 = 39;
     pub const START_FLYING: i32 = 42;
     pub const STOP_FLYING: i32 = 43;
+    /// The player touches a block above or below: standing on the ground,
+    /// landing, or bumping their head.
+    pub const VERTICAL_COLLISION: i32 = 50;
 }
 
 /// Most input flags a PlayerAuthInput may list; the protocol defines about 65.

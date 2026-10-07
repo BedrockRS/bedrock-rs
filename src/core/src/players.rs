@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bedrockrs_protocol::packet::Encode;
 use bedrockrs_protocol::packets::{
-    AddPlayer, Animate, EntityMetadata, INVENTORY_WINDOW, ItemInstance, MetadataValue,
+    ActorEvent, AddPlayer, Animate, EntityMetadata, INVENTORY_WINDOW, ItemInstance, MetadataValue,
     MobEquipment, MoveMode, MovePlayer, PlayerList, PlayerListEntry, PlayerSkin, RemoveActor,
-    SetActorData, Skin, TakeItemActor, Text, UpdatePlayerGameType, entity_flag, metadata_key,
+    SetActorData, Skin, TakeItemActor, Text, TextType, UpdatePlayerGameType, entity_flag,
+    metadata_key,
 };
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 use bytes::Bytes;
@@ -92,6 +93,7 @@ impl Movement {
             flying,
             inventory: None,
             game_mode: None,
+            health: None,
         }
     }
 
@@ -137,6 +139,7 @@ pub struct Joining {
     /// What they hold and in which hotbar slot, which AddPlayer shows others.
     pub held: (ItemInstance, u8),
     pub game_mode: GameMode,
+    pub health: f32,
     pub outbound: Outbound,
 }
 
@@ -158,6 +161,10 @@ struct Online {
     /// The player's inventory as last changed, for saving.
     inventory: SavedInventory,
     game_mode: GameMode,
+    health: f32,
+    /// The tick the player died, while they are dead. Others see them fall
+    /// over, then they disappear.
+    died_at: Option<u64>,
     outbound: Outbound,
 }
 
@@ -221,6 +228,8 @@ impl Online {
 #[derive(Default)]
 pub struct Players {
     last_entity_id: AtomicU64,
+    /// The last tick [`Players::tick`] ran.
+    tick: AtomicU64,
     online: Mutex<HashMap<u64, Online>>,
 }
 
@@ -245,6 +254,7 @@ impl Players {
             inventory,
             held,
             game_mode,
+            health,
             outbound,
         } = joining;
         let newcomer = Online {
@@ -259,6 +269,8 @@ impl Players {
             held,
             inventory,
             game_mode,
+            health,
+            died_at: None,
             outbound,
         };
         let mut online = self.online();
@@ -296,6 +308,7 @@ impl Players {
                 let mut saved = player.movement.saved(player.flying);
                 saved.inventory = Some(player.inventory.clone());
                 saved.game_mode = Some(player.game_mode.name().to_owned());
+                saved.health = Some(player.health);
                 (player.profile.uuid, saved)
             })
             .collect()
@@ -304,14 +317,21 @@ impl Players {
     /// Updates who sees whom and which items, then sends everyone and
     /// everything that moved to the players who can see them.
     pub fn tick(&self, tick: u64, items: &[ItemView]) {
+        self.tick.store(tick, Ordering::Relaxed);
         let mut online = self.online();
         for viewer in online.values_mut() {
             viewer.sync_items(items);
         }
-        // Spectators are seen by nobody.
+        // Spectators are seen by nobody, and the dead only while they fall over.
         let snapshot: Vec<(u64, ChunkPos, bool)> = online
             .iter()
-            .map(|(id, player)| (*id, player.movement.chunk(), player.game_mode.is_present()))
+            .map(|(id, player)| {
+                let fallen = player
+                    .died_at
+                    .is_some_and(|died| tick >= died + DEATH_ANIMATION_TICKS);
+                let present = player.game_mode.is_present() && !fallen;
+                (*id, player.movement.chunk(), present)
+            })
             .collect();
 
         // Entities entering and leaving each viewer's view. A newly shown
@@ -478,6 +498,18 @@ impl Players {
         self.broadcast_text(Text::raw(format!("<{from}> {message}")));
     }
 
+    /// Shows everyone a vanilla message that each client translates, such
+    /// as `§e%multiplayer.player.joined`: `%` and a translation key, after
+    /// any formatting, filled in with `parameters`.
+    pub fn broadcast_translation(&self, message: &str, parameters: &[String]) {
+        self.broadcast_text(Text {
+            text_type: TextType::Translation,
+            needs_translation: true,
+            parameters: parameters.to_vec(),
+            ..Text::raw(message)
+        });
+    }
+
     fn broadcast_text(&self, text: Text) {
         if text.message.is_empty() || text.message.len() > Text::MAX_MESSAGE_LEN {
             tracing::warn!(
@@ -585,6 +617,47 @@ impl Membership<'_> {
         }
     }
 
+    /// Records the player's health, for saving.
+    pub fn health(&self, health: f32) {
+        if let Some(player) = self.players.online().get_mut(&self.entity_id) {
+            player.health = health;
+        }
+    }
+
+    /// Shows everyone who sees the player flinching from damage.
+    pub fn hurt(&self) {
+        self.show_others(ActorEvent::new(self.entity_id, ActorEvent::HURT));
+    }
+
+    /// Shows everyone who sees the player falling over dead; they disappear
+    /// shortly after.
+    pub fn died(&self) {
+        let tick = self.players.tick.load(Ordering::Relaxed);
+        if let Some(player) = self.players.online().get_mut(&self.entity_id) {
+            player.died_at = Some(tick);
+            player.health = 0.0;
+        }
+        self.show_others(ActorEvent::new(self.entity_id, ActorEvent::DEATH));
+    }
+
+    /// The player is alive again: others see them from the next tick, where
+    /// they now stand.
+    pub fn respawned(&self, health: f32) {
+        if let Some(player) = self.players.online().get_mut(&self.entity_id) {
+            player.died_at = None;
+            player.health = health;
+        }
+    }
+
+    fn show_others(&self, packet: impl Encode) {
+        let packet = encode(&packet);
+        for other in self.players.online().values() {
+            if other.seen.contains(&self.entity_id) {
+                other.send(packet.clone());
+            }
+        }
+    }
+
     /// Records whether the player is flying, for saving.
     pub fn flying(&self, flying: bool) {
         if let Some(player) = self.players.online().get_mut(&self.entity_id) {
@@ -675,6 +748,10 @@ pub fn body_overlaps(feet: Vec3, height: f32, pos: BlockPos) -> bool {
 
 /// A player's height standing and sneaking, in blocks.
 pub const STANDING_HEIGHT: f32 = 1.8;
+
+/// How long others see a dead player lying there before they disappear: about
+/// as long as the death animation.
+const DEATH_ANIMATION_TICKS: u64 = 20;
 pub const SNEAKING_HEIGHT: f32 = 1.5;
 
 fn encode(packet: &impl Encode) -> Bytes {
@@ -766,6 +843,7 @@ mod tests {
             inventory: SavedInventory::default(),
             held: (ItemInstance::EMPTY, 0),
             game_mode: GameMode::Creative,
+            health: 20.0,
             outbound,
         };
         (joining, queue)

@@ -516,7 +516,7 @@ mod tests {
             &directory,
             "welcome",
             "welcome",
-            r#"server.on("player_join", function(player) server.broadcast("hi " .. player.name) end)"#,
+            r#"server.on("player_join", function(event) server.broadcast("hi " .. event.player.name) end)"#,
         );
 
         let config = PluginConfig {

@@ -10,6 +10,8 @@ pub mod player_action {
     pub const START_BREAK: i32 = 0;
     pub const ABORT_BREAK: i32 = 1;
     pub const STOP_BREAK: i32 = 2;
+    /// The death screen's Respawn button; the Respawn packet follows.
+    pub const RESPAWN: i32 = 7;
     /// Left-clicking a block in creative; sent in a [`super::PlayerAction`].
     pub const CREATIVE_DESTROY_BLOCK: i32 = 13;
     /// The client predicts it finished breaking a block.

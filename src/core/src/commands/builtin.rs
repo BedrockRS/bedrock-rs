@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use super::parse::{self, Matched};
 use super::{Owner, Registered, Sender};
+use crate::damage::DamageCause;
 use crate::game_mode::GameMode;
+use crate::game_rules::Rule;
 use crate::logins::Control;
 use crate::server::Server;
 
@@ -21,17 +23,21 @@ pub enum Builtin {
     List,
     Version,
     GameMode,
+    GameRule,
+    Kill,
     Op,
     Deop,
     Stop,
 }
 
 impl Builtin {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Help,
         Self::List,
         Self::Version,
         Self::GameMode,
+        Self::GameRule,
+        Self::Kill,
         Self::Op,
         Self::Deop,
         Self::Stop,
@@ -62,6 +68,30 @@ impl Builtin {
                     ArgSpec::optional("player", ArgKind::Player),
                 ])
                 .permission(Permission::Operator),
+            ),
+            // As in vanilla: on its own it lists the rules; with a rule, it
+            // shows it, or sets it to a value.
+            Self::GameRule => (
+                "gamerule",
+                "Sets or queries a game rule value",
+                CommandNode::runs()
+                    .or_with(vec![
+                        ArgSpec::required(
+                            "rule",
+                            ArgKind::Enum {
+                                name: "BoolGameRule".into(),
+                                values: Rule::ALL.map(|rule| rule.name().to_owned()).to_vec(),
+                            },
+                        ),
+                        ArgSpec::optional("value", ArgKind::Bool),
+                    ])
+                    .permission(Permission::Operator),
+            ),
+            Self::Kill => (
+                "kill",
+                "Kills a player",
+                CommandNode::runs_with(vec![ArgSpec::optional("target", ArgKind::Player)])
+                    .permission(Permission::Operator),
             ),
             Self::Op => (
                 "op",
@@ -106,6 +136,30 @@ impl Builtin {
                 env!("CARGO_PKG_VERSION")
             )),
             Self::GameMode => game_mode(server, sender, matched),
+            Self::GameRule => game_rule(server, sender, matched),
+            Self::Kill => {
+                let target = match (matched.arg("target"), sender) {
+                    (Some(ArgValue::Player(player)), _) => Uuid::parse_str(&player.uuid)
+                        .ok()
+                        .map(|uuid| (uuid, player.name.clone())),
+                    (None, Sender::Player(player)) => Some((player.uuid, player.name.clone())),
+                    (None, Sender::Console) => {
+                        return CommandReply::error("Name a player: kill <target>");
+                    }
+                    _ => None,
+                };
+                let Some((uuid, name)) = target else {
+                    return missing_player();
+                };
+                let kill = Control::Damage {
+                    cause: DamageCause::SelfDestruct,
+                    amount: f32::MAX,
+                };
+                if !server.logins.send(uuid, kill) {
+                    return CommandReply::error(format!("{name} is not online."));
+                }
+                CommandReply::ok(format!("Killed {name}"))
+            }
             Self::Op => {
                 let Some((uuid, name)) = target(matched) else {
                     return missing_player();
@@ -213,6 +267,37 @@ fn game_mode(server: &Server, sender: &Sender, matched: &Matched) -> CommandRepl
     } else {
         CommandReply::ok(format!("Set {name}'s game mode to {}.", mode.name()))
     }
+}
+
+/// `/gamerule`: every rule; `/gamerule <rule>`: its value; `/gamerule
+/// <rule> <value>`: sets it, for every player at once.
+fn game_rule(server: &Server, sender: &Sender, matched: &Matched) -> CommandReply {
+    let values = server.game_rules.values();
+    let Some(ArgValue::String(name)) = matched.arg("rule") else {
+        let listed: Vec<String> = Rule::ALL
+            .into_iter()
+            .map(|rule| format!("{} = {}", rule.name(), values.get(rule)))
+            .collect();
+        return CommandReply::ok(listed.join(", "));
+    };
+    let Some(rule) = Rule::from_name(name) else {
+        return CommandReply::error(format!("Game rule {name} is not supported yet."));
+    };
+    let Some(ArgValue::Bool(value)) = matched.arg("value") else {
+        return CommandReply::ok(format!("{} = {}", rule.name(), values.get(rule)));
+    };
+    if let Some(values) = server.game_rules.set(rule, *value) {
+        server.logins.send_all(&Control::GameRules(values));
+        tracing::info!(
+            "{} set the game rule {} to {value}",
+            sender.name(),
+            rule.name()
+        );
+    }
+    CommandReply::ok(format!(
+        "Game rule {} has been updated to {value}",
+        rule.name()
+    ))
 }
 
 /// The player named by the `player` argument.

@@ -11,7 +11,9 @@ use bedrockrs_protocol::packets::DisconnectReason;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::damage::DamageCause;
 use crate::game_mode::GameMode;
+use crate::game_rules;
 
 /// Why a session must disconnect its player, and what the player is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +23,7 @@ pub struct KickNotice {
 }
 
 /// Something the rest of the server tells a player's session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Control {
     /// Disconnect the player.
     Kick(KickNotice),
@@ -30,6 +32,15 @@ pub enum Control {
     SetOperator(bool),
     /// The commands players may use changed; send the player theirs.
     RefreshCommands,
+    /// Set the player's health; 0 kills them.
+    SetHealth(f32),
+    /// Hurt the player, if their game mode and plugins let it.
+    Damage {
+        cause: DamageCause,
+        amount: f32,
+    },
+    /// The game rules changed; these are all of them now.
+    GameRules(game_rules::Values),
 }
 
 /// Where a session receives its [`Control`]s.

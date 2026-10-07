@@ -12,7 +12,8 @@ use tracing::Level;
 
 use crate::luau_commands::{self, Registered};
 use crate::{
-    Action, CommandCall, CommandReply, Event, GAME_MODE_VALUES, Output, Player, PluginCommand,
+    Action, CommandCall, CommandReply, DAMAGE_CAUSES, Event, GAME_MODE_VALUES, Output, Player,
+    PluginCommand,
 };
 
 /// Registry key of each VM's table of event handlers: event name → list of functions.
@@ -221,12 +222,40 @@ impl Plugin {
 
 /// The value handlers receive: a read-only table describing the event.
 ///
-/// - `player_join`, `player_quit`: the player (see [`player_table`]).
+/// - `player_join`, `player_quit`: `{ player, cancel(), is_cancelled() }`;
+///   cancelling stops vanilla's join or quit message.
 /// - `player_chat`: `{ player, message, cancel(), is_cancelled() }`.
 /// - `block_break`, `block_place`: `{ player, position = { x, y, z }, block }`.
+/// - `player_damage`: `{ player, cause, amount, health, cancel(), is_cancelled() }`.
+/// - `player_death`: `{ player, cause, message }`.
+/// - `player_respawn`: the player.
 fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::Result<Table> {
     let payload = match event {
-        Event::PlayerJoin(player) | Event::PlayerQuit(player) => player_table(lua, player)?,
+        Event::PlayerJoin(player) | Event::PlayerQuit(player) => {
+            let table = lua.create_table()?;
+            table.raw_set("player", player_table(lua, player)?)?;
+            table
+        }
+        Event::PlayerRespawn(player) => player_table(lua, player)?,
+        Event::PlayerDamage(damage) => {
+            let table = lua.create_table()?;
+            table.raw_set("player", player_table(lua, &damage.player)?)?;
+            table.raw_set("cause", damage.cause.as_str())?;
+            table.raw_set("amount", damage.amount)?;
+            table.raw_set("health", damage.health)?;
+            table
+        }
+        Event::PlayerDeath {
+            player,
+            cause,
+            message,
+        } => {
+            let table = lua.create_table()?;
+            table.raw_set("player", player_table(lua, player)?)?;
+            table.raw_set("cause", cause.as_str())?;
+            table.raw_set("message", message.as_str())?;
+            table
+        }
         Event::PlayerChat { player, message } => {
             let table = lua.create_table()?;
             table.raw_set("player", player_table(lua, player)?)?;
@@ -266,7 +295,8 @@ fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::
 }
 
 /// A player as handlers see them: `{ name, uuid, send_message(message),
-/// set_game_mode(mode), kick(reason?) }`. The methods work with `.` and `:` alike, and keep working
+/// set_game_mode(mode), set_health(health), damage(amount, cause?),
+/// kick(reason?) }`. The methods work with `.` and `:` alike, and keep working
 /// after the event; acting on a player who has left does nothing.
 pub(crate) fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
     let actions = lua
@@ -324,6 +354,57 @@ pub(crate) fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
         )
     })?;
     table.raw_set("set_game_mode", set_game_mode)?;
+
+    let (queue, uuid) = (actions.clone(), player.uuid.clone());
+    let set_health = lua.create_function(move |_, args: MultiValue| {
+        let health = match method_args(args).next() {
+            Some(Value::Integer(health)) => health as f32,
+            Some(Value::Number(health)) if health.is_finite() => health as f32,
+            _ => return Err(mlua::Error::runtime("set_health expects a number")),
+        };
+        request(
+            &queue,
+            Action::SetHealth {
+                player: uuid.clone(),
+                health,
+            },
+        )
+    })?;
+    table.raw_set("set_health", set_health)?;
+
+    let (queue, uuid) = (actions.clone(), player.uuid.clone());
+    let damage = lua.create_function(move |_, args: MultiValue| {
+        let mut args = method_args(args);
+        let amount = match args.next() {
+            Some(Value::Integer(amount)) if amount > 0 => amount as f32,
+            Some(Value::Number(amount)) if amount.is_finite() && amount > 0.0 => amount as f32,
+            _ => return Err(mlua::Error::runtime("damage expects an amount above 0")),
+        };
+        let cause = match args.next() {
+            None | Some(Value::Nil) => "none".to_owned(),
+            Some(Value::String(cause)) => cause.to_str()?.to_owned(),
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "damage expects a cause string, got a {}",
+                    other.type_name()
+                )));
+            }
+        };
+        if !DAMAGE_CAUSES.contains(&cause.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "unknown damage cause {cause:?}; expected a vanilla cause such as fall, void or entityAttack"
+            )));
+        }
+        request(
+            &queue,
+            Action::Damage {
+                player: uuid.clone(),
+                amount,
+                cause,
+            },
+        )
+    })?;
+    table.raw_set("damage", damage)?;
 
     let uuid = player.uuid.clone();
     let kick = lua.create_function(move |_, args: MultiValue| {
@@ -645,7 +726,7 @@ mod tests {
                 "welcome",
                 "welcome.luau",
                 r#"
-                    server.on("player_join", function(player)
+                    server.on("player_join", function(event) local player = event.player
                         print(player.name, player.uuid)
                         server.broadcast(`Welcome, {player.name}!`)
                     end)
@@ -689,8 +770,8 @@ mod tests {
                 "a",
                 "a.luau",
                 r#"
-                    server.on("player_join", function(player) player.name = "Alex" end)
-                    server.on("player_join", function(player) print("a saw", player.name) end)
+                    server.on("player_join", function(event) local player = event.player player.name = "Alex" end)
+                    server.on("player_join", function(event) local player = event.player print("a saw", player.name) end)
                 "#,
             )
             .unwrap();
@@ -698,7 +779,7 @@ mod tests {
             .load(
                 "b",
                 "b.luau",
-                r#"server.on("player_join", function(player) print("b saw", player.name) end)"#,
+                r#"server.on("player_join", function(event) local player = event.player print("b saw", player.name) end)"#,
             )
             .unwrap();
         engine.dispatch(&steve_joins());
@@ -801,7 +882,7 @@ mod tests {
                 "watch",
                 "watch.luau",
                 r#"
-                    server.on("player_quit", function(player) print("quit", player.name) end)
+                    server.on("player_quit", function(event) local player = event.player print("quit", player.name) end)
                     local function changed(event)
                         local at = event.position
                         print(event.player.name, event.block, at.x, at.y, at.z, event.cancel)
@@ -841,7 +922,7 @@ mod tests {
                 "moderator",
                 "moderator.luau",
                 r#"
-                    server.on("player_join", function(player)
+                    server.on("player_join", function(event) local player = event.player
                         player.send_message("Only you can see this")
                         player:send_message("And this")
                     end)
@@ -890,7 +971,7 @@ mod tests {
                 "careless",
                 "careless.luau",
                 r#"
-                    server.on("player_join", function(player)
+                    server.on("player_join", function(event) local player = event.player
                         for _, attempt in {
                             function() player.send_message() end,
                             function() player.send_message("") end,
@@ -979,5 +1060,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(messages(&lines).last().unwrap(), "Steve");
+    }
+
+    #[test]
+    fn damage_can_be_cancelled_and_health_changed() {
+        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
+        engine
+            .load(
+                "medic",
+                "medic.luau",
+                r#"
+                    server.on("player_damage", function(event)
+                        print(`{event.cause} {event.amount} of {event.health}`)
+                        if event.cause == "fall" then event.cancel() end
+                    end)
+                    server.on("player_respawn", function(player)
+                        player:set_health(10)
+                        player.damage(2.5, "magic")
+                        player.damage(1)
+                    end)
+                    server.on("player_death", function(event)
+                        print(`{event.cause}: {event.message}`)
+                        event.player.damage(1, "laser")
+                    end)
+                "#,
+            )
+            .unwrap();
+        let steve = crate::Player {
+            name: "Steve".into(),
+            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
+        };
+        let damage = |cause: &str| {
+            Event::PlayerDamage(crate::Damage {
+                player: steve.clone(),
+                cause: cause.into(),
+                amount: 4.0,
+                health: 20.0,
+            })
+        };
+        assert!(engine.dispatch(&damage("fall")));
+        assert!(!engine.dispatch(&damage("void")));
+
+        engine.dispatch(&Event::PlayerRespawn(steve.clone()));
+        let uuid = steve.uuid.clone();
+        assert_eq!(
+            actions.try_recv().unwrap(),
+            Action::SetHealth {
+                player: uuid.clone(),
+                health: 10.0
+            }
+        );
+        assert_eq!(
+            actions.try_recv().unwrap(),
+            Action::Damage {
+                player: uuid.clone(),
+                amount: 2.5,
+                cause: "magic".into()
+            }
+        );
+        assert_eq!(
+            actions.try_recv().unwrap(),
+            Action::Damage {
+                player: uuid,
+                amount: 1.0,
+                cause: "none".into()
+            },
+            "damage without a cause"
+        );
+
+        // Unknown causes are errors, so nothing is sent.
+        engine.dispatch(&Event::PlayerDeath {
+            player: steve.clone(),
+            cause: "void".into(),
+            message: "Steve fell out of the world".into(),
+        });
+        assert!(actions.try_recv().is_err());
+        assert_eq!(
+            messages(&lines),
+            [
+                "fall 4 of 20",
+                "void 4 of 20",
+                "void: Steve fell out of the world"
+            ]
+        );
+    }
+
+    #[test]
+    fn joins_and_quits_can_replace_the_vanilla_message() {
+        let (mut engine, _, mut actions) = engine_with_actions(DEFAULT_LIMITS);
+        engine
+            .load(
+                "greeter",
+                "greeter.luau",
+                r#"
+                    server.on("player_join", function(event)
+                        event.cancel()
+                        server.broadcast(`+ {event.player.name}`)
+                    end)
+                    server.on("player_quit", function(event)
+                        if event.is_cancelled() then error("not cancelled yet") end
+                    end)
+                "#,
+            )
+            .unwrap();
+        assert!(
+            engine.dispatch(&steve_joins()),
+            "the vanilla message is cancelled"
+        );
+        assert_eq!(
+            actions.try_recv().unwrap(),
+            Action::Broadcast("+ Steve".into())
+        );
+        let quit = Event::PlayerQuit(crate::Player {
+            name: "Steve".into(),
+            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
+        });
+        assert!(!engine.dispatch(&quit), "the vanilla message stays");
     }
 }

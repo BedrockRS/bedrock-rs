@@ -12,8 +12,10 @@
 //!    VoxelShapes, StartGame and ItemRegistry.
 //! 5. RequestChunkRadius → ChunkRadiusUpdated, NetworkChunkPublisherUpdate, the
 //!    chunks in view, PlayStatus(PlayerSpawn) and CreativeContent.
-//! 6. SetLocalPlayerAsInitialized: the player is in the world. They join the
-//!    [`Players`](crate::players::Players) and plugins hear `player_join`.
+//! 6. SetLocalPlayerAsInitialized: the player is past the loading screen and
+//!    in the world. They join the [`Players`](crate::players::Players); a
+//!    moment later plugins hear `player_join` and, unless one cancels it,
+//!    everyone sees vanilla's "joined the game" message.
 //!
 //! From then on, chat messages (Text) are relayed to every player unless a
 //! plugin cancels them, slash commands (CommandRequest) are run and answered
@@ -22,7 +24,8 @@
 //! change through the session's [`Control`] channel. Item
 //! stack requests move items in the player's [`Inventory`], which is saved
 //! with the player. Plugins
-//! that heard `player_join` hear `player_quit` when the session ends.
+//! that heard `player_join` hear `player_quit` when the session ends, and
+//! unless one cancels it, everyone sees vanilla's "left the game" message.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -30,7 +33,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use bedrockrs_net::{ClientIdentity, Connection, Reliability};
-use bedrockrs_plugins::{BlockChange, CommandReply, Dispatcher, Event, Player, Position};
+use bedrockrs_plugins::{BlockChange, CommandReply, Damage, Dispatcher, Event, Player, Position};
 use bedrockrs_protocol::batch::{self, BatchError, Compression, CompressionAlgorithm};
 use bedrockrs_protocol::block::{BlockState, StateValue};
 use bedrockrs_protocol::io::DecodeError;
@@ -40,20 +43,21 @@ use bedrockrs_protocol::packet::{self, Encode, id};
 use bedrockrs_protocol::packets::Skin;
 use bedrockrs_protocol::packets::{
     AbilityData, AbilityLayer, Attribute, ChunkRadiusUpdated, Disconnect, DisconnectMessage,
-    DisconnectReason, EXEMPTED_PACKS, GameRule, GameRuleValue, InventoryTransaction,
-    ItemStackRequest, ItemStackResponse, JigsawStructureData, Login, NetworkChunkPublisherUpdate,
-    NetworkSettings, PackResponse, PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput,
-    PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
-    ResourcePackStack, ResourcePacksInfo, SetActorData, SetLocalPlayerAsInitialized, StackPack,
-    StackResponse, StartGame, Text, TextType, UpdateAbilities, UpdateAttributes, VoxelShapes,
-    ability, input_flag, player_action, use_item_action,
+    DisconnectReason, EXEMPTED_PACKS, InventoryTransaction, ItemStackRequest, ItemStackResponse,
+    JigsawStructureData, Login, NetworkChunkPublisherUpdate, NetworkSettings, PackResponse,
+    PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput, PlayerMovementSettings,
+    RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse, ResourcePackStack,
+    ResourcePacksInfo, SetActorData, SetLocalPlayerAsInitialized, StackPack, StackResponse,
+    StartGame, Text, TextType, UpdateAbilities, UpdateAttributes, VoxelShapes, ability, input_flag,
+    player_action, use_item_action,
+};
+use bedrockrs_protocol::packets::{
+    ActorEvent, CommandMessage, CommandOrigin, CommandOutput, CommandRequest, DeathInfo,
+    GameRulesChanged, Respawn, RespawnState, SetPlayerGameType,
 };
 use bedrockrs_protocol::packets::{
     Animate, ContainerClose, ContainerOpen, Interact, NO_WINDOW, OWN_INVENTORY_WINDOW, UseItem,
     interact_action,
-};
-use bedrockrs_protocol::packets::{
-    CommandMessage, CommandOrigin, CommandOutput, CommandRequest, SetPlayerGameType,
 };
 use bedrockrs_protocol::packets::{
     INVENTORY_WINDOW, InventoryAction, ItemInstance, MobEquipment, action_source,
@@ -68,15 +72,20 @@ use uuid::Uuid;
 use crate::TICK_DURATION;
 use crate::auth::AuthError;
 use crate::commands::{PlayerSender, Sender};
+use crate::damage::{
+    DamageCause, Health, PEACEFUL_REGENERATION_INTERVAL, VOID_DAMAGE, VOID_DEPTH, VOID_INTERVAL,
+    fall_damage,
+};
 use crate::entities::{ItemEntities, ItemStack, PickedUp};
 use crate::game_mode::GameMode;
+use crate::game_rules;
 use crate::inventory::{HOTBAR_SLOTS, Inventory};
 use crate::items::items;
-use crate::logins::{CONTROL_QUEUE, Control};
+use crate::logins::{CONTROL_QUEUE, Control, LoginClaim};
 use crate::placement::{self, Placing};
 use crate::players::{
-    EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, STANDING_HEIGHT, View, body_overlaps,
-    placeholder_skin, player_metadata,
+    EYE_HEIGHT, Joining, Membership, Movement, OUTBOUND_QUEUE, Profile, STANDING_HEIGHT, View,
+    body_overlaps, placeholder_skin, player_metadata,
 };
 use crate::server::{self, Server};
 use crate::storage::{SavedInventory, SavedPlayer};
@@ -112,9 +121,10 @@ const JOIN_EVENT_DELAY: Duration = Duration::from_millis(750);
 static ITEM_REGISTRY: LazyLock<Vec<u8>> = LazyLock::new(|| items().registry_packet().encode());
 static CREATIVE_CONTENT: LazyLock<Vec<u8>> = LazyLock::new(|| items().creative_packet().encode());
 
-/// Longest a chat message waits for plugins to decide whether to cancel it.
-/// Past that it is sent anyway: a stuck plugin must not silence chat.
-const CHAT_VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest a chat message, damage, or a join or quit message waits for
+/// plugins to decide whether to cancel it. Past that it goes ahead: a stuck
+/// plugin must not stall the game.
+const VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Serves one client until either side closes the connection.
 pub async fn run(mut connection: Connection, server: Arc<Server>) {
@@ -125,281 +135,119 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
         entity_id,
         server.default_game_mode,
     );
-    serve(&mut connection, &server, &mut session).await;
+    session.set_game_rules(server.game_rules.values());
+    let mut joined = None;
+    serve(&mut connection, &server, &mut session, &mut joined).await;
     // However the session ended, remember where the player left.
     if let Some((uuid, player)) = session.saved_player() {
         tracing::info!(%uuid, "{} left the game", session.player());
         server.save_player(uuid, &player);
     }
+    // Plugins that heard of the join hear of the quit, and may replace
+    // vanilla's message.
+    if let Some(player) = joined {
+        let event = Event::PlayerQuit(player.clone());
+        if !cancelled(&server.plugins, event, "a quit message").await {
+            server
+                .players
+                .broadcast_translation(LEFT_MESSAGE, &[player.name]);
+        }
+    }
 }
 
+/// How the packet loop goes on after delivering a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    /// The session ends; give the client time to read its last packets.
+    Close,
+    /// The connection is gone.
+    Lost,
+}
+
+/// Vanilla's join and quit messages, in yellow, filled in with the player's name.
+const JOINED_MESSAGE: &str = "§e%multiplayer.player.joined";
+const LEFT_MESSAGE: &str = "§e%multiplayer.player.left";
+
 /// The session's packet loop, until the connection closes or the session
-/// ends it.
-async fn serve(connection: &mut Connection, server: &Server, session: &mut Session) {
+/// ends it. Packets, ticks and what the rest of the server tells the session
+/// all produce [`Reply`]s, which [`Link::deliver`] carries out alike.
+/// `joined` is set to the player once plugins heard of their join.
+async fn serve(
+    connection: &mut Connection,
+    server: &Server,
+    session: &mut Session,
+    joined: &mut Option<Player>,
+) {
     let network_id = connection.network_id();
-    let entity_id = session.entity_id;
-    let mut compression = None;
     // Packets other sessions and plugins send this player, e.g. chat.
     let (outbound, mut queued) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
-    // Set once the player is in the world; leaving the loop drops it.
-    let mut membership = None;
+    // How the rest of the server reaches the session, once it claims its
+    // player's UUID: a newer login kicks it, commands change its game mode.
+    let (controls, mut control) = mpsc::channel::<Control>(CONTROL_QUEUE);
+    let mut link = Link {
+        server,
+        entity_id: session.entity_id,
+        compression: None,
+        outbound,
+        controls,
+        membership: None,
+        login_claim: None,
+        plugin_player: None,
+        joined: None,
+    };
     // The plugin join event, waiting out [`JOIN_EVENT_DELAY`].
     let mut join_event: Option<(Pin<Box<tokio::time::Sleep>>, Player)> = None;
-    // Set once the player's identity is verified: the one session for that
-    // UUID. The rest of the server reaches the session through it: a newer
-    // login for the same player kicks it, commands change its game mode.
-    let (controls, mut control) = mpsc::channel::<Control>(CONTROL_QUEUE);
-    let mut login_claim = None;
-    // The player as plugins know them, once they are in the world.
-    let mut plugin_player: Option<Player> = None;
-    // However the session ends, plugins that heard of the join hear of the quit.
-    let mut quit_event = QuitEvent {
-        plugins: &server.plugins,
-        player: None,
-    };
-
-    // Items in reach are picked up once a tick.
-    let mut pickups = tokio::time::interval(TICK_DURATION);
-    pickups.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The player's own tick: picking items up, the void, regeneration.
+    let mut ticks = tokio::time::interval(TICK_DURATION);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        tokio::select! {
+        let flow = tokio::select! {
             message = connection.recv() => {
                 let Some(message) = message else {
                     tracing::debug!(network_id, "client closed the connection");
                     return;
                 };
-                // Packets are handled in order; a reply may queue another, such
-                // as the login continuing once its token is verified.
-                let mut pending = VecDeque::new();
-                let packets = match batch::decode(&message.payload, compression.is_some()) {
-                    Ok(packets) => packets,
+                match batch::decode(&message.payload, link.compression.is_some()) {
                     Err(err) => {
-                        pending.push_back(SessionError::from(err).into_reply());
-                        Vec::new()
+                        let reply = SessionError::from(err).into_reply();
+                        link.deliver(connection, session, reply).await
                     }
-                };
-                let mut packets = packets.iter();
-                loop {
-                    let reply = match pending.pop_front() {
-                        Some(reply) => reply,
-                        None => match packets.next() {
-                            Some(packet) => session.handle(packet).unwrap_or_else(|err| err.into_reply()),
-                            None => break,
-                        },
-                    };
-                    let packets = reply.packets.iter().map(Vec::as_slice);
-                    if !send(connection, packets, compression).await {
-                        return;
-                    }
-                    if let Some(agreed) = reply.enable_compression {
-                        compression = Some(agreed);
-                    }
-                    for event in reply.events {
-                        match event {
-                            SessionEvent::Authenticate(token) => {
-                                let result = server.authenticator.verify(&token).await;
-                                pending.push_back(session.authenticated(result));
-                            }
-                            SessionEvent::LoggedIn(uuid) => {
-                                // Kicks this player's older session, if any.
-                                login_claim = Some(server.logins.claim(uuid, controls.clone()));
-                                session.set_operator(server.ops.contains(uuid));
-                            }
-                            SessionEvent::Joined { profile, movement, view, inventory, held } => {
-                                let player = Player {
-                                    name: profile.name.clone(),
-                                    uuid: profile.uuid.to_string(),
-                                };
-                                plugin_player = Some(player.clone());
-                                // Join first, so plugins greeting the player reach them too.
-                                membership = Some(server.players.join(Joining {
-                                    entity_id,
-                                    profile,
-                                    movement,
-                                    view,
-                                    inventory,
-                                    held,
-                                    game_mode: session.game_mode(),
-                                    outbound: outbound.clone(),
-                                }));
-                                let _ = outbound.try_send(available_commands(server, session));
-                                // Plugins hear of the join a little later: the
-                                // client's HUD shows messages that arrive while
-                                // it is still starting up twice.
-                                join_event = Some((
-                                    Box::pin(tokio::time::sleep(JOIN_EVENT_DELAY)),
-                                    player,
-                                ));
-                            }
-                            SessionEvent::Moved(movement) => {
-                                if let Some(membership) = &membership {
-                                    membership.moved(movement);
-                                }
-                            }
-                            SessionEvent::Viewing(view) => {
-                                if let Some(membership) = &membership {
-                                    membership.viewing(view);
-                                }
-                            }
-                            SessionEvent::BrokeBlock(pos) => {
-                                if let Some(broken) = server.break_block(pos, session.game_mode())
-                                    && let Some(player) = &plugin_player
-                                {
-                                    server.plugins.dispatch(Event::BlockBreak(
-                                        block_change(server, player, pos, broken),
-                                    ));
-                                }
-                            }
-                            SessionEvent::PlacedBlock { pos, block, replacing } => {
-                                let placed = match replacing {
-                                    Some(old) => server.place_block_over(pos, block, old),
-                                    None => server.place_block(pos, block),
-                                };
-                                if placed {
-                                    if let Some(player) = &plugin_player {
-                                        server.plugins.dispatch(Event::BlockPlace(
-                                            block_change(server, player, pos, block),
-                                        ));
-                                    }
-                                } else {
-                                    // Someone may have filled the spot since it
-                                    // was checked; undo the client's prediction.
-                                    let _ = outbound.try_send(server::block_update(pos, server.world.block(pos)));
-                                }
-                            }
-                            SessionEvent::Swing => {
-                                if let Some(membership) = &membership {
-                                    membership.swing();
-                                }
-                            }
-                            SessionEvent::Sneaking(sneaking) => {
-                                if let Some(membership) = &membership {
-                                    membership.sneaking(sneaking);
-                                }
-                            }
-                            SessionEvent::InventoryChanged(inventory) => {
-                                if let Some(membership) = &membership {
-                                    membership.inventory(inventory);
-                                }
-                            }
-                            SessionEvent::Dropped { stacks, feet, pitch, yaw } => {
-                                server.throw_items(feet, pitch, yaw, &stacks);
-                                // Others see the throw: the arm swings.
-                                if let Some(membership) = &membership {
-                                    membership.swing();
-                                }
-                            }
-                            SessionEvent::PickedUp(picked) => {
-                                server.show_pickups(&picked, entity_id);
-                            }
-                            SessionEvent::Holding { item, slot } => {
-                                if let Some(membership) = &membership {
-                                    membership.holding(item, slot);
-                                }
-                            }
-                            SessionEvent::Flying(flying) => {
-                                if let Some(membership) = &membership {
-                                    membership.flying(flying);
-                                }
-                            }
-                            SessionEvent::Command { line, origin } => {
-                                let reply = server.run_command(&session.command_sender(), &line).await;
-                                let output = session.command_output(origin, &reply);
-                                if !send(connection, [output.as_slice()].into_iter(), compression).await {
-                                    return;
-                                }
-                            }
-                            SessionEvent::GameModeChanged(mode) => {
-                                if let Some(membership) = &membership {
-                                    membership.game_mode(mode);
-                                }
-                            }
-                            SessionEvent::Chat(message) => {
-                                let cancelled = match &plugin_player {
-                                    Some(player) => chat_cancelled(&server.plugins, player, &message).await,
-                                    None => false,
-                                };
-                                if cancelled {
-                                    tracing::info!(target: "chat", "[cancelled] <{}> {message}", session.player());
-                                } else {
-                                    tracing::info!(target: "chat", "<{}> {message}", session.player());
-                                    server.players.chat(session.player(), &message);
-                                }
+                    Ok(packets) => {
+                        // Packets are handled in order, each with what it leads to.
+                        let mut flow = Flow::Continue;
+                        for packet in &packets {
+                            let reply = session.handle(packet).unwrap_or_else(|err| err.into_reply());
+                            flow = link.deliver(connection, session, reply).await;
+                            if flow != Flow::Continue {
+                                break;
                             }
                         }
-                    }
-                    if reply.close {
-                        drop(membership.take());
-                        linger(connection).await;
-                        return;
+                        flow
                     }
                 }
             }
             Some(control) = control.recv() => {
-                let reply = match control {
-                    Control::Kick(notice) => {
-                        // A newer login for this player, or a plugin: this session ends.
-                        let reply = Reply::disconnect(notice.reason, notice.message);
-                        let _ = send(connection, reply.packets.iter().map(Vec::as_slice), compression).await;
-                        drop(membership.take());
-                        drop(login_claim.take());
-                        linger(connection).await;
-                        return;
-                    }
-                    Control::SetGameMode(mode) => session.set_game_mode(mode),
-                    Control::SetOperator(operator) => {
-                        let mut reply = session.operator_changed(operator);
-                        if membership.is_some() {
-                            reply.packets.push(available_commands(server, session).to_vec());
-                        }
-                        reply
-                    }
-                    Control::RefreshCommands if membership.is_some() => {
-                        Reply::send(vec![available_commands(server, session).to_vec()])
-                    }
-                    // Players still joining get the commands once they are in.
-                    Control::RefreshCommands => Reply::default(),
-                };
-                if !send(connection, reply.packets.iter().map(Vec::as_slice), compression).await {
-                    return;
-                }
-                for event in reply.events {
-                    if let Some(membership) = &membership {
-                        match event {
-                            SessionEvent::GameModeChanged(mode) => membership.game_mode(mode),
-                            SessionEvent::Flying(flying) => membership.flying(flying),
-                            _ => {}
-                        }
-                    }
-                }
+                let reply = link.control(session, control);
+                link.deliver(connection, session, reply).await
             }
             () = async { join_event.as_mut().expect("guarded").0.as_mut().await }, if join_event.is_some() => {
+                // The player is past the loading screen: plugins hear of the
+                // join, and may replace vanilla's message.
                 let (_, player) = join_event.take().expect("guarded");
-                quit_event.player = Some(player.clone());
-                server.plugins.dispatch(Event::PlayerJoin(player));
+                *joined = Some(player.clone());
+                let event = Event::PlayerJoin(player.clone());
+                if !cancelled(&server.plugins, event, "a join message").await {
+                    server
+                        .players
+                        .broadcast_translation(JOINED_MESSAGE, &[player.name]);
+                }
+                Flow::Continue
             }
-            _ = pickups.tick(), if membership.is_some() => {
-                let reply = session.pick_up(&server.items);
-                if !send(connection, reply.packets.iter().map(Vec::as_slice), compression).await {
-                    return;
-                }
-                for event in reply.events {
-                    match event {
-                        SessionEvent::InventoryChanged(inventory) => {
-                            if let Some(membership) = &membership {
-                                membership.inventory(inventory);
-                            }
-                        }
-                        SessionEvent::PickedUp(picked) => server.show_pickups(&picked, entity_id),
-                        SessionEvent::Holding { item, slot } => {
-                            if let Some(membership) = &membership {
-                                membership.holding(item, slot);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+            _ = ticks.tick(), if link.membership.is_some() => {
+                let reply = session.tick(&server.items);
+                link.deliver(connection, session, reply).await
             }
             Some(packet) = queued.recv() => {
                 // Send everything already waiting in one batch.
@@ -407,10 +255,272 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                 while let Ok(packet) = queued.try_recv() {
                     packets.push(packet);
                 }
-                if !send(connection, packets.iter().map(|packet| &packet[..]), compression).await {
-                    return;
+                if send(connection, packets.iter().map(|packet| &packet[..]), link.compression).await {
+                    Flow::Continue
+                } else {
+                    Flow::Lost
                 }
             }
+        };
+        if let Some(player) = link.joined.take() {
+            // Plugins hear of the join a little later: the client's HUD
+            // shows messages that arrive while it is still starting up twice.
+            join_event = Some((Box::pin(tokio::time::sleep(JOIN_EVENT_DELAY)), player));
+        }
+        match flow {
+            Flow::Continue => {}
+            Flow::Lost => return,
+            Flow::Close => {
+                // Out of the world and its UUID released before lingering.
+                drop(link.membership.take());
+                drop(link.login_claim.take());
+                linger(connection).await;
+                return;
+            }
+        }
+    }
+}
+
+/// What the packet loop keeps beyond the session: the player's place in the
+/// world, and how they are known to the rest of the server. It carries out
+/// what the session's replies ask of the server.
+struct Link<'a> {
+    server: &'a Server,
+    entity_id: u64,
+    compression: Option<Compression>,
+    outbound: mpsc::Sender<Bytes>,
+    controls: mpsc::Sender<Control>,
+    /// Set once the player is in the world; dropping it takes them out.
+    membership: Option<Membership<'a>>,
+    /// Set once the player's identity is verified: the one session for that UUID.
+    login_claim: Option<LoginClaim<'a>>,
+    /// The player as plugins know them, once they are in the world.
+    plugin_player: Option<Player>,
+    /// A join plugins should hear of, for the loop to schedule.
+    joined: Option<Player>,
+}
+
+impl Link<'_> {
+    /// What a control from the rest of the server does to the session.
+    fn control(&self, session: &mut Session, control: Control) -> Reply {
+        let in_world = self.membership.is_some();
+        match control {
+            // A newer login for this player, or a plugin: this session ends.
+            Control::Kick(notice) => Reply::disconnect(notice.reason, notice.message),
+            Control::SetGameMode(mode) => session.set_game_mode(mode),
+            Control::SetOperator(operator) => {
+                let mut reply = session.operator_changed(operator);
+                if in_world {
+                    reply
+                        .packets
+                        .push(available_commands(self.server, session).to_vec());
+                }
+                reply
+            }
+            Control::RefreshCommands if in_world => {
+                Reply::send(vec![available_commands(self.server, session).to_vec()])
+            }
+            // Players still joining get the commands once they are in.
+            Control::RefreshCommands => Reply::default(),
+            Control::SetHealth(health) => session.set_health(health),
+            Control::Damage { cause, amount } => session.damage(cause, amount),
+            Control::GameRules(rules) => session.set_game_rules(rules),
+        }
+    }
+
+    /// Sends a reply's packets and carries out its events, then the replies
+    /// those lead to, in order.
+    async fn deliver(
+        &mut self,
+        connection: &Connection,
+        session: &mut Session,
+        reply: Reply,
+    ) -> Flow {
+        let mut pending = VecDeque::from([reply]);
+        while let Some(reply) = pending.pop_front() {
+            let packets = reply.packets.iter().map(Vec::as_slice);
+            if !send(connection, packets, self.compression).await {
+                return Flow::Lost;
+            }
+            if let Some(agreed) = reply.enable_compression {
+                self.compression = Some(agreed);
+            }
+            for event in reply.events {
+                if let Some(next) = self.event(session, event).await {
+                    pending.push_back(next);
+                }
+            }
+            if reply.close {
+                return Flow::Close;
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Carries out one event; some lead to another reply.
+    async fn event(&mut self, session: &mut Session, event: SessionEvent) -> Option<Reply> {
+        let server = self.server;
+        match event {
+            SessionEvent::Authenticate(token) => {
+                let result = server.authenticator.verify(&token).await;
+                return Some(session.authenticated(result));
+            }
+            SessionEvent::LoggedIn(uuid) => {
+                // Kicks this player's older session, if any.
+                self.login_claim = Some(server.logins.claim(uuid, self.controls.clone()));
+                session.set_operator(server.ops.contains(uuid));
+            }
+            SessionEvent::Joined {
+                profile,
+                movement,
+                view,
+                inventory,
+                held,
+            } => {
+                let player = Player {
+                    name: profile.name.clone(),
+                    uuid: profile.uuid.to_string(),
+                };
+                self.plugin_player = Some(player.clone());
+                // Join first, so plugins greeting the player reach them too.
+                self.membership = Some(server.players.join(Joining {
+                    entity_id: self.entity_id,
+                    profile,
+                    movement,
+                    view,
+                    inventory,
+                    held,
+                    game_mode: session.game_mode(),
+                    health: session.health().value,
+                    outbound: self.outbound.clone(),
+                }));
+                let _ = self.outbound.try_send(available_commands(server, session));
+                self.joined = Some(player);
+            }
+            SessionEvent::Moved(movement) => self.with_membership(|it| it.moved(movement)),
+            SessionEvent::Viewing(view) => self.with_membership(|it| it.viewing(view)),
+            SessionEvent::BrokeBlock(pos) => {
+                if let Some(broken) = server.break_block(pos, session.game_mode())
+                    && let Some(player) = &self.plugin_player
+                {
+                    server
+                        .plugins
+                        .dispatch(Event::BlockBreak(block_change(server, player, pos, broken)));
+                }
+            }
+            SessionEvent::PlacedBlock {
+                pos,
+                block,
+                replacing,
+            } => {
+                let placed = match replacing {
+                    Some(old) => server.place_block_over(pos, block, old),
+                    None => server.place_block(pos, block),
+                };
+                if placed {
+                    if let Some(player) = &self.plugin_player {
+                        server
+                            .plugins
+                            .dispatch(Event::BlockPlace(block_change(server, player, pos, block)));
+                    }
+                } else {
+                    // Someone may have filled the spot since it was checked;
+                    // undo the client's prediction.
+                    let _ = self
+                        .outbound
+                        .try_send(server::block_update(pos, server.world.block(pos)));
+                }
+            }
+            SessionEvent::Swing => self.with_membership(|it| it.swing()),
+            SessionEvent::Sneaking(sneaking) => {
+                self.with_membership(|it| it.sneaking(sneaking));
+            }
+            SessionEvent::InventoryChanged(inventory) => {
+                self.with_membership(|it| it.inventory(inventory));
+            }
+            SessionEvent::Dropped {
+                stacks,
+                feet,
+                pitch,
+                yaw,
+            } => {
+                server.throw_items(feet, pitch, yaw, &stacks);
+                // Others see the throw: the arm swings.
+                self.with_membership(|it| it.swing());
+            }
+            SessionEvent::PickedUp(picked) => server.show_pickups(&picked, self.entity_id),
+            SessionEvent::Holding { item, slot } => {
+                self.with_membership(|it| it.holding(item, slot));
+            }
+            SessionEvent::Flying(flying) => self.with_membership(|it| it.flying(flying)),
+            SessionEvent::Command { line, origin } => {
+                let reply = server.run_command(&session.command_sender(), &line).await;
+                return Some(Reply::send(vec![session.command_output(origin, &reply)]));
+            }
+            SessionEvent::GameModeChanged(mode) => self.with_membership(|it| it.game_mode(mode)),
+            SessionEvent::Chat(message) => {
+                let cancelled = match &self.plugin_player {
+                    Some(player) => {
+                        let event = Event::PlayerChat {
+                            player: player.clone(),
+                            message: message.clone(),
+                        };
+                        cancelled(&server.plugins, event, "a chat message").await
+                    }
+                    None => false,
+                };
+                if cancelled {
+                    tracing::info!(target: "chat", "[cancelled] <{}> {message}", session.player());
+                } else {
+                    tracing::info!(target: "chat", "<{}> {message}", session.player());
+                    server.players.chat(session.player(), &message);
+                }
+            }
+            SessionEvent::Damage { cause, amount } => {
+                // Plugins may spare the player.
+                if let Some(player) = &self.plugin_player {
+                    let event = Event::PlayerDamage(Damage {
+                        player: player.clone(),
+                        cause: cause.name().to_owned(),
+                        amount,
+                        health: session.health().value,
+                    });
+                    if cancelled(&server.plugins, event, "damage").await {
+                        return None;
+                    }
+                }
+                return Some(session.apply_damage(cause, amount));
+            }
+            SessionEvent::Hurt => self.with_membership(|it| it.hurt()),
+            SessionEvent::HealthChanged(health) => self.with_membership(|it| it.health(health)),
+            SessionEvent::Died { cause, drops, feet } => {
+                self.with_membership(|it| it.died());
+                server.drop_death_items(feet, &drops);
+                server.announce_death(session.player(), cause);
+                if let Some(player) = &self.plugin_player {
+                    server.plugins.dispatch(Event::PlayerDeath {
+                        player: player.clone(),
+                        cause: cause.name().to_owned(),
+                        message: cause.death_message_english(session.player()),
+                    });
+                }
+            }
+            SessionEvent::Respawned => {
+                let health = session.health().value;
+                self.with_membership(|it| it.respawned(health));
+                if let Some(player) = &self.plugin_player {
+                    server
+                        .plugins
+                        .dispatch(Event::PlayerRespawn(player.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn with_membership(&self, action: impl FnOnce(&Membership<'_>)) {
+        if let Some(membership) = &self.membership {
+            action(membership);
         }
     }
 }
@@ -439,31 +549,13 @@ fn describe(state: &BlockState) -> String {
     format!("{}[{}]", state.name, states.join(","))
 }
 
-/// Tells plugins a player left when dropped, if they heard of the join.
-struct QuitEvent<'a> {
-    plugins: &'a Dispatcher,
-    player: Option<Player>,
-}
-
-impl Drop for QuitEvent<'_> {
-    fn drop(&mut self) {
-        if let Some(player) = self.player.take() {
-            self.plugins.dispatch(Event::PlayerQuit(player));
-        }
-    }
-}
-
-/// Asks plugins whether to cancel a chat message; a message they take too
-/// long over is sent.
-async fn chat_cancelled(plugins: &Dispatcher, player: &Player, message: &str) -> bool {
-    let event = Event::PlayerChat {
-        player: player.clone(),
-        message: message.to_owned(),
-    };
-    match tokio::time::timeout(CHAT_VERDICT_TIMEOUT, plugins.dispatch_cancellable(event)).await {
+/// Asks plugins whether to cancel `event` (`what` names it in the log). What
+/// they take too long over goes ahead: a stuck plugin must not stall the game.
+async fn cancelled(plugins: &Dispatcher, event: Event, what: &str) -> bool {
+    match tokio::time::timeout(VERDICT_TIMEOUT, plugins.dispatch_cancellable(event)).await {
         Ok(cancelled) => cancelled,
         Err(_) => {
-            tracing::warn!(player = %player.name, "plugins took too long over a chat message; sending it");
+            tracing::warn!("plugins took too long to decide on {what}; it goes ahead");
             false
         }
     }
@@ -581,6 +673,21 @@ pub enum SessionEvent {
     Command { line: String, origin: CommandOrigin },
     /// The player's game mode changed.
     GameModeChanged(GameMode),
+    /// The player is about to take damage, unless plugins cancel it; then
+    /// [`Session::apply_damage`] deals it.
+    Damage { cause: DamageCause, amount: f32 },
+    /// The player was hurt; others see them flinch.
+    Hurt,
+    /// The player's health is now this, for saving.
+    HealthChanged(f32),
+    /// The player died, standing at `feet`, dropping `drops`.
+    Died {
+        cause: DamageCause,
+        drops: Vec<ItemStack>,
+        feet: Vec3,
+    },
+    /// The dead player respawned.
+    Respawned,
 }
 
 impl Reply {
@@ -690,6 +797,15 @@ pub struct Session {
     default_game_mode: GameMode,
     /// Whether the player may run operator commands.
     operator: bool,
+    /// The player's `minecraft:health`; 0 while they are dead.
+    health: Health,
+    /// How far the player has fallen since they last stood on something.
+    fall_distance: f32,
+    /// The player's own ticks since they joined, for what happens every so
+    /// many: the void hurting, regeneration.
+    ticks: u64,
+    /// The world's game rules, as last told.
+    rules: game_rules::Values,
     world: Arc<World>,
 }
 
@@ -728,6 +844,10 @@ impl Session {
             game_mode: default_game_mode,
             default_game_mode,
             operator: false,
+            health: Health::PLAYER,
+            fall_distance: 0.0,
+            ticks: 0,
+            rules: game_rules::Values::default(),
             world,
         }
     }
@@ -748,6 +868,7 @@ impl Session {
             let mut saved = self.movement.saved(self.flying);
             saved.inventory = Some(self.inventory.saved());
             saved.game_mode = Some(self.game_mode.name().to_owned());
+            saved.health = Some(self.health.value);
             (self.uuid, saved)
         })
     }
@@ -759,6 +880,249 @@ impl Session {
 
     pub fn game_mode(&self) -> GameMode {
         self.game_mode
+    }
+
+    pub fn health(&self) -> Health {
+        self.health
+    }
+
+    fn is_dead(&self) -> bool {
+        self.health.is_dead()
+    }
+
+    /// Takes in the world's game rules; a client in the world is told them.
+    pub fn set_game_rules(&mut self, rules: game_rules::Values) -> Reply {
+        self.rules = rules;
+        if !self.stage.in_world() {
+            return Reply::default();
+        }
+        Reply::send(vec![
+            GameRulesChanged {
+                rules: rules.packet_rules(),
+            }
+            .encode(),
+        ])
+    }
+
+    /// Damage the player would take, unless they are dead, not in the world
+    /// yet, or in a game mode that spares them. Plugins hear of it before
+    /// [`Session::apply_damage`] deals it.
+    fn proposed_damage(&self, cause: DamageCause, amount: f32) -> Option<SessionEvent> {
+        let spared = !cause.ignores_game_mode() && !self.game_mode.takes_damage();
+        if self.stage != Stage::InGame || self.is_dead() || spared || amount <= 0.0 {
+            return None;
+        }
+        Some(SessionEvent::Damage { cause, amount })
+    }
+
+    /// Hurts the player, as a command or plugin asks.
+    pub fn damage(&mut self, cause: DamageCause, amount: f32) -> Reply {
+        Reply {
+            events: self.proposed_damage(cause, amount).into_iter().collect(),
+            ..Reply::default()
+        }
+    }
+
+    /// Deals damage plugins let through: the player flinches, or dies.
+    pub fn apply_damage(&mut self, cause: DamageCause, amount: f32) -> Reply {
+        // The player may have died or left the world while plugins decided.
+        if self.proposed_damage(cause, amount).is_none() {
+            return Reply::default();
+        }
+        self.health.hurt(amount);
+        tracing::debug!(player = %self.player, cause = cause.name(), amount, health = self.health.value, "hurt");
+        if self.is_dead() {
+            return self.die(cause);
+        }
+        Reply {
+            packets: vec![
+                self.health_attribute().encode(),
+                ActorEvent::new(self.entity_id, ActorEvent::HURT).encode(),
+            ],
+            events: vec![
+                SessionEvent::Hurt,
+                SessionEvent::HealthChanged(self.health.value),
+            ],
+            ..Reply::default()
+        }
+    }
+
+    /// Sets the player's health, as a plugin asks; 0 kills them.
+    pub fn set_health(&mut self, health: f32) -> Reply {
+        if self.stage != Stage::InGame || self.is_dead() {
+            return Reply::default();
+        }
+        self.health.set(health);
+        if self.is_dead() {
+            return self.die(DamageCause::Override);
+        }
+        Reply {
+            packets: vec![self.health_attribute().encode()],
+            events: vec![SessionEvent::HealthChanged(self.health.value)],
+            ..Reply::default()
+        }
+    }
+
+    /// The player dies: their client shows the death screen, and unless the
+    /// `keepinventory` rule says otherwise, what they carried falls where
+    /// they died.
+    fn die(&mut self, cause: DamageCause) -> Reply {
+        self.health.set(0.0);
+        self.fall_distance = 0.0;
+        tracing::info!(uuid = %self.uuid, cause = cause.name(), "{} died", self.player);
+        let mut packets = vec![
+            self.health_attribute().encode(),
+            ActorEvent::new(self.entity_id, ActorEvent::DEATH).encode(),
+            DeathInfo {
+                cause: cause.death_message().to_owned(),
+                messages: vec![self.player.clone()],
+            }
+            .encode(),
+        ];
+        let mut events = vec![SessionEvent::HealthChanged(0.0)];
+        let drops = if self.rules.keepinventory {
+            Vec::new()
+        } else {
+            self.inventory.clear()
+        };
+        if !drops.is_empty() {
+            packets.extend(self.inventory_sync());
+            events.push(SessionEvent::InventoryChanged(self.inventory.saved()));
+            events.extend(self.held_event());
+        }
+        events.push(SessionEvent::Died {
+            cause,
+            drops,
+            feet: self.movement.feet(),
+        });
+        Reply {
+            packets,
+            events,
+            ..Reply::default()
+        }
+    }
+
+    /// The death screen's Respawn button: the player comes back at the world
+    /// spawn with full health.
+    fn respawn(&mut self, respawn: Respawn) -> Reply {
+        if respawn.state != RespawnState::ClientReadyToSpawn || !self.is_dead() {
+            return Reply::default();
+        }
+        self.health = Health::PLAYER;
+        self.fall_distance = 0.0;
+        self.flying = self.game_mode == GameMode::Spectator;
+        self.movement = self.spawn_movement();
+        tracing::info!(uuid = %self.uuid, "{} respawned", self.player);
+        let mut packets = vec![
+            Respawn {
+                position: self.movement.position,
+                state: RespawnState::ReadyToSpawn,
+                entity_runtime_id: self.entity_id,
+            }
+            .encode(),
+            self.health_attribute().encode(),
+            self.own_abilities().encode(),
+        ];
+        // The spawn may be far from where they died.
+        packets.extend(self.stream_chunks(self.view.radius()));
+        let mut events = vec![
+            SessionEvent::Moved(self.movement),
+            SessionEvent::HealthChanged(self.health.value),
+            SessionEvent::Flying(self.flying),
+        ];
+        events.extend(self.view_event());
+        events.push(SessionEvent::Respawned);
+        Reply {
+            packets,
+            events,
+            ..Reply::default()
+        }
+    }
+
+    /// Standing on the world spawn, looking ahead.
+    fn spawn_movement(&self) -> Movement {
+        let spawn = self.world.spawn();
+        Movement {
+            position: Vec3 {
+                x: spawn.x as f32 + 0.5,
+                y: spawn.y as f32 + EYE_HEIGHT,
+                z: spawn.z as f32 + 0.5,
+            },
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            on_ground: true,
+        }
+    }
+
+    /// The player's health as their client shows it.
+    fn health_attribute(&self) -> UpdateAttributes {
+        UpdateAttributes {
+            entity_runtime_id: self.entity_id,
+            attributes: vec![self.health_value()],
+            tick: 0,
+        }
+    }
+
+    fn health_value(&self) -> Attribute {
+        Attribute {
+            value: self.health.shown(),
+            default: self.health.max,
+            ..Attribute::at_default("minecraft:health", 0.0, self.health.max, self.health.max)
+        }
+    }
+
+    /// The player's own tick, while they are in the world: picking items up,
+    /// the void hurting, and regeneration (the world is always peaceful, where
+    /// players regain a point a second).
+    pub fn tick(&mut self, items: &ItemEntities) -> Reply {
+        if self.stage != Stage::InGame || self.is_dead() {
+            return Reply::default();
+        }
+        self.ticks += 1;
+        let mut reply = self.pick_up(items);
+        if self.movement.feet().y < VOID_DEPTH && self.ticks.is_multiple_of(VOID_INTERVAL) {
+            reply
+                .events
+                .extend(self.proposed_damage(DamageCause::Void, VOID_DAMAGE));
+        }
+        if self.rules.naturalregeneration
+            && !self.health.is_full()
+            && self.ticks.is_multiple_of(PEACEFUL_REGENERATION_INTERVAL)
+        {
+            self.health.heal(1.0);
+            reply.packets.push(self.health_attribute().encode());
+            reply
+                .events
+                .push(SessionEvent::HealthChanged(self.health.value));
+        }
+        reply
+    }
+
+    /// Follows a fall from the player's movement: falling builds up a
+    /// distance that landing turns into damage, as vanilla works it out.
+    /// Rising, flying or a mode that cannot be hurt starts it over. Landing
+    /// is when the client reports touching something below.
+    fn fall(&mut self, from: Movement, to: Movement, collided: bool) -> Option<SessionEvent> {
+        let dropped = from.feet().y - to.feet().y;
+        if self.flying || !self.game_mode.takes_damage() || self.is_dead() {
+            self.fall_distance = 0.0;
+            return None;
+        }
+        if collided && dropped >= 0.0 {
+            let distance = self.fall_distance + dropped;
+            self.fall_distance = 0.0;
+            if !self.rules.falldamage {
+                return None;
+            }
+            return self.proposed_damage(DamageCause::Fall, fall_damage(distance));
+        }
+        if dropped > 0.0 {
+            self.fall_distance += dropped;
+        } else {
+            self.fall_distance = 0.0;
+        }
+        None
     }
 
     /// Whether the player is an operator; set from the operator list at
@@ -864,6 +1228,7 @@ impl Session {
             }
             (Stage::InGame, id::PLAYER_AUTH_INPUT) => Ok(self.auth_input(packet::decode(payload)?)),
             (Stage::InGame, id::PLAYER_ACTION) => Ok(self.player_action(packet::decode(payload)?)),
+            (Stage::InGame, id::RESPAWN) => Ok(self.respawn(packet::decode(payload)?)),
             (Stage::InGame, id::ANIMATE) => Ok(self.animate(packet::decode(payload)?)),
             (stage, id::MOB_EQUIPMENT) if stage.in_world() => {
                 Ok(self.equipment(packet::decode(payload)?))
@@ -1017,6 +1382,12 @@ impl Session {
         if let Some(saved) = self.world.load_player(self.uuid) {
             self.movement = Movement::from_saved(&saved);
             self.flying = saved.flying;
+            match saved.health {
+                // Someone who left while dead comes back at the spawn.
+                Some(health) if health <= 0.0 => self.movement = self.spawn_movement(),
+                Some(health) => self.health.set(health),
+                None => {}
+            }
             if let Some(name) = &saved.game_mode {
                 match GameMode::from_name(name) {
                     Some(mode) => self.game_mode = mode,
@@ -1079,6 +1450,7 @@ impl Session {
                         &self.movement,
                         self.game_mode,
                         self.default_game_mode,
+                        &self.rules,
                     )
                     .encode(),
                     // Every vanilla item the server knows.
@@ -1144,7 +1516,7 @@ impl Session {
                 Attribute::at_default("minecraft:movement", 0.0, f32::MAX, ability::WALK_SPEED),
                 Attribute::at_default("minecraft:underwater_movement", 0.0, f32::MAX, 0.02),
                 Attribute::at_default("minecraft:lava_movement", 0.0, f32::MAX, 0.02),
-                Attribute::at_default("minecraft:health", 0.0, 20.0, 20.0),
+                self.health_value(),
             ],
             tick: 0,
         }
@@ -1259,6 +1631,10 @@ impl Session {
     /// Records where the client says its player is. The client is trusted
     /// for now: movement is not validated beyond rejecting non-finite values.
     fn auth_input(&mut self, input: PlayerAuthInput) -> Reply {
+        // The dead lie still until they respawn.
+        if self.is_dead() {
+            return Reply::default();
+        }
         // Blocks broken this tick, even when the player stands still.
         if input.block_actions_unread {
             tracing::debug!(player = %self.player, "block actions hidden behind an item stack request");
@@ -1675,6 +2051,9 @@ impl Session {
     /// lets them build, and it is inside the world's height, within reach,
     /// and in a chunk their client has.
     fn break_block(&self, pos: BlockPos) -> Option<SessionEvent> {
+        if self.is_dead() {
+            return None;
+        }
         if !self.game_mode.may_build() {
             tracing::debug!(player = %self.player, ?pos, mode = self.game_mode.name(), "refusing to change a block in this game mode");
             return None;
@@ -1721,10 +2100,13 @@ impl Session {
         if movement == self.movement {
             return Reply::default();
         }
+        let collided = input.input_flags.contains(&input_flag::VERTICAL_COLLISION);
+        let landing = self.fall(self.movement, movement, collided);
         self.movement = movement;
 
         // Crossing into another chunk moves the view along with the player.
         let mut events = vec![SessionEvent::Moved(movement)];
+        events.extend(landing);
         let packets = if self.view.crosses_into(movement.chunk()) {
             let packets = self.stream_chunks(self.view.radius());
             events.extend(self.view_event());
@@ -1797,6 +2179,7 @@ fn start_game(
     movement: &Movement,
     game_mode: GameMode,
     default_game_mode: GameMode,
+    rules: &game_rules::Values,
 ) -> StartGame {
     let spawn = world.spawn();
     StartGame {
@@ -1832,11 +2215,7 @@ fn start_game(
         platform_broadcast_mode: 0,
         commands_enabled: true,
         texture_pack_required: false,
-        game_rules: vec![GameRule {
-            name: "showcoordinates".into(),
-            editable: false,
-            value: GameRuleValue::Bool(true),
-        }],
+        game_rules: rules.packet_rules(),
         experiments: Vec::new(),
         experiments_previously_toggled: false,
         bonus_chest_enabled: false,
@@ -3409,5 +3788,199 @@ mod tests {
             panic!("a player sends commands");
         };
         assert!(sender.operator);
+    }
+
+    /// PlayerAuthInput with the player's feet at `feet_y` above the spawn,
+    /// touching something below when `landed`.
+    fn moving_to(feet_y: f32, landed: bool) -> Vec<u8> {
+        let eyes = Vec3 {
+            x: 0.5,
+            y: feet_y + EYE_HEIGHT,
+            z: 0.5,
+        };
+        let mut input = PlayerAuthInput::decode_payload(&mut bedrockrs_protocol::io::Reader::new(
+            &breaking_input(eyes, 0.0, Vec::new())[2..],
+        ))
+        .unwrap();
+        if landed {
+            input.input_flags = vec![input_flag::VERTICAL_COLLISION];
+        }
+        input.encode()
+    }
+
+    fn survival_session() -> Session {
+        let mut session = in_game_session();
+        session.set_game_mode(GameMode::Survival);
+        session
+    }
+
+    fn damage_events(reply: &Reply) -> Vec<(DamageCause, f32)> {
+        reply
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Damage { cause, amount } => Some((*cause, *amount)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn landing_after_a_fall_hurts() {
+        let mut session = survival_session();
+        // Up ten blocks (rising builds no fall), then down in two steps.
+        session.handle(&moving_to(-50.0, false)).unwrap();
+        session.handle(&moving_to(-55.0, false)).unwrap();
+        let reply = session.handle(&moving_to(-60.0, true)).unwrap();
+        assert_eq!(damage_events(&reply), [(DamageCause::Fall, 7.0)]);
+
+        // Plugins let it through: the player flinches and is told their health.
+        let reply = session.apply_damage(DamageCause::Fall, 7.0);
+        assert_eq!(ids(&reply), [id::UPDATE_ATTRIBUTES, id::ACTOR_EVENT]);
+        assert_eq!(
+            reply.events,
+            [SessionEvent::Hurt, SessionEvent::HealthChanged(13.0)]
+        );
+        assert_eq!(session.saved_player().unwrap().1.health, Some(13.0));
+
+        // A jump is no fall.
+        session.handle(&moving_to(-58.75, false)).unwrap();
+        let reply = session.handle(&moving_to(-60.0, true)).unwrap();
+        assert!(damage_events(&reply).is_empty());
+    }
+
+    #[test]
+    fn falls_spare_creative_players_and_follow_the_rule() {
+        let mut session = in_game_session();
+        session.handle(&moving_to(-40.0, false)).unwrap();
+        let reply = session.handle(&moving_to(-60.0, true)).unwrap();
+        assert!(damage_events(&reply).is_empty(), "creative");
+
+        let mut session = survival_session();
+        session.set_game_rules(game_rules::Values {
+            falldamage: false,
+            ..game_rules::Values::default()
+        });
+        session.handle(&moving_to(-40.0, false)).unwrap();
+        let reply = session.handle(&moving_to(-60.0, true)).unwrap();
+        assert!(damage_events(&reply).is_empty(), "falldamage is off");
+    }
+
+    #[test]
+    fn commands_and_plugins_reach_every_game_mode() {
+        let mut session = in_game_session();
+        assert!(session.damage(DamageCause::Lava, 5.0).events.is_empty());
+        assert_eq!(
+            damage_events(&session.damage(DamageCause::SelfDestruct, f32::MAX)),
+            [(DamageCause::SelfDestruct, f32::MAX)]
+        );
+        let reply = session.set_health(0.0);
+        assert!(
+            reply.events.iter().any(|event| matches!(
+                event,
+                SessionEvent::Died {
+                    cause: DamageCause::Override,
+                    ..
+                }
+            )),
+            "{:?}",
+            reply.events
+        );
+    }
+
+    #[test]
+    fn dying_drops_everything_and_respawning_starts_over() {
+        let mut session = survival_session();
+        session.handle(&moving_to(-55.0, false)).unwrap();
+        let reply = session.apply_damage(DamageCause::Void, 25.0);
+        assert_eq!(
+            ids(&reply)[..3],
+            [id::UPDATE_ATTRIBUTES, id::ACTOR_EVENT, id::DEATH_INFO]
+        );
+        let Some(SessionEvent::Died { cause, drops, feet }) = reply.events.last() else {
+            panic!("expected a death, got {:?}", reply.events);
+        };
+        assert_eq!(*cause, DamageCause::Void);
+        assert_eq!(drops.len(), TEST_KIT.len());
+        assert_eq!(feet.y, -55.0);
+        assert!(session.inventory().hotbar(0).is_none(), "nothing is kept");
+        assert_eq!(session.saved_player().unwrap().1.health, Some(0.0));
+
+        // The dead neither move nor take more damage.
+        assert!(
+            session
+                .handle(&moving_to(-40.0, false))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(
+            session
+                .apply_damage(DamageCause::Void, 1.0)
+                .events
+                .is_empty()
+        );
+
+        let respawn = Respawn {
+            position: Vec3::default(),
+            state: RespawnState::ClientReadyToSpawn,
+            entity_runtime_id: PLAYER_ENTITY_ID,
+        };
+        let reply = session.handle(&respawn.encode()).unwrap();
+        assert_eq!(
+            ids(&reply)[..3],
+            [id::RESPAWN, id::UPDATE_ATTRIBUTES, id::UPDATE_ABILITIES]
+        );
+        assert_eq!(reply.events.last(), Some(&SessionEvent::Respawned));
+        assert!(session.health().is_full());
+        assert_eq!(
+            session.saved_player().unwrap().1.y,
+            -60.0,
+            "back at the spawn"
+        );
+        // Respawning twice does nothing.
+        assert!(
+            session
+                .handle(&respawn.encode())
+                .unwrap()
+                .packets
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn keepinventory_keeps_everything() {
+        let mut session = survival_session();
+        session.set_game_rules(game_rules::Values {
+            keepinventory: true,
+            ..game_rules::Values::default()
+        });
+        let reply = session.apply_damage(DamageCause::Fall, 30.0);
+        let Some(SessionEvent::Died { drops, .. }) = reply.events.last() else {
+            panic!("expected a death");
+        };
+        assert!(drops.is_empty());
+        assert!(session.inventory().hotbar(0).is_some());
+    }
+
+    #[test]
+    fn the_void_hurts_and_peaceful_heals() {
+        let items = ItemEntities::new();
+        let mut session = survival_session();
+        session.handle(&moving_to(-70.0, false)).unwrap();
+        let hurts: Vec<_> = (0..20)
+            .flat_map(|_| damage_events(&session.tick(&items)))
+            .collect();
+        assert_eq!(hurts, [(DamageCause::Void, 4.0), (DamageCause::Void, 4.0)]);
+
+        let mut session = survival_session();
+        session.apply_damage(DamageCause::Fall, 5.0);
+        for _ in 0..19 {
+            session.tick(&items);
+        }
+        assert_eq!(session.health().value, 15.0);
+        let reply = session.tick(&items);
+        assert_eq!(session.health().value, 16.0, "a point a second");
+        assert!(reply.events.contains(&SessionEvent::HealthChanged(16.0)));
     }
 }

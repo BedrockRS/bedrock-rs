@@ -20,6 +20,7 @@ pub mod id {
     pub const MOVE_PLAYER: u32 = 19;
     pub const UPDATE_BLOCK: u32 = 21;
     pub const LEVEL_EVENT: u32 = 25;
+    pub const ACTOR_EVENT: u32 = 27;
     pub const UPDATE_ATTRIBUTES: u32 = 29;
     pub const INVENTORY_TRANSACTION: u32 = 30;
     pub const MOB_EQUIPMENT: u32 = 31;
@@ -28,6 +29,7 @@ pub mod id {
     pub const SET_ACTOR_DATA: u32 = 39;
     pub const SET_ACTOR_MOTION: u32 = 40;
     pub const ANIMATE: u32 = 44;
+    pub const RESPAWN: u32 = 45;
     pub const CONTAINER_OPEN: u32 = 46;
     pub const CONTAINER_CLOSE: u32 = 47;
     pub const INVENTORY_CONTENT: u32 = 49;
@@ -36,6 +38,7 @@ pub mod id {
     pub const SET_PLAYER_GAME_TYPE: u32 = 62;
     pub const PLAYER_LIST: u32 = 63;
     pub const REQUEST_CHUNK_RADIUS: u32 = 69;
+    pub const GAME_RULES_CHANGED: u32 = 72;
     pub const CHUNK_RADIUS_UPDATED: u32 = 70;
     pub const AVAILABLE_COMMANDS: u32 = 76;
     pub const COMMAND_REQUEST: u32 = 77;
@@ -53,6 +56,7 @@ pub mod id {
     pub const UPDATE_PLAYER_GAME_TYPE: u32 = 151;
     pub const ITEM_REGISTRY: u32 = 162;
     pub const UPDATE_ABILITIES: u32 = 187;
+    pub const DEATH_INFO: u32 = 189;
     pub const REQUEST_NETWORK_SETTINGS: u32 = 193;
     pub const JIGSAW_STRUCTURE_DATA: u32 = 313;
     pub const VOXEL_SHAPES: u32 = 337;

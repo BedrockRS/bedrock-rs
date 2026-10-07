@@ -429,6 +429,23 @@ pub fn block_drop(pos: BlockPos, seed: u64) -> (Vec3, Vec3) {
     (position, velocity)
 }
 
+/// Where an item a dying player drops starts and how fast it goes: at their
+/// feet, popping up and scattering a little, as Dragonfly drops them.
+pub fn death_drop(feet: Vec3, seed: u64) -> (Vec3, Vec3) {
+    let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let unit = |shift: u32| ((mixed >> shift) & 0xFFFF) as f32 / 65535.0 - 0.5;
+    let position = Vec3 {
+        y: feet.y + 0.25,
+        ..feet
+    };
+    let velocity = Vec3 {
+        x: unit(0) * 0.2,
+        y: 0.2,
+        z: unit(16) * 0.2,
+    };
+    (position, velocity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

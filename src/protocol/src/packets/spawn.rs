@@ -249,6 +249,25 @@ impl GameRule {
     }
 }
 
+/// Game rules that changed, such as after `/gamerule`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameRulesChanged {
+    pub rules: Vec<GameRule>,
+}
+
+impl Packet for GameRulesChanged {
+    const ID: u32 = id::GAME_RULES_CHANGED;
+}
+
+impl Encode for GameRulesChanged {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_u32(u32::try_from(self.rules.len()).expect("a few game rules"));
+        for rule in &self.rules {
+            rule.write(writer);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlayerMovementSettings {
     pub rewind_history_size: i32,

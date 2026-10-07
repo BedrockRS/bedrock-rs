@@ -13,7 +13,9 @@
 //!
 //! Only the Luau engine exists so far; [`PluginHost`] runs Luau plugins.
 //! Plugins listen for game [`Event`]s with `server.on(name, handler)`, may
-//! cancel some (`player_chat`), and ask the server for [`Action`]s such as
+//! cancel some (`player_join`, `player_quit`, `player_chat`, `player_damage`),
+//! and ask the server for
+//! [`Action`]s such as
 //! `server.broadcast(message)`, or, on a player from an event,
 //! `player.send_message(message)` and `player.kick(reason)`. Plugins add
 //! slash commands, with subcommands and typed arguments, with
@@ -30,7 +32,7 @@ mod luau_commands;
 mod manifest;
 mod output;
 
-pub use api::{Action, BlockChange, Event, Player, Position};
+pub use api::{Action, BlockChange, DAMAGE_CAUSES, Damage, Event, Player, Position};
 pub use command::{
     ArgKind, ArgSpec, ArgValue, CommandCall, CommandNode, CommandReply, CommandSender, CommandSpec,
     GAME_MODE_VALUES, Permission, PluginCommand, ReplyLine,

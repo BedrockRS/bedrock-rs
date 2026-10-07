@@ -359,6 +359,18 @@ impl Inventory {
         self.main[slot].as_ref()
     }
 
+    /// Empties the whole inventory, cursor included, as dying does. Returns
+    /// what it held, for the world to take.
+    pub fn clear(&mut self) -> Vec<ItemStack> {
+        self.main
+            .iter_mut()
+            .chain(self.armor.iter_mut())
+            .chain([&mut self.offhand, &mut self.cursor])
+            .filter_map(Option::take)
+            .map(|stack| stack.stack())
+            .collect()
+    }
+
     /// Uses up one item from a hotbar slot, as placing a block outside
     /// creative mode does. Returns the slot as it is now, for the client.
     pub fn use_one(&mut self, slot: i32) -> Option<InventorySlot> {

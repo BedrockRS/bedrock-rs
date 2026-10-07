@@ -1,6 +1,6 @@
-//! The sample plugin, end to end: it must welcome a joining player exactly
-//! once and greet them privately, and answer its slash command, subcommands
-//! included, through the plugin host.
+//! The sample plugin, end to end: it must leave vanilla's join message alone
+//! and greet a joining player privately exactly once, and answer its slash
+//! command, subcommands included, through the plugin host.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ fn sample_plugin_server(test: &str) -> (Arc<Server>, PluginHost, PathBuf) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_sample_plugin_welcomes_a_joining_player_once() {
+async fn the_sample_plugin_greets_a_joining_player_once() {
     let (server, plugins, directory) = sample_plugin_server("welcome");
     let (outbound, mut queue) = mpsc::channel(64);
     let uuid = uuid::Uuid::new_v4();
@@ -81,14 +81,19 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
         inventory: Default::default(),
         held: (bedrockrs_protocol::packets::ItemInstance::EMPTY, 0),
         game_mode: GameMode::Creative,
+        health: 20.0,
         outbound,
     });
-    server.plugins.dispatch(Event::PlayerJoin(Player {
+    let join = Event::PlayerJoin(Player {
         name: "Steve".into(),
         uuid: uuid.to_string(),
-    }));
+    });
+    assert!(
+        !server.plugins.dispatch_cancellable(join).await,
+        "vanilla's join message stays"
+    );
 
-    // Collect everything the player is sent for a while: a second welcome
+    // Collect everything the player is sent for a while: a second greeting
     // would arrive well within this window.
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut texts = Vec::new();
@@ -103,13 +108,7 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
     }
     drop(plugins);
     let _ = std::fs::remove_dir_all(&directory);
-    assert_eq!(
-        texts,
-        [
-            "§eWelcome to BedrockRS, Steve!",
-            "§7Only you can see this. Try §f/hello§7."
-        ]
-    );
+    assert_eq!(texts, ["§7Only you can see this. Try §f/hello§7."]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

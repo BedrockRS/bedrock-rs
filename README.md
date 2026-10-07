@@ -69,19 +69,24 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 
 - [x] Luau sandbox with hot reload
 - [x] `plugin.json` manifests
-- [x] Events: `player_join`, `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`
-- [x] Player methods: `send_message`, `set_game_mode`, `kick`; `server.broadcast`, `server.player(uuid)`
+- [x] Events: `player_join`, `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`, `player_damage` (cancellable), `player_death`, `player_respawn`
+- [x] Player methods: `send_message`, `set_game_mode`, `set_health`, `damage`, `kick`; `server.broadcast`, `server.player(uuid)`
 - [x] Slash commands with nested subcommands, typed arguments, aliases and permissions
 - [ ] `player.give` and item events
 - [ ] Cancellable block events
 - [ ] JavaScript/TypeScript engine
 - [ ] Python engine
 
-### Milestone 6: Survival ⬜
+### Milestone 6: Survival 🟡
 
+- [x] Health (`minecraft:health`), saved with the player
+- [x] Fall damage and the void, with vanilla's numbers
+- [x] Death screen, death messages, drops, and respawning at the world spawn
+- [x] Regeneration (the world is peaceful for now)
+- [x] Game rules: `falldamage`, `keepinventory`, `naturalregeneration`, `showcoordinates`, `showdeathmessages`
+- [ ] Difficulty, hunger and food
+- [ ] Combat (PvP) and armour
 - [ ] Block interactions
-- [ ] Health, damage and death
-- [ ] Hunger
 - [ ] Mobs and entity AI
 - [ ] Vanilla biome data
 
@@ -141,6 +146,8 @@ Type commands into the server console (with or without the `/`) or in game. The 
 | `/gamemode <gameMode> [player]` | operators | Sets a game mode, as in vanilla: `survival`, `creative`, `adventure`, `spectator`, `default` (or `s`, `c`, `a`, `d`, or `0`, `1`, `2`) |
 | `/op <player>` | operators | Makes an online player an operator |
 | `/deop <player>` | operators | Takes away a player's operator status |
+| `/gamerule [rule] [value]` | operators | Lists the game rules, or shows or sets one, e.g. `/gamerule keepinventory true` |
+| `/kill [target]` | operators | Kills a player (yourself by default) |
 | `/stop` | operators | Saves everything and stops the server |
 
 To make yourself an operator, join the server and type `op <your name>` in the console.
@@ -185,8 +192,10 @@ Each plugin is a folder in `server/plugins/` with a `plugin.json` and an entry s
 ```
 
 ```lua
-server.on("player_join", function(player)
-	server.broadcast(`§eWelcome to BedrockRS, {player.name}!`)
+-- Replace vanilla's "joined the game" message with your own.
+server.on("player_join", function(event)
+	event.cancel()
+	server.broadcast(`§a+ {event.player.name}`)
 end)
 ```
 
@@ -237,6 +246,10 @@ See [server/plugins/hello](server/plugins/hello) for a fuller example.
 ## 🧱 Project goals
 
 BedrockRS aims to be a fast, safe and extensible Bedrock server that is easy to run and easy to extend. The architecture is developed independently, using open specifications and reference projects for research only. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, research and build log.
+
+## 📚 Documentation
+
+Guides for running a server and the full plugin API reference are in the [BedrockRS docs](https://github.com/BedrockRS/docs).
 
 ## 🤝 Contributing
 

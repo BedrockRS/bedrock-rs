@@ -951,9 +951,48 @@ DTLS, SCTP, and multi-segment messages both ways.
   A change goes to the player as SetPlayerGameType plus UpdateAbilities, and to
   everyone else as UpdatePlayerGameType. Health, hunger and damage do not exist yet,
   so survival players cannot be hurt.
+- **Health and damage (implemented)** in `damage`, modelled on vanilla so behavior
+  packs can drive them later:
+  - `Health { value, max }` is the `minecraft:health` component (players: 20/20),
+    shown to the client as the `minecraft:health` attribute, rounded up.
+  - `DamageCause` is vanilla's full list, by the Script API's names (`fall`, `void`,
+    `selfDestruct`, `entityAttack`, …). Creative players and spectators are spared
+    everything but `selfDestruct` (`/kill`) and `override` (health set directly).
+  - **Falls:** the session adds up how far the player drops between inputs; landing
+    is the client's `VerticalCollision` input flag (50) while not rising. Damage is
+    `ceil(distance - 3)` from half a point, as Dragonfly and vanilla work it out;
+    rising, flying or an immune mode starts the count over. Breaking time and
+    movement are still trusted.
+  - **The void:** below y = -64, 4 damage every 10 ticks.
+  - **Regeneration:** the world is peaceful (StartGame difficulty 0), where players
+    regain a point every 20 ticks while `naturalregeneration` is on. Hunger comes
+    with difficulties.
+  - **Order:** the session proposes damage (`SessionEvent::Damage`); plugins hear
+    `player_damage` and may cancel it (2 s at most, like chat); then
+    `Session::apply_damage` deals it: UpdateAttributes and ActorEvent(Hurt) to the
+    player, ActorEvent(Hurt) to whoever sees them.
+  - **Death:** health 0, ActorEvent(Death) and DeathInfo (the death-screen message)
+    to the player; others see them fall over and lose sight of them after 20 ticks.
+    Unless `keepinventory`, everything they carry is dropped at their feet. The
+    death message goes to everyone as a translation (`%death.attack.fall`, …) when
+    `showdeathmessages` is on, and to the log in English. The dead ignore movement,
+    breaking and placing.
+  - **Respawn:** the death screen's button sends Respawn(ClientReadyToSpawn); the
+    server answers Respawn(ReadyToSpawn) at the world spawn with full health, as
+    Dragonfly does, and streams the chunks there. A player who left while dead
+    comes back at the spawn.
+- **Game rules (implemented)** in `game_rules`: `falldamage`, `keepinventory`,
+  `naturalregeneration`, `showcoordinates` and `showdeathmessages`, saved as
+  `game_rules.json` in the world directory (defaults as vanilla, except
+  `showcoordinates`, which the server has always turned on). They go to clients in
+  StartGame and, after `/gamerule`, in GameRulesChanged.
+- **Session loop:** packets, the player's tick and server controls all produce
+  `Reply`s; `Link::deliver` sends their packets and carries out their events in one
+  place, including events that lead to further replies (authentication, commands,
+  damage after plugins).
 - **Session controls (implemented)** in `logins`: the per-UUID channel that kicked
-  duplicate logins carries a `Control` enum: `Kick`, `SetGameMode`, `SetOperator` and
-  `RefreshCommands`. Commands and plugin actions reach a player's session through it,
+  duplicate logins carries a `Control` enum: `Kick`, `SetGameMode`, `SetOperator`,
+  `RefreshCommands`, `SetHealth`, `Damage` and `GameRules`. Commands and plugin actions reach a player's session through it,
   and the session applies them between packets.
 - **Commands (implemented)** in `commands`. Every command, built-in or from a plugin,
   is a `CommandSpec`: a name, description and aliases, and a tree of `CommandNode`s.
@@ -975,7 +1014,8 @@ DTLS, SCTP, and multi-segment messages both ways.
     plugin commands go to the plugin thread (`Dispatcher::run_command`) and wait at
     most 2 s for its reply.
   - **Built-in** (`commands::builtin`): `help [command]`, `list`, `version`, and for
-    operators `gamemode <gameMode> [player]`, `op <player>`, `deop <player>`, `stop`.
+    operators `gamemode <gameMode> [player]`, `gamerule [rule] [value]`,
+    `kill [target]`, `op <player>`, `deop <player>`, `stop`.
     `gamemode` matches vanilla: the client merges our `GameMode` enum with its own,
     so it carries exactly vanilla's names (`survival`, `creative`, `adventure`,
     `spectator`, `s`, `c`, `a`, `default`, `d`), and 0, 1 and 2 work through a
@@ -1017,13 +1057,19 @@ DTLS, SCTP, and multi-segment messages both ways.
 
   | Event | Handler receives | When |
   |---|---|---|
-  | `player_join` | the player | 750 ms after the player spawns |
-  | `player_quit` | the player | when the session of a player whose join plugins heard ends, however it ends |
+  | `player_join` | `{ player, cancel(), is_cancelled() }` | 750 ms after SetLocalPlayerAsInitialized, so once the client is past the loading screen and its HUD shows messages once; unless cancelled, everyone then sees vanilla's `§e%multiplayer.player.joined` |
+  | `player_quit` | `{ player, cancel(), is_cancelled() }` | when the session of a player whose join plugins heard ends, however it ends; unless cancelled, everyone sees `§e%multiplayer.player.left` |
   | `player_chat` | `{ player, message, cancel(), is_cancelled() }` | before a chat message is relayed; `cancel()` stops it, and later handlers still run and can check |
   | `block_break` | `{ player, position = { x, y, z }, block }` | after a player broke a block; `block` is the broken block's name |
   | `block_place` | `{ player, position = { x, y, z }, block }` | after a player placed a block |
+  | `player_damage` | `{ player, cause, amount, health, cancel(), is_cancelled() }` | before damage is dealt |
+  | `player_death` | `{ player, cause, message }` | after a player died; `message` is the death message in English |
+  | `player_respawn` | the player | after a dead player respawned |
 
-  Block events report what already happened and cannot be cancelled yet.
+  Block events report what already happened and cannot be cancelled yet. Cancellable
+  events wait at most 2 s for the plugins; past that, what they describe goes ahead.
+  The server sends the join and quit messages itself, so cancelling one and
+  broadcasting another is how plugins replace them.
 - **Luau API (implemented):**
   - `server.on(event, handler)`: unknown event names are an error. Handlers live in
     the VM's registry, so a reload drops the old ones with the old VM.
@@ -1052,6 +1098,9 @@ DTLS, SCTP, and multi-segment messages both ways.
     - `player.send_message(message)`: System chat to that player only.
     - `player.set_game_mode(mode)`: survival, creative, adventure or spectator (or
       vanilla's short forms, or `default`); anything else is a Lua error.
+    - `player.set_health(health)`: within 0 and 20; 0 kills them (cause `override`).
+    - `player.damage(amount, cause?)`: hurts them as `cause` (a vanilla cause name,
+      `none` by default) would, game mode and `player_damage` handlers permitting.
     - `player.kick(reason?)`: disconnects them with reason 55 (Kicked), showing
       `reason` or "You were kicked from the server.". Core delivers it through the
       same per-UUID channel as the duplicate-login kick.
@@ -1199,6 +1248,7 @@ Each step starts only after explicit confirmation.
 | 24 | Real skins: each player's skin (image, geometry, cape, animations, arm size) read from their login's client data, checked, and sent in PlayerList and PlayerSkin; AddPlayer followed by PlayerSkin and MobEquipment | Players see each other's real skins and capes, including character-creator skins; a joining player's held item shows at once | ✅ done 2026-09-27 after two live tests: character-creator skins needed their persona pieces, and a slot chosen while loading was lost |
 | 25 | Block states and placement (Priority 2, part A): the 1.26.50 block palette; placed states checked and upgraded (items, saved chunks); facing, axis, torch, slab, stairs (with corners) and sign rules; fence, pane, bar and wall connections, updated around every change; rollback for every refused placement; clients' own swings (punching) shown to others | Stairs, torches, iron bars, fences, panes and logs place facing the right way and connect; nothing leaves a dead spot; punching swings the arm | 🧪 live test (2026-09-27): rotations, connections, rollback and swings worked, and old dead spots were repaired; slabs stacked a block too high and would not merge (double slabs added); ready for another test |
 | 26 | Per-player game modes (saved; abilities, breaking, placing, drops and visibility follow them) and slash commands: AvailableCommands, CommandRequest and CommandOutput; command trees with subcommands, typed arguments and permissions shared by built-in and plugin commands; `server.command` for Luau plugins; operators in `ops.json`; console commands; `help`, `list`, `version`, `gamemode`, `op`, `deop`, `stop` | Players switch game modes with `/gamemode`, and a plugin's subcommands autocomplete and run | 🟡 2026-10-07: tested end to end with the console and the sample plugin; not yet with a live client |
+| 27 | Health and death: the `minecraft:health` component and vanilla's damage causes; fall damage, the void and peaceful regeneration; the death screen, death messages, drops and respawning; game rules (`falldamage`, `keepinventory`, `naturalregeneration`, `showcoordinates`, `showdeathmessages`) with `/gamerule`, and `/kill`; `player_damage` (cancellable), `player_death` and `player_respawn` events and `player.set_health` / `player.damage` for plugins. The session loop now delivers every reply in one place | Survival players get hurt, die and respawn | 🟡 2026-10-07: tested in the session and from the console; not yet with a live client |
 
 Later steps are proposed but not yet scheduled:
 - `player.give` and item events for plugins; then block interactions and containers,
@@ -1210,6 +1260,15 @@ Later steps are proposed but not yet scheduled:
 - the JS/TS and Python engines
 
 ## 7. Risks and open questions
+
+- **The death screen is untested with a live client.** The flow is Dragonfly's
+  (health 0 and ActorEvent(Death), then Respawn(ReadyToSpawn) once the client sends
+  Respawn(ClientReadyToSpawn)), plus vanilla's DeathInfo. DeathInfo's cause is sent
+  as a bare translation key (`death.attack.fall`); if the death screen shows the key
+  itself, it wants a `%` in front, as Text translations do.
+- **Fall damage trusts the client's collision flag.** Landing is the
+  `VerticalCollision` input flag; a client that never sends it takes no fall damage.
+  Server-side collision against the world would make it authoritative.
 
 - **Command packets are untested with a live client.** AvailableCommands,
   CommandRequest and CommandOutput follow gophertunnel for 2193 (fixed 32-bit enum

@@ -97,6 +97,10 @@ pub struct SavedPlayer {
     /// those players get the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub game_mode: Option<String>,
+    /// Absent from files saved before health was: those players have full
+    /// health. 0 for a player who left while dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<f32>,
 }
 
 /// A player's inventory, by slot. Items are saved by name, so their network
@@ -507,6 +511,7 @@ mod tests {
                 ..SavedInventory::default()
             }),
             game_mode: Some("adventure".into()),
+            health: Some(13.0),
         };
         storage.save_player(uuid, &player).unwrap();
         assert_eq!(storage.load_player(uuid).unwrap(), Some(player.clone()));
