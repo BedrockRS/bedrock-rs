@@ -1,0 +1,39 @@
+[package]
+name = "bedrockrs_core"
+description = "BedrockRS game server: 20 TPS game loop, worlds, chunks and entities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+default-run = "bedrockrs"
+
+[[bin]]
+name = "bedrockrs"
+path = "src/main.rs"
+
+[features]
+js = ["bedrockrs_plugins/js"]
+python = ["bedrockrs_plugins/python"]
+
+[dependencies]
+anyhow.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+bedrockrs_net.workspace = true
+bedrockrs_plugins.workspace = true
+bedrockrs_protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

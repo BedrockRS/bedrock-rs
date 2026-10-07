@@ -1,0 +1,83 @@
+[workspace]
+resolver = "3"
+members = ["src/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Floor set by rustpython-vm 0.5 (the highest MSRV among our dependencies).
+rust-version = "1.93"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+bedrockrs_net = { path = "src/net" }
+bedrockrs_plugins = { path = "src/plugins" }
+bedrockrs_protocol = { path = "src/protocol" }
+
+# Async runtime & buffers
+bytes = "1.12.1"
+tokio = "1.53.1"
+
+# NetherNet: HTTP signaling + sans-IO WebRTC on str0m's default aws-lc-rs crypto backend
+# (without its `examples` feature).
+axum = "0.8.9"
+if-addrs = "0.15.0"
+str0m = { version = "0.23.1", default-features = false, features = ["aws-lc-rs"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+# Identity assertion (ES384 on P-384, SHA-256 fingerprints, base64url)
+base64 = "0.23.1"
+p384 = "0.14.0"
+sha2 = "0.11.0"
+
+# Player authentication: RS256 signatures of multiplayer tokens (the AWS-LC build
+# str0m already uses) and HTTPS to fetch the signing keys (rustls on the same crypto).
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm", "ring-io"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+
+# Player UUIDs (vanilla derives them from the XUID with MD5, as version 3 UUIDs)
+md-5 = "0.11.0"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+# Serialization
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# Batch compression negotiated via NetworkSettings (zlib / snappy)
+flate2 = "1.1.10"
+snap = "1.1.2"
+
+# Console timestamps, in local time
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+# Diagnostics & errors
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+toml = { version = "1.1.6", default-features = false, features = ["std", "serde", "parse"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Plugin engines (JS and Python are optional features of bedrockrs_plugins)
+deno_ast = { version = "0.53.3", features = ["transpiling"] }
+deno_core = "0.412.0"
+mlua = { version = "0.12.1", features = ["luau"] }
+notify = "8.2.0"
+rustpython-vm = { version = "0.5.0", default-features = false, features = ["compiler"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+# Dependencies are optimized even in dev builds: pure-Rust DTLS/crypto, compression
+# and the Luau VM are very slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
