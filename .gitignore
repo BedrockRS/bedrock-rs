@@ -13,6 +13,13 @@ __pycache__/
 !/server/worlds/.gitkeep
 *.pem
 
+# The same files, from running the server in the repository root by mistake.
+/bedrockrs.toml
+/ops.json
+/keys/
+/worlds/
+/plugins/
+
 # Editors and OS
 .vscode/
 .idea/
