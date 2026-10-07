@@ -935,6 +935,61 @@ DTLS, SCTP, and multi-segment messages both ways.
 - **Storage format and vanilla worlds (decided 2026-09-26):** keep the `.bin` format for
   the MVP. The trait and the name-based palettes are in place; a LevelDB backend for
   vanilla worlds comes later. The reasoning is in §7.
+- **Game modes (implemented)** in `game_mode`: survival, creative, adventure and
+  spectator, per player. A player's mode is saved with them (by name, in the player
+  file) and new players get `[players] default_game_mode`. The mode decides:
+  - abilities (UpdateAbilities), as vanilla grants them: only creative and spectator
+    may fly, spectators always fly and pass through blocks;
+  - breaking: creative breaks on the first hit (StartBreak, CreativeDestroyBlock);
+    survival breaks when the client predicts the block destroyed, without checking
+    the breaking time yet; adventure and spectator change no blocks;
+  - placing: outside creative one item is used up (an InventorySlot keeps the client
+    in step); the creative inventory and its item stack actions are creative only;
+  - drops: only survival and adventure breaks drop the block's item;
+  - presence: spectators pick nothing up and nobody sees their entity.
+
+  A change goes to the player as SetPlayerGameType plus UpdateAbilities, and to
+  everyone else as UpdatePlayerGameType. Health, hunger and damage do not exist yet,
+  so survival players cannot be hurt.
+- **Session controls (implemented)** in `logins`: the per-UUID channel that kicked
+  duplicate logins carries a `Control` enum: `Kick`, `SetGameMode`, `SetOperator` and
+  `RefreshCommands`. Commands and plugin actions reach a player's session through it,
+  and the session applies them between packets.
+- **Commands (implemented)** in `commands`. Every command, built-in or from a plugin,
+  is a `CommandSpec`: a name, description and aliases, and a tree of `CommandNode`s.
+  A node may run, with one or more overloads of typed `ArgSpec`s (string, text, int,
+  number, bool, player, enum) tried in order, and may lead to named subcommands, to
+  any depth; each node has a permission (any or operator), which subcommands can only
+  narrow. Plugin nodes have one overload each, since each has one handler.
+  - **Parsing** (`commands::parse`): words, with double quotes for names with
+    spaces. Subcommand names win over arguments; the node reached must run; each
+    argument is parsed to its type (players by name, any case, or `@s`), and every
+    mistake is answered with what was wrong and the usage line.
+  - **Clients** (`commands::client`): each runnable path becomes an overload of
+    AvailableCommands, its subcommands as one-value enums (as Dragonfly does) and
+    then its arguments. Players only get the commands and subcommands they may run.
+    It is sent after joining and again when their operator status or the plugin
+    commands change.
+  - **Running:** CommandRequest → `Server::run_command` → a `CommandReply`, sent back
+    as CommandOutput with the request's origin. Built-in commands run in place;
+    plugin commands go to the plugin thread (`Dispatcher::run_command`) and wait at
+    most 2 s for its reply.
+  - **Built-in** (`commands::builtin`): `help [command]`, `list`, `version`, and for
+    operators `gamemode <gameMode> [player]`, `op <player>`, `deop <player>`, `stop`.
+    `gamemode` matches vanilla: the client merges our `GameMode` enum with its own,
+    so it carries exactly vanilla's names (`survival`, `creative`, `adventure`,
+    `spectator`, `s`, `c`, `a`, `default`, `d`), and 0, 1 and 2 work through a
+    second, whole-number overload rather than being listed.
+  - **Names:** built-in commands win; plugin commands follow in plugin name order, and
+    a command or alias whose name is taken is left out with a warning.
+- **Operators (implemented)** in `ops`: `ops.json` in the working directory lists
+  them by UUID (with their name at the time, for people reading it). Operators get
+  operator commands and player permission level 2 (ability `OperatorCommands`). The
+  console makes the first one with `op <player>`; players must be online to be made
+  operators, since only their session knows their UUID.
+- **Server console (implemented)** in `main.rs`: lines typed into the console run as
+  commands with every permission, with or without their `/`; output is logged.
+  `stop` (or `/stop` from an operator) shuts down as Ctrl+C does.
 
   Generation beyond superflat and entities are not started yet.
 
@@ -978,11 +1033,25 @@ DTLS, SCTP, and multi-segment messages both ways.
     so no round trip to the game thread is needed: a player can be looked up from
     their `player_join` until their `player_quit` handlers finish, and plugins
     loaded later see everyone already online.
+  - `server.command(definition)`: a slash command, with subcommands at any depth
+    (`bedrockrs_plugins::luau_commands` documents the table). The definition is
+    checked when the plugin loads, so a typo (an unknown field, a misnamed type, a
+    required argument after an optional one) stops the load with the reason. The
+    handlers stay in the VM's registry; the specs go to the server as
+    `Action::SetCommands` whenever the plugins' commands change, including on hot
+    reload. A handler gets a `ctx` with `sender` (nil for the console), `console`,
+    `command`, `path`, `args` (parsed values; players as player tables) and
+    `reply`/`error`; a string it returns is a reply. Replies made after it returned
+    reach the player as chat. A handler that fails gives the player a generic
+    error, and the details go to the log.
   - The `server` table is read-only after sandboxing.
-  - Every player in an event is a read-only table `{ name, uuid, send_message, kick }`.
+  - Every player in an event is a read-only table `{ name, uuid, send_message,
+    set_game_mode, kick }`.
     The methods work with `.` and `:` alike and keep working after the event; acting
     on a player who has left does nothing.
     - `player.send_message(message)`: System chat to that player only.
+    - `player.set_game_mode(mode)`: survival, creative, adventure or spectator (or
+      vanilla's short forms, or `default`); anything else is a Lua error.
     - `player.kick(reason?)`: disconnects them with reason 55 (Kicked), showing
       `reason` or "You were kicked from the server.". Core delivers it through the
       same per-UUID channel as the duplicate-login kick.
@@ -1062,6 +1131,9 @@ DTLS, SCTP, and multi-segment messages both ways.
   [logs]
   chat = true           # the `chat` target at info, or off
   system_noise = false  # our crates at debug and libraries at info, instead of info and warn
+
+  [players]
+  default_game_mode = "creative"  # for players joining for the first time
   ```
 
   `[logs]` becomes the log filter, e.g. `warn,bedrockrs=info,plugin=info,chat=info`
@@ -1126,6 +1198,7 @@ Each step starts only after explicit confirmation.
 | 23 | Inventories, part B: drops accepted (any slot, cursor included, a cursor with nowhere to go on closing, and Q on the HUD as a normal inventory transaction); held items shown to others (MobEquipment); item entities with physics, shown to the players in view; breaking a block drops its item; picking up items in reach every tick, with the pickup animation | Items thrown with Q or out of the screen fly forward and land; broken blocks pop their item; walking over items picks them up, and a full inventory leaves the rest; others see what a player holds | 🧪 live tests (2026-09-27): physics, pickup and screen drops worked; Q on the HUD and held items did not (fixed); then held items were invisible to others (no item bones in the placeholder skin) and throws did not swing the arm (fixed); then held items only appeared after switching slots (fixed with the skins step); ✅ done 2026-09-27 |
 | 24 | Real skins: each player's skin (image, geometry, cape, animations, arm size) read from their login's client data, checked, and sent in PlayerList and PlayerSkin; AddPlayer followed by PlayerSkin and MobEquipment | Players see each other's real skins and capes, including character-creator skins; a joining player's held item shows at once | ✅ done 2026-09-27 after two live tests: character-creator skins needed their persona pieces, and a slot chosen while loading was lost |
 | 25 | Block states and placement (Priority 2, part A): the 1.26.50 block palette; placed states checked and upgraded (items, saved chunks); facing, axis, torch, slab, stairs (with corners) and sign rules; fence, pane, bar and wall connections, updated around every change; rollback for every refused placement; clients' own swings (punching) shown to others | Stairs, torches, iron bars, fences, panes and logs place facing the right way and connect; nothing leaves a dead spot; punching swings the arm | 🧪 live test (2026-09-27): rotations, connections, rollback and swings worked, and old dead spots were repaired; slabs stacked a block too high and would not merge (double slabs added); ready for another test |
+| 26 | Per-player game modes (saved; abilities, breaking, placing, drops and visibility follow them) and slash commands: AvailableCommands, CommandRequest and CommandOutput; command trees with subcommands, typed arguments and permissions shared by built-in and plugin commands; `server.command` for Luau plugins; operators in `ops.json`; console commands; `help`, `list`, `version`, `gamemode`, `op`, `deop`, `stop` | Players switch game modes with `/gamemode`, and a plugin's subcommands autocomplete and run | 🟡 2026-10-07: tested end to end with the console and the sample plugin; not yet with a live client |
 
 Later steps are proposed but not yet scheduled:
 - `player.give` and item events for plugins; then block interactions and containers,
@@ -1137,6 +1210,13 @@ Later steps are proposed but not yet scheduled:
 - the JS/TS and Python engines
 
 ## 7. Risks and open questions
+
+- **Command packets are untested with a live client.** AvailableCommands,
+  CommandRequest and CommandOutput follow gophertunnel for 2193 (fixed 32-bit enum
+  indices and offsets, string permission levels and origins, a version string in
+  CommandRequest). If the client rejects AvailableCommands it disconnects at join,
+  which would point at the layout; subcommands as one-value enums are how Dragonfly
+  does it.
 
 - **Live-client interop: session setup verified.** On 2026-09-25 a vanilla Bedrock
   1.26.51 client joined over LAN. Signaling, our identity assertion, ICE, DTLS (server

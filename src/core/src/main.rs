@@ -16,9 +16,13 @@
 //! with defaults on first run. `RUST_LOG`, when set, overrides it; chat is
 //! logged under the `chat` target. `NO_COLOR` turns colours off.
 //!
+//! Commands typed into the console run with every permission, with or without
+//! their `/`: `op <player>` makes the first operator, and `stop` stops the
+//! server, as Ctrl+C does. Operators are kept in `ops.json`.
+//!
 //! [`config`]: bedrockrs_core::config
 
-use std::io::IsTerminal as _;
+use std::io::{BufRead as _, IsTerminal as _};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -26,8 +30,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use bedrockrs_core::auth::Authenticator;
+use bedrockrs_core::commands::Sender;
 use bedrockrs_core::config::{CONFIG_FILE, Config};
 use bedrockrs_core::console::ConsoleFormat;
+use bedrockrs_core::ops::{OPS_FILE, Operators};
 use bedrockrs_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use bedrockrs_core::session;
 use bedrockrs_core::tick::TickLoop;
@@ -86,7 +92,12 @@ async fn main() -> anyhow::Result<()> {
         );
         Authenticator::offline()
     };
-    let server = Arc::new(Server::new(world, plugins.dispatcher(), authenticator));
+    let ops = Operators::open(Path::new(OPS_FILE))?;
+    let server = Arc::new(
+        Server::new(world, plugins.dispatcher(), authenticator)
+            .with_operators(ops)
+            .with_default_game_mode(loaded.config.players.default_game_mode),
+    );
     tokio::spawn(server::apply_plugin_actions(
         Arc::clone(&server),
         plugin_actions,
@@ -113,6 +124,8 @@ async fn main() -> anyhow::Result<()> {
         identity = listener.key_fingerprint(),
         "NetherNet listening"
     );
+    let mut console = console_lines();
+    tracing::info!("type help in the console for a list of commands");
 
     loop {
         tokio::select! {
@@ -122,6 +135,22 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => break,
             },
+            Some(line) = console.recv() => {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    for line in server.run_command(&Sender::Console, &line).await.lines {
+                        if line.success {
+                            tracing::info!("{}", line.text);
+                        } else {
+                            tracing::warn!("{}", line.text);
+                        }
+                    }
+                });
+            }
+            () = server.stop_requested() => {
+                tracing::info!("shutting down");
+                break;
+            }
             result = tokio::signal::ctrl_c() => {
                 result.context("failed to listen for Ctrl+C")?;
                 tracing::info!("shutting down");
@@ -130,6 +159,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Lines typed into the console, read on a thread of their own. Stops when
+/// the console closes, as it does when the server runs without one.
+fn console_lines() -> mpsc::Receiver<String> {
+    let (lines, received) = mpsc::channel(16);
+    let reader = std::thread::Builder::new()
+        .name("console".into())
+        .spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if !line.trim().is_empty() && lines.blocking_send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    if let Err(err) = reader {
+        tracing::warn!(%err, "failed to read the console; console commands are off");
+    }
+    received
 }
 
 /// Runs a client's protocol session until it disconnects.

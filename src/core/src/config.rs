@@ -5,7 +5,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+use crate::game_mode::GameMode;
 
 /// Where the server looks for its configuration, relative to where it runs.
 pub const CONFIG_FILE: &str = "bedrockrs.toml";
@@ -22,6 +24,11 @@ chat = true
 # Show routine internal activity: connections, logins, chunk streaming and
 # saves, refused actions, and the libraries the server is built on.
 system_noise = false
+
+[players]
+# The game mode of players joining for the first time: survival, creative,
+# adventure or spectator. Operators change anyone's with /gamemode.
+default_game_mode = "creative"
 "#;
 
 /// The server's settings.
@@ -29,6 +36,32 @@ system_noise = false
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub logs: Logs,
+    pub players: Players,
+}
+
+/// Settings for players.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Players {
+    #[serde(deserialize_with = "game_mode")]
+    pub default_game_mode: GameMode,
+}
+
+impl Default for Players {
+    fn default() -> Self {
+        Self {
+            default_game_mode: GameMode::Creative,
+        }
+    }
+}
+
+fn game_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<GameMode, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    GameMode::from_name(&name).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "unknown game mode {name:?}; expected survival, creative, adventure or spectator"
+        ))
+    })
 }
 
 /// What the console shows.
@@ -141,6 +174,14 @@ mod tests {
         let err = Config::parse("[logs]\nchats = false").unwrap_err();
         assert!(err.to_string().contains("chats"), "{err}");
         assert!(Config::parse("[logs]\nchat = \"yes\"").is_err());
+    }
+
+    #[test]
+    fn game_modes_are_read_by_name() {
+        let config = Config::parse("[players]\ndefault_game_mode = \"Survival\"").unwrap();
+        assert_eq!(config.players.default_game_mode, GameMode::Survival);
+        let err = Config::parse("[players]\ndefault_game_mode = \"hardcore\"").unwrap_err();
+        assert!(err.to_string().contains("unknown game mode"), "{err}");
     }
 
     #[test]

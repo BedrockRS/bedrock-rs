@@ -33,9 +33,13 @@ pub mod id {
     pub const INVENTORY_CONTENT: u32 = 49;
     pub const INVENTORY_SLOT: u32 = 50;
     pub const LEVEL_CHUNK: u32 = 58;
+    pub const SET_PLAYER_GAME_TYPE: u32 = 62;
     pub const PLAYER_LIST: u32 = 63;
     pub const REQUEST_CHUNK_RADIUS: u32 = 69;
     pub const CHUNK_RADIUS_UPDATED: u32 = 70;
+    pub const AVAILABLE_COMMANDS: u32 = 76;
+    pub const COMMAND_REQUEST: u32 = 77;
+    pub const COMMAND_OUTPUT: u32 = 79;
     pub const PLAYER_SKIN: u32 = 93;
     pub const SET_LOCAL_PLAYER_AS_INITIALIZED: u32 = 113;
     pub const NETWORK_CHUNK_PUBLISHER_UPDATE: u32 = 121;
@@ -46,6 +50,7 @@ pub mod id {
     pub const CREATIVE_CONTENT: u32 = 145;
     pub const ITEM_STACK_REQUEST: u32 = 147;
     pub const ITEM_STACK_RESPONSE: u32 = 148;
+    pub const UPDATE_PLAYER_GAME_TYPE: u32 = 151;
     pub const ITEM_REGISTRY: u32 = 162;
     pub const UPDATE_ABILITIES: u32 = 187;
     pub const REQUEST_NETWORK_SETTINGS: u32 = 193;

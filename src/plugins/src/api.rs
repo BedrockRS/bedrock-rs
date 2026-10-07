@@ -3,6 +3,8 @@
 //! The server sends [`Event`]s to plugins, and plugins answer with
 //! [`Action`]s for the server to carry out. Both cross threads as messages.
 
+use crate::command::PluginCommand;
+
 /// A player as plugins see them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Player {
@@ -81,4 +83,9 @@ pub enum Action {
     SendMessage { player: String, message: String },
     /// Disconnect a player, showing them `reason`.
     Kick { player: String, reason: String },
+    /// Change a player's game mode; `mode` is one of
+    /// [`GAME_MODE_VALUES`](crate::GAME_MODE_VALUES).
+    SetGameMode { player: String, mode: String },
+    /// The commands plugins have registered changed; these are all of them now.
+    SetCommands(Vec<PluginCommand>),
 }

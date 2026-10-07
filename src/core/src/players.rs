@@ -13,7 +13,7 @@ use bedrockrs_protocol::packet::Encode;
 use bedrockrs_protocol::packets::{
     AddPlayer, Animate, EntityMetadata, INVENTORY_WINDOW, ItemInstance, MetadataValue,
     MobEquipment, MoveMode, MovePlayer, PlayerList, PlayerListEntry, PlayerSkin, RemoveActor,
-    SetActorData, Skin, TakeItemActor, Text, entity_flag, metadata_key,
+    SetActorData, Skin, TakeItemActor, Text, UpdatePlayerGameType, entity_flag, metadata_key,
 };
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 use bytes::Bytes;
@@ -21,6 +21,7 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use uuid::Uuid;
 
 use crate::entities::ItemView;
+use crate::game_mode::GameMode;
 use crate::storage::{SavedInventory, SavedPlayer};
 
 /// Packets that may wait for one player before more are dropped.
@@ -90,6 +91,7 @@ impl Movement {
             head_yaw: self.head_yaw,
             flying,
             inventory: None,
+            game_mode: None,
         }
     }
 
@@ -134,6 +136,7 @@ pub struct Joining {
     pub inventory: SavedInventory,
     /// What they hold and in which hotbar slot, which AddPlayer shows others.
     pub held: (ItemInstance, u8),
+    pub game_mode: GameMode,
     pub outbound: Outbound,
 }
 
@@ -154,6 +157,7 @@ struct Online {
     held: (ItemInstance, u8),
     /// The player's inventory as last changed, for saving.
     inventory: SavedInventory,
+    game_mode: GameMode,
     outbound: Outbound,
 }
 
@@ -240,6 +244,7 @@ impl Players {
             view,
             inventory,
             held,
+            game_mode,
             outbound,
         } = joining;
         let newcomer = Online {
@@ -253,6 +258,7 @@ impl Players {
             seen_items: HashSet::new(),
             held,
             inventory,
+            game_mode,
             outbound,
         };
         let mut online = self.online();
@@ -289,6 +295,7 @@ impl Players {
             .map(|player| {
                 let mut saved = player.movement.saved(player.flying);
                 saved.inventory = Some(player.inventory.clone());
+                saved.game_mode = Some(player.game_mode.name().to_owned());
                 (player.profile.uuid, saved)
             })
             .collect()
@@ -301,9 +308,10 @@ impl Players {
         for viewer in online.values_mut() {
             viewer.sync_items(items);
         }
-        let snapshot: Vec<(u64, ChunkPos)> = online
+        // Spectators are seen by nobody.
+        let snapshot: Vec<(u64, ChunkPos, bool)> = online
             .iter()
-            .map(|(id, player)| (*id, player.movement.chunk()))
+            .map(|(id, player)| (*id, player.movement.chunk(), player.game_mode.is_present()))
             .collect();
 
         // Entities entering and leaving each viewer's view. A newly shown
@@ -311,11 +319,11 @@ impl Players {
         let mut shown: HashSet<(u64, u64)> = HashSet::new();
         let mut spawns = Vec::new();
         for (viewer_id, viewer) in online.iter_mut() {
-            for (target_id, chunk) in &snapshot {
+            for (target_id, chunk, present) in &snapshot {
                 if target_id == viewer_id {
                     continue;
                 }
-                let visible = viewer.view.contains(*chunk);
+                let visible = *present && viewer.view.contains(*chunk);
                 if visible && viewer.seen.insert(*target_id) {
                     shown.insert((*viewer_id, *target_id));
                     spawns.push((*viewer_id, *target_id));
@@ -440,6 +448,22 @@ impl Players {
         true
     }
 
+    /// The player online with this name, ignoring case: their UUID and name.
+    pub fn find(&self, name: &str) -> Option<(Uuid, String)> {
+        self.online()
+            .values()
+            .find(|player| player.profile.name.eq_ignore_ascii_case(name))
+            .map(|player| (player.profile.uuid, player.profile.name.clone()))
+    }
+
+    /// The names of everyone online.
+    pub fn names(&self) -> Vec<String> {
+        self.online()
+            .values()
+            .map(|player| player.profile.name.clone())
+            .collect()
+    }
+
     /// The name of the player in the world as `uuid`, if they are.
     pub fn name_of(&self, uuid: Uuid) -> Option<String> {
         self.online()
@@ -536,6 +560,26 @@ impl Membership<'_> {
         let packet = encode(&held_item(self.entity_id, player));
         for other in online.values() {
             if other.seen.contains(&self.entity_id) {
+                other.send(packet.clone());
+            }
+        }
+    }
+
+    /// Records the player's game mode, for saving, and tells everyone else.
+    /// Spectators disappear from view on the next tick.
+    pub fn game_mode(&self, mode: GameMode) {
+        let mut online = self.players.online();
+        let Some(player) = online.get_mut(&self.entity_id) else {
+            return;
+        };
+        player.game_mode = mode;
+        let packet = encode(&UpdatePlayerGameType {
+            game_type: mode.id(),
+            player_unique_id: unique_id(self.entity_id),
+            tick: 0,
+        });
+        for (id, other) in online.iter() {
+            if *id != self.entity_id {
                 other.send(packet.clone());
             }
         }
@@ -660,7 +704,7 @@ fn add_player(entity_id: u64, player: &Online) -> AddPlayer {
         pitch: movement.pitch,
         yaw: movement.yaw,
         head_yaw: movement.head_yaw,
-        game_mode: 1,
+        game_mode: player.game_mode.id(),
         metadata: player_metadata(&player.profile.name, player.sneaking),
         held_item: player.held.0,
         entity_unique_id: unique_id(entity_id),
@@ -721,6 +765,7 @@ mod tests {
             view: view_at(0, 0),
             inventory: SavedInventory::default(),
             held: (ItemInstance::EMPTY, 0),
+            game_mode: GameMode::Creative,
             outbound,
         };
         (joining, queue)

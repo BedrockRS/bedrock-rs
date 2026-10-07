@@ -28,7 +28,7 @@ BedrockRS is a high-performance Minecraft: Bedrock Edition dedicated server writ
 
 ## 🚧 Current status
 
-BedrockRS is in **early development**. A vanilla 26.51 client can join, build, chat and see other players, but many gameplay systems don't exist yet, and APIs may change significantly.
+BedrockRS is in **early development**. A vanilla 26.51 client can join, build, chat, run commands and see other players, but many gameplay systems don't exist yet, and APIs may change significantly.
 
 ## 🗺️ Milestones
 
@@ -54,7 +54,8 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 - [x] Block breaking and placing, with reach and overlap checks
 - [x] Full 1.26.50 block palette with placement rules (facing, slabs, stairs, connections)
 - [x] World persistence (compressed chunk files, versioned format)
-- [x] Player persistence (position, rotation, flying state, inventory)
+- [x] Player persistence (position, rotation, flying state, inventory, game mode)
+- [x] Per-player game modes: survival, creative, adventure and spectator
 
 ### Milestone 4: Inventories 🟡
 
@@ -69,7 +70,8 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 - [x] Luau sandbox with hot reload
 - [x] `plugin.json` manifests
 - [x] Events: `player_join`, `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`
-- [x] Player methods: `send_message`, `kick`; `server.broadcast`, `server.player(uuid)`
+- [x] Player methods: `send_message`, `set_game_mode`, `kick`; `server.broadcast`, `server.player(uuid)`
+- [x] Slash commands with nested subcommands, typed arguments, aliases and permissions
 - [ ] `player.give` and item events
 - [ ] Cancellable block events
 - [ ] JavaScript/TypeScript engine
@@ -85,11 +87,13 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 
 ### Milestone 7: Production ready ⬜
 
-- [ ] Movement validation (speed and teleport checks)
+- [x] Slash commands for players and the server console
+- [x] Operators (`/op`, `/deop`, `ops.json`)
+- [ ] Movement validation (speed, teleport and breaking-time checks)
 - [ ] Advertised public addresses for NAT'd deployments
 - [ ] Vanilla world import (LevelDB)
-- [ ] Console commands
-- [ ] More `bedrockrs.toml` settings (server name, max players, gamemode, …)
+- [ ] Target selectors beyond `@s` (`@a`, `@p`, …)
+- [ ] More `bedrockrs.toml` settings (server name, max players, …)
 - [ ] Protocol 2216+ (Bedrock 26.60)
 
 ## 📁 Project structure
@@ -103,6 +107,7 @@ bedrock-rs/
 │   └── protocol/         # bedrockrs_protocol: packet codec, batching and NBT
 ├── server/               # where the server runs
 │   ├── bedrockrs.toml    # configuration (created on first run)
+│   ├── ops.json          # operators (created by the first /op)
 │   ├── plugins/          # plugins, one folder each
 │   ├── worlds/           # saved worlds
 │   └── keys/             # server identity key (created on first run)
@@ -124,9 +129,36 @@ Start the server from the `server/` folder with `server/start.bat` (Windows) or 
 
 Then connect from Minecraft with your machine's IP address and port `19132`.
 
+## 💬 Commands
+
+Type commands into the server console (with or without the `/`) or in game. The console can run everything; in game, operator commands need an operator.
+
+| Command | Who | What it does |
+|---|---|---|
+| `/help [command]` | everyone | Lists the commands you can use, or explains one |
+| `/list` | everyone | Lists the players online |
+| `/version` | everyone | Shows the server's version |
+| `/gamemode <gameMode> [player]` | operators | Sets a game mode, as in vanilla: `survival`, `creative`, `adventure`, `spectator`, `default` (or `s`, `c`, `a`, `d`, or `0`, `1`, `2`) |
+| `/op <player>` | operators | Makes an online player an operator |
+| `/deop <player>` | operators | Takes away a player's operator status |
+| `/stop` | operators | Saves everything and stops the server |
+
+To make yourself an operator, join the server and type `op <your name>` in the console.
+
 ## ⚙️ Configuration
 
-`server/bedrockrs.toml` is created with every setting at its default on first run. Network settings can be overridden with environment variables:
+`server/bedrockrs.toml` is created with every setting at its default on first run:
+
+```toml
+[logs]
+chat = true                     # show chat in the console
+system_noise = false            # show routine internal activity
+
+[players]
+default_game_mode = "creative"  # for players joining for the first time
+```
+
+Network settings can be overridden with environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -157,6 +189,48 @@ server.on("player_join", function(player)
 	server.broadcast(`§eWelcome to BedrockRS, {player.name}!`)
 end)
 ```
+
+### Slash commands
+
+Plugins add real slash commands, with subcommands nested as deep as you like. Players get them in `/help` and autocompleted as they type, and the server checks every argument before your code runs:
+
+```lua
+server.command({
+	name = "warp",
+	description = "Travel between warps",
+	aliases = { "w" },
+	-- /warp <name>
+	args = { { name = "name", type = "string" } },
+	run = function(ctx)
+		ctx.reply(`Warping to {ctx.args.name}...`)
+	end,
+	subcommands = {
+		-- /warp set <name> [public]
+		set = {
+			description = "Make a warp where you stand",
+			args = {
+				{ name = "name", type = "string" },
+				{ name = "public", type = "bool", optional = true },
+			},
+			run = function(ctx)
+				if not ctx.sender then
+					return ctx.error("Only players can set warps.")
+				end
+				ctx.reply(`Set warp {ctx.args.name}.`)
+			end,
+		},
+		-- /warp admin reload, for operators only
+		admin = {
+			permission = "operator",
+			subcommands = {
+				reload = { run = function(ctx) return "Warps reloaded." end },
+			},
+		},
+	},
+})
+```
+
+Argument types are `string`, `text` (the rest of the line), `int`, `number`, `bool`, `player`, `gamemode` and `enum` (with `values = { ... }`). Commands follow hot reload like everything else.
 
 See [server/plugins/hello](server/plugins/hello) for a fuller example.
 

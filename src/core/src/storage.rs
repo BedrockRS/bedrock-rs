@@ -93,6 +93,10 @@ pub struct SavedPlayer {
     /// the starter kit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory: Option<SavedInventory>,
+    /// The game mode's name. Absent from files saved before game modes were:
+    /// those players get the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_mode: Option<String>,
 }
 
 /// A player's inventory, by slot. Items are saved by name, so their network
@@ -502,6 +506,7 @@ mod tests {
                 }],
                 ..SavedInventory::default()
             }),
+            game_mode: Some("adventure".into()),
         };
         storage.save_player(uuid, &player).unwrap();
         assert_eq!(storage.load_player(uuid).unwrap(), Some(player.clone()));
@@ -510,7 +515,9 @@ mod tests {
         // Files from before flying was saved mean "not flying".
         let older = r#"{"x":1.0,"y":-60.0,"z":2.0,"pitch":0.0,"yaw":0.0,"head_yaw":0.0}"#;
         fs::write(storage.player_path(uuid), older).unwrap();
-        assert!(!storage.load_player(uuid).unwrap().unwrap().flying);
+        let older = storage.load_player(uuid).unwrap().unwrap();
+        assert!(!older.flying);
+        assert_eq!(older.game_mode, None, "the default game mode applies");
 
         fs::write(storage.player_path(uuid), "{ not json").unwrap();
         assert!(matches!(

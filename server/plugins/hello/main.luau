@@ -17,7 +17,7 @@ local newest: string? = nil
 -- Welcome everyone who spawns into the world.
 server.on("player_join", function(player)
 	server.broadcast(`§eWelcome to BedrockRS, {player.name}!`)
-	player.send_message("§7Only you can see this. Try §f!kickme§7 or §f!wave§7.")
+	player.send_message("§7Only you can see this. Try §f/hello§7.")
 	newest = player.uuid
 end)
 
@@ -34,20 +34,6 @@ server.on("player_chat", function(event)
 			return
 		end
 	end
-	if message == "!kickme" then
-		event.cancel()
-		event.player.kick("You asked to be kicked. Come back any time!")
-	elseif message == "!wave" then
-		-- Looks the newest player up again, long after their join event.
-		event.cancel()
-		local target = if newest then server.player(newest) else nil
-		if target then
-			target.send_message(`§b{event.player.name} waves at you!`)
-			event.player.send_message(`§7You waved at {target.name}.`)
-		else
-			event.player.send_message("§7Whoever joined last has left.")
-		end
-	end
 end)
 
 server.on("block_break", function(event)
@@ -59,3 +45,72 @@ server.on("block_place", function(event)
 	local at = event.position
 	log.info(`{event.player.name} placed {event.block} at {at.x} {at.y} {at.z}`)
 end)
+
+-- A slash command with subcommands. Players see all of it in /help and get it
+-- autocompleted as they type; the server checks the arguments before `run`
+-- is called, so `ctx.args` always holds what each argument asks for.
+server.command({
+	name = "hello",
+	description = "Friendly things to do",
+	aliases = { "hi" },
+	-- /hello on its own.
+	run = function(ctx)
+		return "Hello! Try /hello wave, /hello to <player> or /hello kickme."
+	end,
+	subcommands = {
+		-- /hello wave
+		wave = {
+			description = "Wave at whoever joined last",
+			run = function(ctx)
+				-- `ctx.sender` is the player, or nil when the console runs it.
+				local from = if ctx.sender then ctx.sender.name else "The console"
+				local target = if newest then server.player(newest) else nil
+				if not target then
+					ctx.error("Whoever joined last has left.")
+					return
+				end
+				target.send_message(`§b{from} waves at you!`)
+				ctx.reply(`You waved at {target.name}.`)
+			end,
+		},
+		-- /hello to <player> [message]
+		to = {
+			description = "Say hello to another player",
+			args = {
+				{ name = "player", type = "player" },
+				{ name = "message", type = "text", optional = true },
+			},
+			run = function(ctx)
+				local from = if ctx.sender then ctx.sender.name else "The console"
+				local message = ctx.args.message or "Hello!"
+				ctx.args.player.send_message(`§d{from} says: {message}`)
+				ctx.reply(`Said hello to {ctx.args.player.name}.`)
+			end,
+		},
+		-- /hello kickme
+		kickme = {
+			description = "Leave with a friendly goodbye",
+			run = function(ctx)
+				if not ctx.sender then
+					ctx.error("Only players can be kicked.")
+					return
+				end
+				ctx.sender.kick("You asked to be kicked. Come back any time!")
+			end,
+		},
+		-- /hello admin announce <message>: only operators see and run these.
+		admin = {
+			permission = "operator",
+			subcommands = {
+				announce = {
+					description = "Announce something to everyone",
+					args = { { name = "message", type = "text" } },
+					run = function(ctx)
+						server.broadcast(`§6[Announcement] {ctx.args.message}`)
+						return "Announced."
+					end,
+				},
+			},
+		},
+	},
+})

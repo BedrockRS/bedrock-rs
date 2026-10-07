@@ -359,6 +359,24 @@ impl Inventory {
         self.main[slot].as_ref()
     }
 
+    /// Uses up one item from a hotbar slot, as placing a block outside
+    /// creative mode does. Returns the slot as it is now, for the client.
+    pub fn use_one(&mut self, slot: i32) -> Option<InventorySlot> {
+        let index = usize::try_from(slot)
+            .ok()
+            .filter(|&slot| slot < HOTBAR_SLOTS)?;
+        let stack = self.main[index].as_mut()?;
+        stack.count -= 1;
+        if stack.count == 0 {
+            self.main[index] = None;
+        }
+        Some(InventorySlot {
+            window_id: INVENTORY_WINDOW,
+            slot: index as u32,
+            item: self.main[index].map_or(ItemInstance::EMPTY, |stack| stack.instance()),
+        })
+    }
+
     /// Applies a request if it is valid, and says what changed. `creative`
     /// allows taking items from the creative inventory and destroying them.
     pub fn handle(&mut self, request: &StackRequest, creative: bool) -> StackResponse {
@@ -1256,5 +1274,25 @@ mod tests {
         let loaded = Inventory::from_saved(&odd);
         assert_eq!(loaded.saved().main.len(), 1);
         assert_eq!(loaded.main[4].unwrap().count, 1, "swords stack to 1");
+    }
+
+    #[test]
+    fn placing_uses_up_one_item() {
+        let mut inventory = Inventory::with_hotbar(&["minecraft:stone"]);
+        let stone = inventory.hotbar(0).unwrap().stack();
+        let slot = inventory.use_one(0).unwrap();
+        assert_eq!(slot.slot, 0);
+        assert_eq!(inventory.hotbar(0).unwrap().count, stone.count - 1);
+        assert_eq!(slot.item, inventory.hotbar(0).unwrap().instance());
+
+        for _ in 1..stone.count {
+            inventory.use_one(0).unwrap();
+        }
+        assert!(
+            inventory.hotbar(0).is_none(),
+            "the last one empties the slot"
+        );
+        assert!(inventory.use_one(0).is_none());
+        assert!(inventory.use_one(9).is_none(), "not a hotbar slot");
     }
 }

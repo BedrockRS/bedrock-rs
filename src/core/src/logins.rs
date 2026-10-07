@@ -1,6 +1,7 @@
 //! One session per player: a verified login with a UUID that is already
-//! connected kicks the older session, as vanilla does. Plugins kick players
-//! through the same registry.
+//! connected kicks the older session, as vanilla does. The rest of the server
+//! reaches a player's session through the same registry, to kick them or
+//! change their game mode or operator status.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +11,8 @@ use bedrockrs_protocol::packets::DisconnectReason;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::game_mode::GameMode;
+
 /// Why a session must disconnect its player, and what the player is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KickNotice {
@@ -17,8 +20,23 @@ pub struct KickNotice {
     pub message: String,
 }
 
-/// Tells a session to disconnect its player.
-pub type Kick = mpsc::Sender<KickNotice>;
+/// Something the rest of the server tells a player's session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Control {
+    /// Disconnect the player.
+    Kick(KickNotice),
+    SetGameMode(GameMode),
+    /// The player became an operator, or stopped being one.
+    SetOperator(bool),
+    /// The commands players may use changed; send the player theirs.
+    RefreshCommands,
+}
+
+/// Where a session receives its [`Control`]s.
+pub type Controls = mpsc::Sender<Control>;
+
+/// How many controls may wait for a session.
+pub const CONTROL_QUEUE: usize = 16;
 
 /// The message a session kicked by a newer login shows.
 pub const LOGGED_IN_ELSEWHERE: &str = "You logged in from another location.";
@@ -27,7 +45,7 @@ pub const LOGGED_IN_ELSEWHERE: &str = "You logged in from another location.";
 #[derive(Debug, Default)]
 pub struct Logins {
     last_id: AtomicU64,
-    active: Mutex<HashMap<Uuid, (u64, Kick)>>,
+    active: Mutex<HashMap<Uuid, (u64, Controls)>>,
 }
 
 impl Logins {
@@ -37,14 +55,14 @@ impl Logins {
 
     /// Records the session logged in as `uuid`, kicking any older session
     /// logged in as the same player. The claim lasts until it is dropped.
-    pub fn claim(&self, uuid: Uuid, kick: Kick) -> LoginClaim<'_> {
+    pub fn claim(&self, uuid: Uuid, controls: Controls) -> LoginClaim<'_> {
         let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some((_, older)) = self.active().insert(uuid, (id, kick)) {
+        if let Some((_, older)) = self.active().insert(uuid, (id, controls)) {
             tracing::info!(%uuid, "the player logged in again; kicking the older session");
-            let _ = older.try_send(KickNotice {
+            let _ = older.try_send(Control::Kick(KickNotice {
                 reason: DisconnectReason::LOGGED_IN_OTHER_LOCATION,
                 message: LOGGED_IN_ELSEWHERE.to_owned(),
-            });
+            }));
         }
         LoginClaim {
             logins: self,
@@ -60,17 +78,40 @@ impl Logins {
     /// Disconnects the player logged in as `uuid`, showing them `message`.
     /// Returns whether they were logged in.
     pub fn kick(&self, uuid: Uuid, message: String) -> bool {
-        let Some((_, kick)) = self.active().get(&uuid).cloned() else {
+        self.send(
+            uuid,
+            Control::Kick(KickNotice {
+                reason: DisconnectReason::KICKED,
+                message,
+            }),
+        )
+    }
+
+    /// Tells the session logged in as `uuid` to do something. Returns whether
+    /// there is such a session.
+    pub fn send(&self, uuid: Uuid, control: Control) -> bool {
+        let Some((_, controls)) = self.active().get(&uuid).cloned() else {
             return false;
         };
-        let _ = kick.try_send(KickNotice {
-            reason: DisconnectReason::KICKED,
-            message,
-        });
+        if controls.try_send(control).is_err() {
+            tracing::warn!(%uuid, "a session is not keeping up with what it is told");
+        }
         true
     }
 
-    fn active(&self) -> MutexGuard<'_, HashMap<Uuid, (u64, Kick)>> {
+    /// Tells every logged-in session to do something.
+    pub fn send_all(&self, control: &Control) {
+        let sessions: Vec<Controls> = self
+            .active()
+            .values()
+            .map(|(_, controls)| controls.clone())
+            .collect();
+        for controls in sessions {
+            let _ = controls.try_send(control.clone());
+        }
+    }
+
+    fn active(&self) -> MutexGuard<'_, HashMap<Uuid, (u64, Controls)>> {
         self.active.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -108,7 +149,9 @@ mod tests {
         let first_claim = logins.claim(uuid, first_kick);
         assert!(first.try_recv().is_err());
         let second_claim = logins.claim(uuid, second_kick);
-        let notice = first.try_recv().unwrap();
+        let Control::Kick(notice) = first.try_recv().unwrap() else {
+            panic!("expected a kick");
+        };
         assert_eq!(notice.reason, DisconnectReason::LOGGED_IN_OTHER_LOCATION);
         assert_eq!(notice.message, LOGGED_IN_ELSEWHERE);
         assert!(second.try_recv().is_err(), "the newer session stays");
@@ -131,11 +174,30 @@ mod tests {
         assert!(logins.kick(uuid, "bye".into()));
         assert_eq!(
             kicks.try_recv().unwrap(),
-            KickNotice {
+            Control::Kick(KickNotice {
                 reason: DisconnectReason::KICKED,
                 message: "bye".into()
-            }
+            })
         );
+    }
+
+    #[test]
+    fn sessions_are_told_what_to_do() {
+        let logins = Logins::new();
+        let uuid = Uuid::new_v4();
+        assert!(
+            !logins.send(uuid, Control::SetOperator(true)),
+            "not logged in"
+        );
+        let (controls, mut received) = mpsc::channel(CONTROL_QUEUE);
+        let _claim = logins.claim(uuid, controls);
+        assert!(logins.send(uuid, Control::SetGameMode(GameMode::Survival)));
+        logins.send_all(&Control::RefreshCommands);
+        assert_eq!(
+            received.try_recv().unwrap(),
+            Control::SetGameMode(GameMode::Survival)
+        );
+        assert_eq!(received.try_recv().unwrap(), Control::RefreshCommands);
     }
 
     #[test]

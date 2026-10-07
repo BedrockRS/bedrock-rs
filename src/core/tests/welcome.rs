@@ -1,10 +1,14 @@
-//! The join path from the plugin event to the chat: the sample plugin must
-//! welcome a joining player exactly once, and greet them privately.
+//! The sample plugin, end to end: it must welcome a joining player exactly
+//! once and greet them privately, and answer its slash command, subcommands
+//! included, through the plugin host.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bedrockrs_core::auth::Authenticator;
+use bedrockrs_core::commands::Sender;
+use bedrockrs_core::game_mode::GameMode;
 use bedrockrs_core::players::{EYE_HEIGHT, Joining, Movement, Profile, View};
 use bedrockrs_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use bedrockrs_core::world::World;
@@ -14,15 +18,19 @@ use bedrockrs_protocol::packets::Text;
 use bedrockrs_protocol::types::{ChunkPos, Vec3};
 use tokio::sync::mpsc;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_sample_plugin_welcomes_a_joining_player_once() {
-    let directory = std::env::temp_dir().join(format!("bedrockrs-welcome-{}", std::process::id()));
+/// A server running the sample plugin from a copy in a directory of its own.
+fn sample_plugin_server(test: &str) -> (Arc<Server>, PluginHost, PathBuf) {
+    let directory = std::env::temp_dir().join(format!("bedrockrs-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).unwrap();
     let hello = directory.join("hello");
     std::fs::create_dir_all(&hello).unwrap();
     for file in ["plugin.json", "main.luau"] {
-        std::fs::copy(format!("../../server/plugins/hello/{file}"), hello.join(file)).unwrap();
+        std::fs::copy(
+            format!("../../server/plugins/hello/{file}"),
+            hello.join(file),
+        )
+        .unwrap();
     }
 
     let (actions, plugin_actions) = mpsc::channel(PLUGIN_ACTION_QUEUE);
@@ -40,7 +48,12 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
         Arc::clone(&server),
         plugin_actions,
     ));
+    (server, plugins, directory)
+}
 
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sample_plugin_welcomes_a_joining_player_once() {
+    let (server, plugins, directory) = sample_plugin_server("welcome");
     let (outbound, mut queue) = mpsc::channel(64);
     let uuid = uuid::Uuid::new_v4();
     let _membership = server.players.join(Joining {
@@ -67,6 +80,7 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
         },
         inventory: Default::default(),
         held: (bedrockrs_protocol::packets::ItemInstance::EMPTY, 0),
+        game_mode: GameMode::Creative,
         outbound,
     });
     server.plugins.dispatch(Event::PlayerJoin(Player {
@@ -93,7 +107,66 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
         texts,
         [
             "§eWelcome to BedrockRS, Steve!",
-            "§7Only you can see this. Try §f!kickme§7 or §f!wave§7."
+            "§7Only you can see this. Try §f/hello§7."
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sample_plugin_answers_its_command() {
+    let (server, plugins, directory) = sample_plugin_server("command");
+    // The plugin's commands reach the server as an action once it loaded.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while server.commands.find("hello").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the plugin's command never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let lines = |reply: bedrockrs_plugins::CommandReply| {
+        reply
+            .lines
+            .into_iter()
+            .map(|line| (line.success, line.text))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        lines(server.run_command(&Sender::Console, "/hi").await),
+        [(
+            true,
+            "Hello! Try /hello wave, /hello to <player> or /hello kickme.".to_owned()
+        )],
+        "the alias runs the command"
+    );
+    assert_eq!(
+        lines(server.run_command(&Sender::Console, "hello kickme").await),
+        [(false, "Only players can be kicked.".to_owned())]
+    );
+    assert_eq!(
+        lines(
+            server
+                .run_command(&Sender::Console, "hello to Nobody")
+                .await
+        ),
+        [(
+            false,
+            "no player named \"Nobody\" is online (<player: target>)".to_owned()
+        )],
+        "arguments are checked before the plugin hears of the command"
+    );
+    assert_eq!(
+        lines(
+            server
+                .run_command(
+                    &Sender::Console,
+                    "hello admin announce Server restarting soon"
+                )
+                .await
+        ),
+        [(true, "Announced.".to_owned())]
+    );
+    drop(plugins);
+    let _ = std::fs::remove_dir_all(&directory);
 }

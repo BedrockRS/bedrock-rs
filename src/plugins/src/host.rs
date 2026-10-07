@@ -13,7 +13,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::luau::{Limits, LuauEngine};
 use crate::manifest::{MANIFEST_FILE, PluginSource};
-use crate::{Action, Event, Output, tracing_output};
+use crate::{Action, CommandCall, CommandReply, Event, Output, PluginCommand, tracing_output};
 
 /// Quiet period after the last change in the plugin directory before plugins
 /// are reloaded; editors often save in several steps.
@@ -67,6 +67,8 @@ enum Command {
     /// An event for the plugins; for a cancellable one, where to say whether
     /// a plugin cancelled it.
     Event(Event, Option<oneshot::Sender<bool>>),
+    /// A plugin command someone ran, and where its reply goes.
+    Execute(CommandCall, oneshot::Sender<CommandReply>),
     Shutdown,
 }
 
@@ -113,6 +115,14 @@ impl Dispatcher {
             return false;
         }
         cancelled.await.unwrap_or(false)
+    }
+
+    /// Runs a plugin command and resolves to what it replied. `None` if the
+    /// plugins stopped first.
+    pub async fn run_command(&self, call: CommandCall) -> Option<CommandReply> {
+        let (reply, replied) = oneshot::channel();
+        self.commands.send(Command::Execute(call, reply)).ok()?;
+        replied.await.ok()
     }
 }
 
@@ -198,11 +208,14 @@ fn run(
     };
     let mut plugins = Plugins {
         directory: config.directory,
-        engine: LuauEngine::new(limits, output, actions),
+        engine: LuauEngine::new(limits, output, actions.clone()),
         running: BTreeMap::new(),
         warned: HashSet::new(),
     };
     plugins.scan();
+    // The server learns the plugins' commands before anyone can join.
+    let mut announced = Vec::new();
+    announce_commands(&plugins.engine, &actions, &mut announced);
     let _ = ready.send(plugins.engine.names());
 
     // When to rescan; each change pushes it back, events do not.
@@ -215,6 +228,7 @@ fn run(
                 Err(RecvTimeoutError::Timeout) => {
                     plugins.scan();
                     rescan_at = None;
+                    announce_commands(&plugins.engine, &actions, &mut announced);
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => None,
@@ -228,8 +242,34 @@ fn run(
                     let _ = verdict.send(cancelled);
                 }
             }
+            Some(Command::Execute(call, reply)) => {
+                let _ = reply.send(plugins.engine.run_command(&call));
+            }
             Some(Command::Shutdown) | None => break,
         }
+        // Loading, unloading or a handler may have changed the commands.
+        announce_commands(&plugins.engine, &actions, &mut announced);
+    }
+}
+
+/// Tells the server the plugins' commands if they changed since `announced`.
+/// If the server is not keeping up, it is told on a later try.
+fn announce_commands(
+    engine: &LuauEngine,
+    actions: &tokio_mpsc::Sender<Action>,
+    announced: &mut Vec<PluginCommand>,
+) {
+    let commands = engine.commands();
+    if commands == *announced {
+        return;
+    }
+    match actions.try_send(Action::SetCommands(commands.clone())) {
+        Ok(()) => *announced = commands,
+        Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("the server is not keeping up; plugin commands will be updated later");
+        }
+        // The server is shutting down.
+        Err(tokio_mpsc::error::TrySendError::Closed(_)) => *announced = commands,
     }
 }
 

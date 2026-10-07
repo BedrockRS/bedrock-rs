@@ -38,7 +38,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] 
 
 # Player UUIDs (vanilla derives them from the XUID with MD5, as version 3 UUIDs)
 md-5 = "0.11.0"
-uuid = { version = "1.26.1", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["serde", "v4"] }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }

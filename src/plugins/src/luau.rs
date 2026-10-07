@@ -10,7 +10,10 @@ use mlua::{Function, Lua, MultiValue, Table, Value, VmState};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::Level;
 
-use crate::{Action, Event, Output, Player};
+use crate::luau_commands::{self, Registered};
+use crate::{
+    Action, CommandCall, CommandReply, Event, GAME_MODE_VALUES, Output, Player, PluginCommand,
+};
 
 /// Registry key of each VM's table of event handlers: event name → list of functions.
 const HANDLERS: &str = "bedrockrs.handlers";
@@ -42,6 +45,8 @@ pub(crate) struct LuauEngine {
 
 struct Plugin {
     lua: Lua,
+    /// The slash commands the plugin registered.
+    commands: Registered,
     /// When the running call must stop; checked by the VM's interrupt callback.
     deadline: Rc<Cell<Option<Instant>>>,
 }
@@ -80,6 +85,38 @@ impl LuauEngine {
         self.plugins.keys().cloned().collect()
     }
 
+    /// Every command the running plugins registered, plugin by plugin in
+    /// name order.
+    pub fn commands(&self) -> Vec<PluginCommand> {
+        self.plugins
+            .iter()
+            .flat_map(|(name, plugin)| {
+                plugin
+                    .commands
+                    .borrow()
+                    .iter()
+                    .map(|spec| PluginCommand {
+                        plugin: name.clone(),
+                        spec: spec.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Runs the handler of a plugin command within the execution limit.
+    pub fn run_command(&self, call: &CommandCall) -> CommandReply {
+        let Some(plugin) = self.plugins.get(&call.plugin) else {
+            return CommandReply::error(format!("/{} is no longer available.", call.command));
+        };
+        plugin
+            .run(self.limits.execution, || luau_commands::run(&plugin.lua, call))
+            .unwrap_or_else(|err| {
+                tracing::error!(plugin = %call.plugin, command = %call.command, "command failed: {err}");
+                CommandReply::error("An error occurred while running this command.")
+            })
+    }
+
     /// Calls every handler for `event`, plugin by plugin in name order. A
     /// handler that fails is logged and skipped. Returns whether a handler
     /// cancelled the event; later handlers still run and can check.
@@ -108,7 +145,8 @@ impl LuauEngine {
         lua.set_memory_limit(self.limits.memory)?;
         // Globals become read-only once sandboxed, so install ours first.
         install_output(&lua, name, &self.output)?;
-        install_server(&lua, &self.actions, &self.roster)?;
+        let commands = Registered::default();
+        install_server(&lua, &self.actions, &self.roster, &commands)?;
         lua.sandbox(true)?;
 
         let deadline = Rc::new(Cell::new(None::<Instant>));
@@ -119,7 +157,11 @@ impl LuauEngine {
             )),
             _ => Ok(VmState::Continue),
         });
-        Ok(Plugin { lua, deadline })
+        Ok(Plugin {
+            lua,
+            commands,
+            deadline,
+        })
     }
 }
 
@@ -224,9 +266,9 @@ fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::
 }
 
 /// A player as handlers see them: `{ name, uuid, send_message(message),
-/// kick(reason?) }`. The methods work with `.` and `:` alike, and keep working
+/// set_game_mode(mode), kick(reason?) }`. The methods work with `.` and `:` alike, and keep working
 /// after the event; acting on a player who has left does nothing.
-fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
+pub(crate) fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
     let actions = lua
         .app_data_ref::<mpsc::Sender<Action>>()
         .ok_or_else(|| mlua::Error::runtime("the plugin API is not installed"))?
@@ -258,6 +300,31 @@ fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
     })?;
     table.raw_set("send_message", send_message)?;
 
+    let (queue, uuid) = (actions.clone(), player.uuid.clone());
+    let set_game_mode = lua.create_function(move |_, args: MultiValue| {
+        let mode = match method_args(args).next() {
+            Some(Value::String(mode)) => mode.to_str()?.to_ascii_lowercase(),
+            _ => {
+                return Err(mlua::Error::runtime(
+                    "set_game_mode expects a game mode name",
+                ));
+            }
+        };
+        if !GAME_MODE_VALUES.contains(&mode.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "unknown game mode {mode:?}; expected survival, creative, adventure or spectator"
+            )));
+        }
+        request(
+            &queue,
+            Action::SetGameMode {
+                player: uuid.clone(),
+                mode,
+            },
+        )
+    })?;
+    table.raw_set("set_game_mode", set_game_mode)?;
+
     let uuid = player.uuid.clone();
     let kick = lua.create_function(move |_, args: MultiValue| {
         let reason = match method_args(args).next() {
@@ -288,7 +355,7 @@ fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
 
 /// A method's arguments without `self`, so `player:kick()` works like
 /// `player.kick()`. A player method never takes a table otherwise.
-fn method_args(args: MultiValue) -> impl Iterator<Item = Value> {
+pub(crate) fn method_args(args: MultiValue) -> impl Iterator<Item = Value> {
     let mut args = args.into_iter().peekable();
     if matches!(args.peek(), Some(Value::Table(_))) {
         args.next();
@@ -297,7 +364,7 @@ fn method_args(args: MultiValue) -> impl Iterator<Item = Value> {
 }
 
 /// Queues `action` for the server.
-fn request(actions: &mpsc::Sender<Action>, action: Action) -> mlua::Result<()> {
+pub(crate) fn request(actions: &mpsc::Sender<Action>, action: Action) -> mlua::Result<()> {
     match actions.try_send(action) {
         // A closed channel means the server is shutting down.
         Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
@@ -310,10 +377,16 @@ fn request(actions: &mpsc::Sender<Action>, action: Action) -> mlua::Result<()> {
 /// Adds the `server` table:
 /// - `server.on(event, handler)` registers an event handler;
 /// - `server.broadcast(message)` sends a chat message to everyone;
-/// - `server.player(uuid)` is the online player with that UUID, or `nil`.
+/// - `server.player(uuid)` is the online player with that UUID, or `nil`;
+/// - `server.command(definition)` adds a slash command (see [`luau_commands`]).
 ///
 /// Actions on one player are methods of player tables.
-fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>, roster: &Roster) -> mlua::Result<()> {
+fn install_server(
+    lua: &Lua,
+    actions: &mpsc::Sender<Action>,
+    roster: &Roster,
+    commands: &Registered,
+) -> mlua::Result<()> {
     lua.set_named_registry_value(HANDLERS, lua.create_table()?)?;
     // Player tables built for events queue their actions here.
     lua.set_app_data(actions.clone());
@@ -355,6 +428,7 @@ fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>, roster: &Roster) ->
         found.map(|player| player_table(lua, &player)).transpose()
     })?;
     server.set("player", player)?;
+    luau_commands::install(lua, &server, commands)?;
 
     lua.globals().set("server", server)
 }

@@ -688,6 +688,7 @@ mod tests {
             head_yaw: 180.0,
             flying: true,
             inventory: None,
+            game_mode: Some("survival".into()),
         };
         let world = World::open(&directory).unwrap();
         assert_eq!(world.load_player(uuid), None);

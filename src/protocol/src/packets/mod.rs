@@ -4,6 +4,7 @@
 //! gophertunnel (which targets the same protocol) as a cross-check.
 
 mod block;
+mod command;
 mod effect;
 mod entity;
 mod handshake;
@@ -16,6 +17,7 @@ mod text;
 mod window;
 
 pub use block::*;
+pub use command::*;
 pub use effect::*;
 pub use entity::*;
 pub use handshake::*;

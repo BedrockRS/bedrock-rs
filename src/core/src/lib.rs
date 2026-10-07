@@ -9,12 +9,15 @@ use std::time::Duration;
 
 pub mod auth;
 pub mod blocks;
+pub mod commands;
 pub mod config;
 pub mod console;
 pub mod entities;
+pub mod game_mode;
 pub mod inventory;
 pub mod items;
 pub mod logins;
+pub mod ops;
 pub mod placement;
 pub mod players;
 pub mod server;

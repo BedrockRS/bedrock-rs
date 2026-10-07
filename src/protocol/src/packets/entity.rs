@@ -45,10 +45,13 @@ pub mod ability {
     pub const OPEN_CONTAINERS: u32 = 1 << 3;
     pub const ATTACK_PLAYERS: u32 = 1 << 4;
     pub const ATTACK_MOBS: u32 = 1 << 5;
+    pub const OPERATOR_COMMANDS: u32 = 1 << 6;
+    pub const TELEPORT: u32 = 1 << 7;
     pub const INVULNERABLE: u32 = 1 << 8;
     pub const FLYING: u32 = 1 << 9;
     pub const MAY_FLY: u32 = 1 << 10;
     pub const INSTANT_BUILD: u32 = 1 << 11;
+    pub const NO_CLIP: u32 = 1 << 17;
     /// Every one of the 20 abilities.
     pub const ALL: u32 = (1 << 20) - 1;
 
@@ -123,6 +126,42 @@ impl Packet for UpdateAbilities {
 impl Encode for UpdateAbilities {
     fn encode_payload(&self, writer: &mut Writer) {
         self.0.write(writer);
+    }
+}
+
+/// Sets the game mode of the client's own player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetPlayerGameType {
+    pub game_type: i32,
+}
+
+impl Packet for SetPlayerGameType {
+    const ID: u32 = id::SET_PLAYER_GAME_TYPE;
+}
+
+impl Encode for SetPlayerGameType {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_i32(self.game_type);
+    }
+}
+
+/// Tells clients another player's game mode changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdatePlayerGameType {
+    pub game_type: i32,
+    pub player_unique_id: i64,
+    pub tick: u64,
+}
+
+impl Packet for UpdatePlayerGameType {
+    const ID: u32 = id::UPDATE_PLAYER_GAME_TYPE;
+}
+
+impl Encode for UpdatePlayerGameType {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_i32(self.game_type);
+        writer.var_i64(self.player_unique_id);
+        writer.var_u64(self.tick);
     }
 }
 

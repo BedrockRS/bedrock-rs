@@ -16,7 +16,10 @@
 //!    [`Players`](crate::players::Players) and plugins hear `player_join`.
 //!
 //! From then on, chat messages (Text) are relayed to every player unless a
-//! plugin cancels them, and plugins hear of blocks broken and placed. Item
+//! plugin cancels them, slash commands (CommandRequest) are run and answered
+//! with their output, and plugins hear of blocks broken and placed. What the
+//! player may do follows their [`GameMode`], which commands and plugins can
+//! change through the session's [`Control`] channel. Item
 //! stack requests move items in the player's [`Inventory`], which is saved
 //! with the player. Plugins
 //! that heard `player_join` hear `player_quit` when the session ends.
@@ -27,7 +30,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use bedrockrs_net::{ClientIdentity, Connection, Reliability};
-use bedrockrs_plugins::{BlockChange, Dispatcher, Event, Player, Position};
+use bedrockrs_plugins::{BlockChange, CommandReply, Dispatcher, Event, Player, Position};
 use bedrockrs_protocol::batch::{self, BatchError, Compression, CompressionAlgorithm};
 use bedrockrs_protocol::block::{BlockState, StateValue};
 use bedrockrs_protocol::io::DecodeError;
@@ -50,6 +53,9 @@ use bedrockrs_protocol::packets::{
     interact_action,
 };
 use bedrockrs_protocol::packets::{
+    CommandMessage, CommandOrigin, CommandOutput, CommandRequest, SetPlayerGameType,
+};
+use bedrockrs_protocol::packets::{
     INVENTORY_WINDOW, InventoryAction, ItemInstance, MobEquipment, action_source,
 };
 use bedrockrs_protocol::skin::client_skin;
@@ -61,10 +67,12 @@ use uuid::Uuid;
 
 use crate::TICK_DURATION;
 use crate::auth::AuthError;
+use crate::commands::{PlayerSender, Sender};
 use crate::entities::{ItemEntities, ItemStack, PickedUp};
+use crate::game_mode::GameMode;
 use crate::inventory::{HOTBAR_SLOTS, Inventory};
 use crate::items::items;
-use crate::logins::KickNotice;
+use crate::logins::{CONTROL_QUEUE, Control};
 use crate::placement::{self, Placing};
 use crate::players::{
     EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, STANDING_HEIGHT, View, body_overlaps,
@@ -99,10 +107,6 @@ const MAX_CHAT_LENGTH: usize = 512;
 /// they send arrive once the client's HUD is ready.
 const JOIN_EVENT_DELAY: Duration = Duration::from_millis(750);
 
-/// Everyone plays in creative mode for now: creative items can be taken from
-/// the creative inventory, and placing blocks uses none up.
-const CREATIVE: bool = true;
-
 /// The ItemRegistry and CreativeContent packets, the same for every player,
 /// encoded once.
 static ITEM_REGISTRY: LazyLock<Vec<u8>> = LazyLock::new(|| items().registry_packet().encode());
@@ -119,6 +123,7 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
         connection.client_identity().cloned(),
         Arc::clone(&server.world),
         entity_id,
+        server.default_game_mode,
     );
     serve(&mut connection, &server, &mut session).await;
     // However the session ended, remember where the player left.
@@ -141,8 +146,9 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
     // The plugin join event, waiting out [`JOIN_EVENT_DELAY`].
     let mut join_event: Option<(Pin<Box<tokio::time::Sleep>>, Player)> = None;
     // Set once the player's identity is verified: the one session for that
-    // UUID. A newer login for the same player, or a plugin, sends a kick.
-    let (kick, mut kicks) = mpsc::channel::<KickNotice>(1);
+    // UUID. The rest of the server reaches the session through it: a newer
+    // login for the same player kicks it, commands change its game mode.
+    let (controls, mut control) = mpsc::channel::<Control>(CONTROL_QUEUE);
     let mut login_claim = None;
     // The player as plugins know them, once they are in the world.
     let mut plugin_player: Option<Player> = None;
@@ -197,7 +203,8 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                             }
                             SessionEvent::LoggedIn(uuid) => {
                                 // Kicks this player's older session, if any.
-                                login_claim = Some(server.logins.claim(uuid, kick.clone()));
+                                login_claim = Some(server.logins.claim(uuid, controls.clone()));
+                                session.set_operator(server.ops.contains(uuid));
                             }
                             SessionEvent::Joined { profile, movement, view, inventory, held } => {
                                 let player = Player {
@@ -213,8 +220,10 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                     view,
                                     inventory,
                                     held,
+                                    game_mode: session.game_mode(),
                                     outbound: outbound.clone(),
                                 }));
+                                let _ = outbound.try_send(available_commands(server, session));
                                 // Plugins hear of the join a little later: the
                                 // client's HUD shows messages that arrive while
                                 // it is still starting up twice.
@@ -234,7 +243,7 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                 }
                             }
                             SessionEvent::BrokeBlock(pos) => {
-                                if let Some(broken) = server.break_block(pos)
+                                if let Some(broken) = server.break_block(pos, session.game_mode())
                                     && let Some(player) = &plugin_player
                                 {
                                     server.plugins.dispatch(Event::BlockBreak(
@@ -294,6 +303,18 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                     membership.flying(flying);
                                 }
                             }
+                            SessionEvent::Command { line, origin } => {
+                                let reply = server.run_command(&session.command_sender(), &line).await;
+                                let output = session.command_output(origin, &reply);
+                                if !send(connection, [output.as_slice()].into_iter(), compression).await {
+                                    return;
+                                }
+                            }
+                            SessionEvent::GameModeChanged(mode) => {
+                                if let Some(membership) = &membership {
+                                    membership.game_mode(mode);
+                                }
+                            }
                             SessionEvent::Chat(message) => {
                                 let cancelled = match &plugin_player {
                                     Some(player) => chat_cancelled(&server.plugins, player, &message).await,
@@ -315,14 +336,43 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                     }
                 }
             }
-            Some(notice) = kicks.recv() => {
-                // A newer login for this player, or a plugin: this session ends.
-                let reply = Reply::disconnect(notice.reason, notice.message);
-                let _ = send(connection, reply.packets.iter().map(Vec::as_slice), compression).await;
-                drop(membership.take());
-                drop(login_claim.take());
-                linger(connection).await;
-                return;
+            Some(control) = control.recv() => {
+                let reply = match control {
+                    Control::Kick(notice) => {
+                        // A newer login for this player, or a plugin: this session ends.
+                        let reply = Reply::disconnect(notice.reason, notice.message);
+                        let _ = send(connection, reply.packets.iter().map(Vec::as_slice), compression).await;
+                        drop(membership.take());
+                        drop(login_claim.take());
+                        linger(connection).await;
+                        return;
+                    }
+                    Control::SetGameMode(mode) => session.set_game_mode(mode),
+                    Control::SetOperator(operator) => {
+                        let mut reply = session.operator_changed(operator);
+                        if membership.is_some() {
+                            reply.packets.push(available_commands(server, session).to_vec());
+                        }
+                        reply
+                    }
+                    Control::RefreshCommands if membership.is_some() => {
+                        Reply::send(vec![available_commands(server, session).to_vec()])
+                    }
+                    // Players still joining get the commands once they are in.
+                    Control::RefreshCommands => Reply::default(),
+                };
+                if !send(connection, reply.packets.iter().map(Vec::as_slice), compression).await {
+                    return;
+                }
+                for event in reply.events {
+                    if let Some(membership) = &membership {
+                        match event {
+                            SessionEvent::GameModeChanged(mode) => membership.game_mode(mode),
+                            SessionEvent::Flying(flying) => membership.flying(flying),
+                            _ => {}
+                        }
+                    }
+                }
             }
             () = async { join_event.as_mut().expect("guarded").0.as_mut().await }, if join_event.is_some() => {
                 let (_, player) = join_event.take().expect("guarded");
@@ -363,6 +413,16 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
             }
         }
     }
+}
+
+/// The commands this session's player may run, for their client.
+fn available_commands(server: &Server, session: &Session) -> Bytes {
+    Bytes::from(
+        server
+            .commands
+            .available_to(&session.command_sender())
+            .encode(),
+    )
 }
 
 /// A block state for logs: `minecraft:oak_stairs[upside_down_bit=0,…]`.
@@ -517,6 +577,10 @@ pub enum SessionEvent {
     Holding { item: ItemInstance, slot: u8 },
     /// The player said something in chat.
     Chat(String),
+    /// The player typed a slash command; its output goes back with `origin`.
+    Command { line: String, origin: CommandOrigin },
+    /// The player's game mode changed.
+    GameModeChanged(GameMode),
 }
 
 impl Reply {
@@ -620,11 +684,22 @@ pub struct Session {
     /// Whether the player's inventory screen is open. Opening it twice makes
     /// the client crash, and latency can make it ask twice.
     inventory_open: bool,
+    /// What the player may do.
+    game_mode: GameMode,
+    /// The game mode of new players, which the world reports as its own.
+    default_game_mode: GameMode,
+    /// Whether the player may run operator commands.
+    operator: bool,
     world: Arc<World>,
 }
 
 impl Session {
-    pub fn new(identity: Option<ClientIdentity>, world: Arc<World>, entity_id: u64) -> Self {
+    pub fn new(
+        identity: Option<ClientIdentity>,
+        world: Arc<World>,
+        entity_id: u64,
+        default_game_mode: GameMode,
+    ) -> Self {
         let spawn = world.spawn();
         Self {
             stage: Stage::RequestNetworkSettings,
@@ -650,6 +725,9 @@ impl Session {
             held_slot: 0,
             shown_held: ItemInstance::EMPTY,
             inventory_open: false,
+            game_mode: default_game_mode,
+            default_game_mode,
+            operator: false,
             world,
         }
     }
@@ -669,6 +747,7 @@ impl Session {
         (self.stage == Stage::InGame).then(|| {
             let mut saved = self.movement.saved(self.flying);
             saved.inventory = Some(self.inventory.saved());
+            saved.game_mode = Some(self.game_mode.name().to_owned());
             (self.uuid, saved)
         })
     }
@@ -676,6 +755,88 @@ impl Session {
     /// What the player carries.
     pub fn inventory(&self) -> &Inventory {
         &self.inventory
+    }
+
+    pub fn game_mode(&self) -> GameMode {
+        self.game_mode
+    }
+
+    /// Whether the player is an operator; set from the operator list at
+    /// login, before they spawn.
+    pub fn set_operator(&mut self, operator: bool) {
+        self.operator = operator;
+    }
+
+    /// The player, as someone running commands.
+    pub fn command_sender(&self) -> Sender {
+        Sender::Player(PlayerSender {
+            uuid: self.uuid,
+            name: self.player.clone(),
+            operator: self.operator,
+        })
+    }
+
+    /// Changes the player's game mode: their client is told, along with
+    /// what the mode lets them do. A player who may no longer fly stops.
+    pub fn set_game_mode(&mut self, mode: GameMode) -> Reply {
+        self.game_mode = mode;
+        self.flying = match mode {
+            GameMode::Spectator => true,
+            _ => self.flying && mode.may_fly(),
+        };
+        tracing::info!(uuid = %self.uuid, "{}'s game mode is now {}", self.player, mode.name());
+        if !self.stage.in_world() {
+            return Reply::default();
+        }
+        Reply {
+            packets: vec![
+                SetPlayerGameType {
+                    game_type: mode.id(),
+                }
+                .encode(),
+                self.own_abilities().encode(),
+            ],
+            events: vec![
+                SessionEvent::GameModeChanged(mode),
+                SessionEvent::Flying(self.flying),
+            ],
+            ..Reply::default()
+        }
+    }
+
+    /// The player became an operator or stopped being one: their client is
+    /// told their new permissions, and they are told in chat.
+    pub fn operator_changed(&mut self, operator: bool) -> Reply {
+        self.operator = operator;
+        if !self.stage.in_world() {
+            return Reply::default();
+        }
+        let message = if operator {
+            "§eYou are now an operator."
+        } else {
+            "§eYou are no longer an operator."
+        };
+        Reply::send(vec![
+            self.own_abilities().encode(),
+            Text::system(message).encode(),
+        ])
+    }
+
+    /// What running a command printed, for the client that sent it.
+    pub fn command_output(&self, origin: CommandOrigin, reply: &CommandReply) -> Vec<u8> {
+        CommandOutput {
+            origin,
+            success_count: u32::from(reply.succeeded()),
+            messages: reply
+                .lines
+                .iter()
+                .map(|line| CommandMessage {
+                    success: line.success,
+                    message: line.text.clone(),
+                })
+                .collect(),
+        }
+        .encode()
     }
 
     /// Handles one encoded packet (header and payload).
@@ -698,6 +859,9 @@ impl Session {
                 Ok(self.initialized(packet::decode(payload)?))
             }
             (Stage::InGame, id::TEXT) => Ok(self.text(packet::decode(payload)?)),
+            (Stage::InGame, id::COMMAND_REQUEST) => {
+                Ok(self.command_request(packet::decode(payload)?))
+            }
             (Stage::InGame, id::PLAYER_AUTH_INPUT) => Ok(self.auth_input(packet::decode(payload)?)),
             (Stage::InGame, id::PLAYER_ACTION) => Ok(self.player_action(packet::decode(payload)?)),
             (Stage::InGame, id::ANIMATE) => Ok(self.animate(packet::decode(payload)?)),
@@ -853,6 +1017,14 @@ impl Session {
         if let Some(saved) = self.world.load_player(self.uuid) {
             self.movement = Movement::from_saved(&saved);
             self.flying = saved.flying;
+            if let Some(name) = &saved.game_mode {
+                match GameMode::from_name(name) {
+                    Some(mode) => self.game_mode = mode,
+                    None => {
+                        tracing::warn!(uuid = %self.uuid, mode = %name, "ignoring an unknown saved game mode")
+                    }
+                }
+            }
             if let Some(inventory) = &saved.inventory {
                 self.inventory = Inventory::from_saved(inventory);
             }
@@ -901,7 +1073,14 @@ impl Session {
                 Ok(Reply::send(vec![
                     JigsawStructureData::empty().encode(),
                     VoxelShapes.encode(),
-                    start_game(&self.world, self.entity_id, &self.movement).encode(),
+                    start_game(
+                        &self.world,
+                        self.entity_id,
+                        &self.movement,
+                        self.game_mode,
+                        self.default_game_mode,
+                    )
+                    .encode(),
                     // Every vanilla item the server knows.
                     ITEM_REGISTRY.clone(),
                 ]))
@@ -971,29 +1150,21 @@ impl Session {
         }
     }
 
-    /// A creative player's abilities at vanilla walk and fly speeds.
+    /// What the player's game mode lets them do, at vanilla walk and fly
+    /// speeds, and their permissions.
     fn own_abilities(&self) -> UpdateAbilities {
-        let creative = ability::BUILD
-            | ability::MINE
-            | ability::DOORS_AND_SWITCHES
-            | ability::OPEN_CONTAINERS
-            | ability::ATTACK_PLAYERS
-            | ability::ATTACK_MOBS
-            | ability::INVULNERABLE
-            | ability::MAY_FLY
-            | ability::INSTANT_BUILD;
         // Flying is an ability value too: granting it keeps a player who
         // left in the air flying when they return.
-        let values = if self.flying {
-            creative | ability::FLYING
-        } else {
-            creative
-        };
+        let mut values = self.game_mode.abilities(self.flying);
+        if self.operator {
+            values |= ability::OPERATOR_COMMANDS;
+        }
         UpdateAbilities(AbilityData {
             entity_unique_id: i64::try_from(self.entity_id)
                 .expect("entity IDs stay far below i64::MAX"),
-            player_permissions: 1,
-            command_permissions: 0,
+            // Member, or operator; commands at the "any" or operator level.
+            player_permissions: if self.operator { 2 } else { 1 },
+            command_permissions: u8::from(self.operator),
             layers: vec![AbilityLayer::base(values)],
         })
     }
@@ -1095,13 +1266,13 @@ impl Session {
         let mut events: Vec<SessionEvent> = input
             .block_actions
             .iter()
-            .filter(|action| {
-                // Everyone is in creative mode, where starting to break a
-                // block breaks it; survival clients finish with a prediction.
-                matches!(
-                    action.action,
-                    player_action::START_BREAK | player_action::PREDICT_DESTROY_BLOCK
-                )
+            .filter(|action| match action.action {
+                // In creative mode, starting to break a block breaks it;
+                // otherwise the client says when it finished, which is
+                // trusted for now: breaking time is not checked.
+                player_action::START_BREAK => self.game_mode.breaks_instantly(),
+                player_action::PREDICT_DESTROY_BLOCK => true,
+                _ => false,
             })
             .filter_map(|action| self.break_block(action.position))
             .collect();
@@ -1128,8 +1299,12 @@ impl Session {
         };
         let mut packets = Vec::new();
         if let Some(flying) = flying {
-            self.flying = flying;
-            events.push(SessionEvent::Flying(flying));
+            // Only modes that may fly can start; spectators cannot stop.
+            self.flying = match self.game_mode {
+                GameMode::Spectator => true,
+                mode => flying && mode.may_fly(),
+            };
+            events.push(SessionEvent::Flying(self.flying));
             packets.push(self.own_abilities().encode());
         }
 
@@ -1283,7 +1458,7 @@ impl Session {
     /// Picks up the items within the player's reach, as many as fit. Called
     /// every tick while the player is in the world.
     pub fn pick_up(&mut self, items: &ItemEntities) -> Reply {
-        if self.stage != Stage::InGame {
+        if self.stage != Stage::InGame || !self.game_mode.is_present() {
             return Reply::default();
         }
         let feet = self.movement.feet();
@@ -1323,7 +1498,7 @@ impl Session {
         let responses: Vec<StackResponse> = packet
             .requests
             .iter()
-            .map(|request| self.inventory.handle(request, CREATIVE))
+            .map(|request| self.inventory.handle(request, self.game_mode.is_creative()))
             .collect();
         let changed = responses
             .iter()
@@ -1354,7 +1529,7 @@ impl Session {
 
     /// Right-clicking a block with a block item places it against the clicked
     /// face. The held stack is the server's, and must be the item the client
-    /// says it holds. In creative mode, placing uses nothing up. The client
+    /// says it holds. Outside creative mode, placing uses one up. The client
     /// predicts the placement, so a refused one is undone with the block that
     /// is really there.
     fn inventory_transaction(&mut self, transaction: InventoryTransaction) -> Reply {
@@ -1372,7 +1547,7 @@ impl Session {
         match self.placed_block(&use_item, target) {
             Ok((pos, state, replacing)) => {
                 tracing::debug!(player = %self.player, ?pos, block = %describe(&state), id = state.network_id(), "placing a block");
-                Reply {
+                let mut reply = Reply {
                     events: vec![
                         SessionEvent::PlacedBlock {
                             pos,
@@ -1382,7 +1557,19 @@ impl Session {
                         SessionEvent::Swing,
                     ],
                     ..Reply::default()
+                };
+                // The item is used up even if someone else fills the spot
+                // before the block goes in, which is rare.
+                if !self.game_mode.is_creative()
+                    && let Some(slot) = self.inventory.use_one(use_item.hotbar_slot)
+                {
+                    reply.packets.push(slot.encode());
+                    reply
+                        .events
+                        .push(SessionEvent::InventoryChanged(self.inventory.saved()));
+                    reply.events.extend(self.held_event());
                 }
+                reply
             }
             // Whatever the reason, the client already shows its prediction,
             // next to the clicked block or in it (a slab it expected to
@@ -1472,7 +1659,7 @@ impl Session {
     /// A PlayerAction: creative clients report instant breaks this way too.
     fn player_action(&mut self, action: PlayerAction) -> Reply {
         let events = match action.action {
-            player_action::CREATIVE_DESTROY_BLOCK => self
+            player_action::CREATIVE_DESTROY_BLOCK if self.game_mode.breaks_instantly() => self
                 .break_block(action.block_position)
                 .into_iter()
                 .collect(),
@@ -1484,9 +1671,14 @@ impl Session {
         }
     }
 
-    /// Checks that the player may break the block at `pos`: inside the
-    /// world's height, within reach, and in a chunk their client has.
+    /// Checks that the player may break the block at `pos`: their game mode
+    /// lets them build, and it is inside the world's height, within reach,
+    /// and in a chunk their client has.
     fn break_block(&self, pos: BlockPos) -> Option<SessionEvent> {
+        if !self.game_mode.may_build() {
+            tracing::debug!(player = %self.player, ?pos, mode = self.game_mode.name(), "refusing to change a block in this game mode");
+            return None;
+        }
         let centre = Vec3 {
             x: pos.x as f32 + 0.5,
             y: pos.y as f32 + 0.5,
@@ -1574,15 +1766,43 @@ impl Session {
             ..Reply::default()
         }
     }
+
+    /// A slash command the player typed, for the server to run. Control
+    /// characters become spaces, as in chat.
+    fn command_request(&mut self, request: CommandRequest) -> Reply {
+        let line: String = request
+            .command_line
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if line.chars().count() > MAX_CHAT_LENGTH {
+            let warning = format!("§cCommands can be at most {MAX_CHAT_LENGTH} characters long.");
+            return Reply::send(vec![Text::raw(warning).encode()]);
+        }
+        Reply {
+            events: vec![SessionEvent::Command {
+                line,
+                origin: request.origin,
+            }],
+            ..Reply::default()
+        }
+    }
 }
 
-/// StartGame for the flat world: a creative-mode player standing at the spawn.
-fn start_game(world: &World, entity_id: u64, movement: &Movement) -> StartGame {
+/// StartGame for the flat world, with the player in their game mode where
+/// they stand.
+fn start_game(
+    world: &World,
+    entity_id: u64,
+    movement: &Movement,
+    game_mode: GameMode,
+    default_game_mode: GameMode,
+) -> StartGame {
     let spawn = world.spawn();
     StartGame {
         entity_unique_id: i64::try_from(entity_id).expect("entity IDs stay far below i64::MAX"),
         entity_runtime_id: entity_id,
-        player_game_mode: 1,
+        player_game_mode: game_mode.id(),
         player_position: movement.position,
         pitch: movement.pitch,
         yaw: movement.yaw,
@@ -1591,7 +1811,7 @@ fn start_game(world: &World, entity_id: u64, movement: &Movement) -> StartGame {
         user_defined_biome_name: "plains".into(),
         dimension: OVERWORLD,
         generator: 2,
-        world_game_mode: 1,
+        world_game_mode: default_game_mode.id(),
         hardcore: false,
         difficulty: 0,
         world_spawn: spawn,
@@ -1700,7 +1920,12 @@ mod tests {
     }
 
     fn session(identity: Option<ClientIdentity>) -> Session {
-        Session::new(identity, Arc::new(World::new()), PLAYER_ENTITY_ID)
+        Session::new(
+            identity,
+            Arc::new(World::new()),
+            PLAYER_ENTITY_ID,
+            GameMode::Creative,
+        )
     }
 
     fn login_packet(token: String) -> Vec<u8> {
@@ -2980,5 +3205,209 @@ mod tests {
         };
         let reply = session.handle(&tip.encode()).unwrap();
         assert!(reply.events.is_empty() && reply.packets.is_empty());
+    }
+
+    fn spawn_eyes() -> Vec3 {
+        Vec3 {
+            x: 0.5,
+            y: -60.0 + EYE_HEIGHT,
+            z: 0.5,
+        }
+    }
+
+    /// PlayerAuthInput at the spawn with these input flags.
+    fn flags_input(flags: Vec<i32>) -> Vec<u8> {
+        let mut input = PlayerAuthInput::decode_payload(&mut bedrockrs_protocol::io::Reader::new(
+            &breaking_input(spawn_eyes(), 0.0, Vec::new())[2..],
+        ))
+        .unwrap();
+        input.input_flags = flags;
+        input.encode()
+    }
+
+    fn break_action(action: i32, position: BlockPos) -> BlockAction {
+        BlockAction {
+            action,
+            position,
+            face: 1,
+        }
+    }
+
+    #[test]
+    fn game_modes_decide_how_blocks_break() {
+        let mut session = in_game_session();
+        session.set_game_mode(GameMode::Survival);
+        let grass = BlockPos { x: 1, y: -61, z: 0 };
+
+        // Outside creative, starting to break is not breaking: the client
+        // says when it is done.
+        let start = break_action(player_action::START_BREAK, grass);
+        let reply = session
+            .handle(&breaking_input(spawn_eyes(), 0.0, vec![start]))
+            .unwrap();
+        assert!(!reply.events.contains(&SessionEvent::BrokeBlock(grass)));
+        let done = break_action(player_action::PREDICT_DESTROY_BLOCK, grass);
+        let reply = session
+            .handle(&breaking_input(spawn_eyes(), 0.0, vec![done]))
+            .unwrap();
+        assert!(reply.events.contains(&SessionEvent::BrokeBlock(grass)));
+
+        // Instant breaks are for creative players only.
+        let destroy = PlayerAction {
+            entity_runtime_id: PLAYER_ENTITY_ID,
+            action: player_action::CREATIVE_DESTROY_BLOCK,
+            block_position: grass,
+            result_position: BlockPos::default(),
+            face: 1,
+        };
+        assert!(session.handle(&destroy.encode()).unwrap().events.is_empty());
+
+        // Adventure players and spectators change no blocks at all.
+        for mode in [GameMode::Adventure, GameMode::Spectator] {
+            session.set_game_mode(mode);
+            let reply = session
+                .handle(&breaking_input(spawn_eyes(), 0.0, vec![done]))
+                .unwrap();
+            assert!(
+                !reply.events.contains(&SessionEvent::BrokeBlock(grass)),
+                "{mode:?}"
+            );
+            let reply = session
+                .handle(&place(0, BlockPos { x: 2, y: -61, z: 0 }, 1))
+                .unwrap();
+            assert!(
+                !reply
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, SessionEvent::PlacedBlock { .. })),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn survival_placing_uses_up_the_held_block() {
+        let mut session = in_game_session();
+        let before = session.inventory().hotbar(0).unwrap().count;
+
+        // Creative players keep their blocks.
+        session
+            .handle(&place(0, BlockPos { x: 2, y: -61, z: 0 }, 1))
+            .unwrap();
+        assert_eq!(session.inventory().hotbar(0).unwrap().count, before);
+
+        session.set_game_mode(GameMode::Survival);
+        let reply = session
+            .handle(&place(0, BlockPos { x: 3, y: -61, z: 0 }, 1))
+            .unwrap();
+        assert_eq!(session.inventory().hotbar(0).unwrap().count, before - 1);
+        assert_eq!(ids(&reply), [id::INVENTORY_SLOT]);
+        assert!(
+            reply
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::PlacedBlock { .. }))
+        );
+        assert!(
+            reply
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::InventoryChanged(_))),
+            "the change is saved"
+        );
+    }
+
+    #[test]
+    fn changing_game_mode_tells_the_client_and_is_saved() {
+        let mut session = in_game_session();
+        session
+            .handle(&flags_input(vec![input_flag::START_FLYING]))
+            .unwrap();
+
+        let reply = session.set_game_mode(GameMode::Survival);
+        assert_eq!(
+            ids(&reply),
+            [id::SET_PLAYER_GAME_TYPE, id::UPDATE_ABILITIES]
+        );
+        assert_eq!(
+            reply.events,
+            [
+                SessionEvent::GameModeChanged(GameMode::Survival),
+                SessionEvent::Flying(false),
+            ],
+            "survival players cannot fly"
+        );
+        let (_, saved) = session.saved_player().unwrap();
+        assert_eq!(saved.game_mode.as_deref(), Some("survival"));
+        assert!(!saved.flying);
+
+        // Survival clients cannot start flying either.
+        let reply = session
+            .handle(&flags_input(vec![input_flag::START_FLYING]))
+            .unwrap();
+        assert!(reply.events.contains(&SessionEvent::Flying(false)));
+
+        // Spectators always fly.
+        let reply = session.set_game_mode(GameMode::Spectator);
+        assert!(reply.events.contains(&SessionEvent::Flying(true)));
+    }
+
+    #[test]
+    fn players_changed_before_spawning_start_in_their_mode() {
+        let mut session = session_with_mode(GameMode::Survival);
+        assert_eq!(session.game_mode(), GameMode::Survival);
+        let reply = session.set_game_mode(GameMode::Adventure);
+        assert!(
+            reply.packets.is_empty() && reply.events.is_empty(),
+            "not in the world yet"
+        );
+        assert_eq!(session.game_mode(), GameMode::Adventure);
+    }
+
+    fn session_with_mode(mode: GameMode) -> Session {
+        Session::new(None, Arc::new(World::new()), PLAYER_ENTITY_ID, mode)
+    }
+
+    fn command_request(line: &str) -> Vec<u8> {
+        let mut bytes = vec![id::COMMAND_REQUEST as u8];
+        let mut writer = bedrockrs_protocol::io::Writer::new();
+        writer.string(line);
+        writer.string("player");
+        writer.uuid([3; 16]);
+        writer.string("");
+        writer.i64_le(0);
+        writer.bool(false);
+        writer.string("52");
+        bytes.extend(writer.into_bytes());
+        bytes
+    }
+
+    #[test]
+    fn slash_commands_are_passed_on_and_answered() {
+        let mut session = in_game_session();
+        let reply = session.handle(&command_request("/gamemode\ns")).unwrap();
+        let [SessionEvent::Command { line, origin }] = &reply.events[..] else {
+            panic!("expected a command, got {:?}", reply.events);
+        };
+        assert_eq!(line, "/gamemode s", "control characters become spaces");
+        assert_eq!(origin.uuid, [3; 16]);
+
+        let output = session.command_output(origin.clone(), &CommandReply::error("No."));
+        assert_eq!(
+            packet::read_header(&output).unwrap().0.id,
+            id::COMMAND_OUTPUT
+        );
+
+        // The player is who runs it, with their operator status.
+        let Sender::Player(sender) = session.command_sender() else {
+            panic!("a player sends commands");
+        };
+        assert!(!sender.operator);
+        let reply = session.operator_changed(true);
+        assert_eq!(ids(&reply), [id::UPDATE_ABILITIES, id::TEXT]);
+        let Sender::Player(sender) = session.command_sender() else {
+            panic!("a player sends commands");
+        };
+        assert!(sender.operator);
     }
 }

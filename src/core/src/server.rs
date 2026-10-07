@@ -8,14 +8,17 @@ use bedrockrs_protocol::packet::Encode as _;
 use bedrockrs_protocol::packets::{LevelEvent, LevelSoundEvent, UpdateBlock};
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
 use crate::blocks::palette;
+use crate::commands::Commands;
 use crate::entities::{self, ItemEntities, ItemStack, PickedUp};
+use crate::game_mode::GameMode;
 use crate::items::items;
-use crate::logins::Logins;
+use crate::logins::{Control, Logins};
+use crate::ops::Operators;
 use crate::placement;
 use crate::players::Players;
 use crate::storage::SavedPlayer;
@@ -38,8 +41,16 @@ pub struct Server {
     pub logins: Logins,
     /// Items lying in the world.
     pub items: ItemEntities,
+    /// Every slash command, built-in and from plugins.
+    pub commands: Commands,
+    /// Players who may run operator commands.
+    pub ops: Operators,
+    /// The game mode of players who have not played here before.
+    pub default_game_mode: GameMode,
     /// The last tick the game loop ran; 0 before the first.
     tick: AtomicU64,
+    /// Signalled when something asks the server to stop.
+    stop: Notify,
 }
 
 impl Server {
@@ -51,8 +62,33 @@ impl Server {
             authenticator,
             logins: Logins::new(),
             items: ItemEntities::new(),
+            commands: Commands::new(),
+            ops: Operators::in_memory(),
+            default_game_mode: GameMode::Creative,
             tick: AtomicU64::new(0),
+            stop: Notify::new(),
         }
+    }
+
+    /// Keeps operators in `ops` rather than in memory.
+    pub fn with_operators(mut self, ops: Operators) -> Self {
+        self.ops = ops;
+        self
+    }
+
+    pub fn with_default_game_mode(mut self, mode: GameMode) -> Self {
+        self.default_game_mode = mode;
+        self
+    }
+
+    /// Asks the server to stop, as `/stop` does.
+    pub fn request_stop(&self) {
+        self.stop.notify_one();
+    }
+
+    /// Resolves once something asked the server to stop.
+    pub async fn stop_requested(&self) {
+        self.stop.notified().await;
     }
 
     pub fn current_tick(&self) -> u64 {
@@ -92,9 +128,9 @@ impl Server {
 
     /// Replaces the block at `pos` with air. Every player whose client has
     /// that chunk sees the change and the breaking particles, and hears it,
-    /// and the block's item pops out. Breaking air does nothing. Returns the
-    /// block broken, if any.
-    pub fn break_block(&self, pos: BlockPos) -> Option<u32> {
+    /// and, if `game_mode` collects broken blocks, the block's item pops out.
+    /// Breaking air does nothing. Returns the block broken, if any.
+    pub fn break_block(&self, pos: BlockPos, game_mode: GameMode) -> Option<u32> {
         let broken = self.world.replace_block(pos, self.world.air())?;
         let chunk = ChunkPos::of_block(pos);
         self.players
@@ -107,6 +143,9 @@ impl Server {
         self.players
             .send_to_viewers(chunk, &Bytes::from(effect.encode()));
         self.update_neighbours(pos);
+        if !game_mode.drops_broken_blocks() {
+            return Some(broken);
+        }
         // The block's own item, whatever state it was in; a double slab is
         // two of its slab.
         let name = self.world.state_of(broken).map(|state| state.name.as_str());
@@ -238,6 +277,24 @@ impl Server {
                     tracing::debug!(%uuid, "a plugin kicked a player who is not online");
                 }
             }
+            Action::SetGameMode { player, mode } => {
+                let Some(uuid) = plugin_player(&player) else {
+                    return;
+                };
+                let Some(mode) = GameMode::resolve(&mode, self.default_game_mode) else {
+                    tracing::warn!(mode, "a plugin asked for a game mode that does not exist");
+                    return;
+                };
+                if !self.logins.send(uuid, Control::SetGameMode(mode)) {
+                    tracing::debug!(%uuid, "a plugin set the game mode of a player who is not online");
+                }
+            }
+            Action::SetCommands(commands) => {
+                if self.commands.set_plugin_commands(commands) {
+                    tracing::debug!("plugin commands changed; telling every player");
+                    self.logins.send_all(&Control::RefreshCommands);
+                }
+            }
         }
     }
 }
@@ -321,6 +378,7 @@ mod tests {
             },
             inventory: Default::default(),
             held: (bedrockrs_protocol::packets::ItemInstance::EMPTY, 0),
+            game_mode: crate::game_mode::GameMode::Creative,
             outbound,
         });
         (membership, queue)
@@ -339,7 +397,7 @@ mod tests {
         while far.try_recv().is_ok() {}
 
         let grass = BlockPos { x: 9, y: -61, z: 8 };
-        server.break_block(grass);
+        server.break_block(grass, GameMode::Creative);
         assert_eq!(server.world.block(grass), server.world.air());
         // The change, then the breaking particles and sound.
         assert_eq!(ids(&mut near), [id::UPDATE_BLOCK, id::LEVEL_EVENT]);
@@ -348,9 +406,27 @@ mod tests {
             "the chunk is not loaded out there"
         );
 
+        assert_eq!(server.items.count(), 0, "creative breaks drop nothing");
+
         // Breaking air again changes nothing, so nothing is sent.
-        server.break_block(grass);
+        server.break_block(grass, GameMode::Creative);
         assert!(ids(&mut near).is_empty());
+    }
+
+    #[test]
+    fn survival_breaks_drop_the_block_item() {
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        );
+        let grass = BlockPos { x: 9, y: -61, z: 8 };
+        assert!(server.break_block(grass, GameMode::Survival).is_some());
+        assert_eq!(server.items.count(), 1);
+
+        // Air has no item.
+        server.break_block(grass, GameMode::Survival);
+        assert_eq!(server.items.count(), 1);
     }
 
     #[test]
@@ -442,10 +518,47 @@ mod tests {
             player: steve_uuid.to_string(),
             reason: "Bye".into(),
         });
-        let notice = kicks.try_recv().unwrap();
+        let Control::Kick(notice) = kicks.try_recv().unwrap() else {
+            panic!("expected a kick");
+        };
         assert_eq!(notice.reason, DisconnectReason::KICKED);
         assert_eq!(notice.message, "Bye");
+
+        server.apply(Action::SetGameMode {
+            player: steve_uuid.to_string(),
+            mode: "survival".into(),
+        });
+        assert_eq!(
+            kicks.try_recv().unwrap(),
+            Control::SetGameMode(GameMode::Survival)
+        );
         drop(steve);
+    }
+
+    #[test]
+    fn plugin_commands_reach_every_player() {
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        );
+        let (controls, mut received) = mpsc::channel(4);
+        let _claim = server.logins.claim(Uuid::new_v4(), controls);
+        let warp = bedrockrs_plugins::PluginCommand {
+            plugin: "warps".into(),
+            spec: bedrockrs_plugins::CommandSpec {
+                name: "warp".into(),
+                description: String::new(),
+                aliases: Vec::new(),
+                root: bedrockrs_plugins::CommandNode::runs(),
+            },
+        };
+        server.apply(Action::SetCommands(vec![warp.clone()]));
+        assert!(server.commands.find("warp").is_some());
+        assert_eq!(received.try_recv().unwrap(), Control::RefreshCommands);
+        // The same commands again change nothing.
+        server.apply(Action::SetCommands(vec![warp]));
+        assert!(received.try_recv().is_err());
     }
 
     fn ids(queue: &mut mpsc::Receiver<Bytes>) -> Vec<u32> {
