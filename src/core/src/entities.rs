@@ -454,10 +454,10 @@ mod tests {
 
     fn stone(count: u8) -> ItemStack {
         ItemStack {
-            nbt: None,
             item: items().by_name("minecraft:stone").unwrap().network_id,
             count,
             metadata: 0,
+            nbt: None,
         }
     }
 
@@ -592,10 +592,10 @@ mod tests {
         entities.spawn(
             3,
             ItemStack {
-                nbt: None,
                 item: 32000,
                 count: 1,
                 metadata: 0,
+                nbt: None,
             },
             Vec3::default(),
             Vec3::default(),

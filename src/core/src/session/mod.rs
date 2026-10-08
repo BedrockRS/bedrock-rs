@@ -307,6 +307,9 @@ impl Session {
             (Stage::InGame, id::PLAYER_ACTION) => Ok(self.player_action(packet::decode(payload)?)),
             (Stage::InGame, id::RESPAWN) => Ok(self.respawn(packet::decode(payload)?)),
             (Stage::InGame, id::ANIMATE) => Ok(self.animate(packet::decode(payload)?)),
+            (Stage::InGame, id::BLOCK_PICK_REQUEST) => {
+                Ok(self.pick_block(packet::decode(payload)?))
+            }
             (stage, id::MOB_EQUIPMENT) if stage.in_world() => {
                 Ok(self.equipment(packet::decode(payload)?))
             }

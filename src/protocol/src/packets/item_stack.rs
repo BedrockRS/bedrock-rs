@@ -18,6 +18,8 @@ use crate::packets::inventory::list_len;
 /// values 64 to 66 at the end.
 pub mod container {
     pub const ARMOR: u8 = 6;
+    /// The crafting grid: slots 28 to 31 of the inventory screen's 2x2 grid.
+    pub const CRAFTING_INPUT: u8 = 13;
     pub const COMBINED_HOTBAR_AND_INVENTORY: u8 = 12;
     pub const HOTBAR: u8 = 28;
     pub const INVENTORY: u8 = 29;

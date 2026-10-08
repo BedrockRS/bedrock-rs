@@ -95,6 +95,11 @@ impl Palette {
             .map(|(_, values)| values.as_slice())
     }
 
+    /// The name of every block.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.blocks.keys().map(String::as_str)
+    }
+
     /// Every valid state of every block.
     pub fn all_states(&self) -> impl Iterator<Item = BlockState> + '_ {
         self.blocks.iter().flat_map(|(name, BlockStates(states))| {

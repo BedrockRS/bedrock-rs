@@ -31,6 +31,7 @@ fn joins_once_initialized_then_relays_chat() {
             view,
             inventory,
             held,
+            ..
         },
     ] = &reply.events[..]
     else {

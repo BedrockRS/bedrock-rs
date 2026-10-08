@@ -24,7 +24,9 @@ pub mod id {
     pub const UPDATE_ATTRIBUTES: u32 = 29;
     pub const INVENTORY_TRANSACTION: u32 = 30;
     pub const MOB_EQUIPMENT: u32 = 31;
+    pub const MOB_ARMOR_EQUIPMENT: u32 = 32;
     pub const INTERACT: u32 = 33;
+    pub const BLOCK_PICK_REQUEST: u32 = 34;
     pub const PLAYER_ACTION: u32 = 36;
     pub const SET_ACTOR_DATA: u32 = 39;
     pub const SET_ACTOR_MOTION: u32 = 40;
@@ -32,6 +34,7 @@ pub mod id {
     pub const RESPAWN: u32 = 45;
     pub const CONTAINER_OPEN: u32 = 46;
     pub const CONTAINER_CLOSE: u32 = 47;
+    pub const PLAYER_HOTBAR: u32 = 48;
     pub const INVENTORY_CONTENT: u32 = 49;
     pub const INVENTORY_SLOT: u32 = 50;
     pub const LEVEL_CHUNK: u32 = 58;

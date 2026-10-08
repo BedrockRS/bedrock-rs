@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bedrockrs_protocol::packet::Encode;
 use bedrockrs_protocol::packets::{
     ActorEvent, AddPlayer, Animate, EntityMetadata, INVENTORY_WINDOW, ItemInstance, MetadataValue,
-    MobEquipment, MoveMode, MovePlayer, PlayerList, PlayerListEntry, PlayerSkin, RemoveActor,
-    SetActorData, Skin, TakeItemActor, Text, TextType, UpdatePlayerGameType, entity_flag,
-    metadata_key,
+    MobArmorEquipment, MobEquipment, MoveMode, MovePlayer, PlayerList, PlayerListEntry, PlayerSkin,
+    RemoveActor, SetActorData, Skin, TakeItemActor, Text, TextType, UpdatePlayerGameType,
+    entity_flag, metadata_key,
 };
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 use bytes::Bytes;
@@ -138,6 +138,8 @@ pub struct Joining {
     pub inventory: SavedInventory,
     /// What they hold and in which hotbar slot, which AddPlayer shows others.
     pub held: (ItemInstance, u8),
+    /// What they wear.
+    pub armor: [ItemInstance; 4],
     pub game_mode: GameMode,
     pub health: f32,
     pub outbound: Outbound,
@@ -158,6 +160,8 @@ struct Online {
     seen_items: HashSet<u64>,
     /// What the player holds, and in which hotbar slot, for others to see.
     held: (ItemInstance, u8),
+    /// What the player wears, for others to see.
+    armor: [ItemInstance; 4],
     /// The player's inventory as last changed, for saving.
     inventory: SavedInventory,
     game_mode: GameMode,
@@ -256,6 +260,7 @@ impl Players {
             view,
             inventory,
             held,
+            armor,
             game_mode,
             health,
             outbound,
@@ -270,6 +275,7 @@ impl Players {
             seen: HashSet::new(),
             seen_items: HashSet::new(),
             held,
+            armor,
             inventory,
             game_mode,
             health,
@@ -370,6 +376,9 @@ impl Players {
             }));
             if !target.held.0.is_empty() {
                 viewer.send(encode(&held_item(target_id, target)));
+            }
+            if target.armor.iter().any(|piece| !piece.is_empty()) {
+                viewer.send(encode(&worn_armor(target_id, target)));
             }
         }
 
@@ -600,6 +609,21 @@ impl Membership<'_> {
         }
     }
 
+    /// Shows everyone who sees the player what they now wear.
+    pub fn armor(&self, armor: [ItemInstance; 4]) {
+        let mut online = self.players.online();
+        let Some(player) = online.get_mut(&self.entity_id) else {
+            return;
+        };
+        player.armor = armor;
+        let packet = encode(&worn_armor(self.entity_id, player));
+        for other in online.values() {
+            if other.seen.contains(&self.entity_id) {
+                other.send(packet.clone());
+            }
+        }
+    }
+
     /// Records the player's game mode, for saving, and tells everyone else.
     /// Spectators disappear from view on the next tick.
     pub fn game_mode(&self, mode: GameMode) {
@@ -791,6 +815,14 @@ fn add_player(entity_id: u64, player: &Online) -> AddPlayer {
     }
 }
 
+fn worn_armor(entity_id: u64, player: &Online) -> MobArmorEquipment {
+    MobArmorEquipment {
+        entity_runtime_id: entity_id,
+        armor: player.armor,
+        body: ItemInstance::EMPTY,
+    }
+}
+
 fn held_item(entity_id: u64, player: &Online) -> MobEquipment {
     let (item, slot) = player.held;
     MobEquipment {
@@ -845,6 +877,7 @@ mod tests {
             view: view_at(0, 0),
             inventory: SavedInventory::default(),
             held: (ItemInstance::EMPTY, 0),
+            armor: [ItemInstance::EMPTY; 4],
             game_mode: GameMode::Creative,
             health: 20.0,
             outbound,

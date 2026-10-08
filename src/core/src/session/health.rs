@@ -108,6 +108,7 @@ impl Session {
             .encode(),
         ];
         let mut events = vec![SessionEvent::HealthChanged(0.0)];
+        let armor_before = self.inventory.armor();
         let drops = if self.rules.keepinventory {
             Vec::new()
         } else {
@@ -117,6 +118,7 @@ impl Session {
             packets.extend(self.inventory_sync());
             events.push(SessionEvent::InventoryChanged(self.inventory.saved()));
             events.extend(self.held_event());
+            events.extend(self.armor_events(armor_before));
         }
         events.push(SessionEvent::Died {
             cause,

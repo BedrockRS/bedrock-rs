@@ -1,3 +1,7 @@
+use bedrockrs_protocol::packets::{
+    FullContainerName, LegacyRequest, StackAction, StackRequest, StackSlot, container,
+};
+
 use super::*;
 
 #[test]
@@ -71,7 +75,7 @@ fn q_on_the_hud_throws_the_held_item() {
     let mut session = in_game_session();
     let stone = *session.inventory().hotbar(0).unwrap();
     let throw = |count: u16, slot: u32| {
-        InventoryTransaction::Normal(vec![
+        InventoryTransaction::from(TransactionData::Normal(vec![
             InventoryAction {
                 source: action_source::WORLD,
                 window_id: None,
@@ -94,7 +98,7 @@ fn q_on_the_hud_throws_the_held_item() {
                     ..stone.instance()
                 },
             },
-        ])
+        ]))
         .encode()
     };
     let reply = session.handle(&throw(1, 0)).unwrap();
@@ -151,6 +155,11 @@ fn the_inventory_screen_opens_when_asked_and_closes_confirmed() {
             id::INVENTORY_CONTENT,
             id::INVENTORY_CONTENT,
             id::INVENTORY_CONTENT,
+            // The cursor and the four slots of the crafting grid.
+            id::INVENTORY_SLOT,
+            id::INVENTORY_SLOT,
+            id::INVENTORY_SLOT,
+            id::INVENTORY_SLOT,
             id::INVENTORY_SLOT
         ]
     );
@@ -201,6 +210,11 @@ fn item_stack_requests_are_answered_and_saved() {
             id::INVENTORY_CONTENT,
             id::INVENTORY_CONTENT,
             id::INVENTORY_CONTENT,
+            // The cursor and the four slots of the crafting grid.
+            id::INVENTORY_SLOT,
+            id::INVENTORY_SLOT,
+            id::INVENTORY_SLOT,
+            id::INVENTORY_SLOT,
             id::INVENTORY_SLOT
         ]
     );
@@ -265,4 +279,87 @@ fn drops_leave_the_inventory_and_pickups_come_back() {
     assert_eq!(session.inventory().hotbar(0).unwrap().count, 64);
     assert_eq!(items.count(), 0);
     assert!(session.pick_up(&items).events.is_empty());
+}
+
+/// Using the held item in the air, as a client putting on armour does: it
+/// moves the item itself and names the two slots it changed.
+fn use_in_air(session: &Session) -> Vec<u8> {
+    let slot = i32::from(session.held_slot);
+    let data = TransactionData::UseItem(UseItem {
+        action: use_item_action::CLICK_AIR,
+        trigger: 1,
+        block_position: BlockPos::default(),
+        face: 255,
+        hotbar_slot: slot,
+        held_item: session.inventory().hotbar(slot).unwrap().instance(),
+        player_position: Vec3::default(),
+        clicked_position: Vec3::default(),
+        block_runtime_id: 0,
+        client_prediction: 1,
+    });
+    InventoryTransaction {
+        legacy_request: Some(LegacyRequest {
+            id: -5,
+            slots: vec![
+                (container::ARMOR, vec![1]),
+                (container::INVENTORY, vec![slot as u8]),
+            ],
+        }),
+        data,
+    }
+    .encode()
+}
+
+#[test]
+fn using_armour_puts_it_on_with_its_sound() {
+    let mut session = in_game_session();
+    session.inventory = Inventory::with_hotbar(&["minecraft:iron_chestplate"]);
+    let reply = session.handle(&use_in_air(&session)).unwrap();
+    assert!(session.inventory().hotbar(0).is_none(), "it left the hand");
+    let worn = session.inventory().armor();
+    let chestplate = items().by_name("minecraft:iron_chestplate").unwrap();
+    assert_eq!(worn[1].network_id, chestplate.network_id);
+    assert!(reply.events.contains(&SessionEvent::ArmorChanged(worn)));
+    assert!(
+        reply
+            .events
+            .contains(&SessionEvent::Equipped("armor.equip_iron"))
+    );
+    // The client hears what the slots it changed hold, before anything else.
+    assert_eq!(ids(&reply)[0], id::ITEM_STACK_RESPONSE);
+    assert!(ids(&reply).contains(&id::INVENTORY_CONTENT));
+
+    // So it can take the chestplate off again, naming it, as it names what
+    // any request left behind, by the request's ID.
+    let take_off = ItemStackRequest {
+        requests: vec![StackRequest {
+            id: -7,
+            actions: vec![StackAction::Take {
+                count: 1,
+                source: StackSlot {
+                    container: FullContainerName::new(container::ARMOR),
+                    slot: 1,
+                    stack_id: -5,
+                },
+                destination: StackSlot {
+                    container: FullContainerName::new(container::CURSOR),
+                    slot: 0,
+                    stack_id: 0,
+                },
+            }],
+            filter_strings: Vec::new(),
+            filter_cause: 0,
+        }],
+    };
+    let reply = session.handle(&take_off.encode()).unwrap();
+    assert_eq!(ids(&reply), [id::ITEM_STACK_RESPONSE], "not rejected");
+    assert!(session.inventory().armor()[1].is_empty(), "taken off");
+
+    // Using something else in the air changes nothing, but the client still
+    // hears about the slots it named.
+    session.inventory = Inventory::with_hotbar(&TEST_KIT);
+    assert_eq!(
+        ids(&session.handle(&use_in_air(&session)).unwrap()),
+        [id::ITEM_STACK_RESPONSE]
+    );
 }

@@ -1,6 +1,7 @@
 //! A player's inventory: 36 slots (the hotbar is slots 0 to 8), four armour
-//! slots, the offhand and the cursor, which holds what the player is moving
-//! in the inventory screen.
+//! slots, the offhand, and in the inventory screen the cursor, which holds
+//! what the player is moving, and the 2x2 crafting grid. Nothing is crafted
+//! yet; items only sit in the grid.
 //!
 //! The server owns the inventory. The client moves items on its side and
 //! asks the server to confirm with item stack requests; each request is
@@ -15,15 +16,15 @@ use std::collections::VecDeque;
 
 use bedrockrs_protocol::packets::{
     ContainerResponse, FullContainerName, INVENTORY_WINDOW, InventoryContent, InventorySlot,
-    ItemInstance, SlotResponse, StackAction, StackRequest, StackResponse, StackSlot, UI_WINDOW,
-    container,
+    ItemInstance, LegacyRequest, SlotResponse, StackAction, StackRequest, StackResponse, StackSlot,
+    UI_WINDOW, container,
 };
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::entities::ItemStack;
-use crate::items::{ItemNbt, SHIELD, intern_nbt, items};
+use crate::items::{ItemNbt, SHIELD, armor_slot, intern_nbt, items};
 use crate::storage::{SavedInventory, SavedStack};
 
 /// Slots of the main inventory, hotbar first.
@@ -36,6 +37,10 @@ const OFFHAND_WINDOW: u32 = 119;
 const ARMOR_WINDOW: u32 = 120;
 /// The slot of the created output container that creative items appear in.
 const CREATED_OUTPUT_SLOT: u8 = 50;
+/// The inventory screen's crafting grid: 2x2, from this slot of the UI window
+/// (a crafting table's 3x3 grid starts at 32).
+const CRAFTING_GRID_SLOTS: usize = 4;
+const CRAFTING_GRID_OFFSET: u8 = 28;
 /// Requests whose resulting stack IDs are remembered for the client to refer
 /// back to. The client rarely has more than a few in flight.
 const RECENT_REQUESTS: usize = 64;
@@ -109,6 +114,7 @@ enum Place {
     Armor(usize),
     Offhand,
     Cursor,
+    Crafting(usize),
     CreatedOutput,
 }
 
@@ -134,6 +140,8 @@ pub enum RequestError {
     UnknownCreativeItem(u32),
     #[error("only creative players can do that")]
     NotCreative,
+    #[error("item {item} is not worn in armour slot {slot}")]
+    NotWornThere { item: i16, slot: usize },
     #[error("unsupported action: {0}")]
     Unsupported(&'static str),
 }
@@ -145,6 +153,7 @@ pub struct Inventory {
     armor: [Option<Stack>; ARMOR_SLOTS],
     offhand: Option<Stack>,
     cursor: Option<Stack>,
+    crafting: [Option<Stack>; CRAFTING_GRID_SLOTS],
     /// What a creative pick put in the created output, for the rest of the request.
     created: Option<Stack>,
     last_stack_id: i32,
@@ -163,6 +172,7 @@ impl Default for Inventory {
             armor: [None; ARMOR_SLOTS],
             offhand: None,
             cursor: None,
+            crafting: [None; CRAFTING_GRID_SLOTS],
             created: None,
             last_stack_id: 0,
             changes: Vec::new(),
@@ -191,18 +201,27 @@ impl Inventory {
         self.cursor = stack;
     }
 
-    /// Puts what is on the cursor back into the first free slot, as the
-    /// inventory screen closes, or throws it out if there is none. Returns
-    /// whether anything moved.
-    pub fn return_cursor(&mut self) -> bool {
-        let Some(cursor) = self.cursor.take() else {
-            return false;
-        };
-        match self.main.iter_mut().find(|slot| slot.is_none()) {
-            Some(free) => *free = Some(cursor),
-            None => self.dropped.push(cursor.stack()),
+    /// Puts what is on the cursor and in the crafting grid back into the
+    /// inventory, as the inventory screen closes: onto stacks of the same
+    /// item, then into free slots, and what does not fit is thrown out.
+    /// Returns whether anything moved.
+    pub fn return_screen_items(&mut self) -> bool {
+        let loose: Vec<Stack> = self
+            .cursor
+            .take()
+            .into_iter()
+            .chain(self.crafting.iter_mut().filter_map(Option::take))
+            .collect();
+        for stack in &loose {
+            let added = self.add(stack.stack());
+            if added < stack.count {
+                self.dropped.push(ItemStack {
+                    count: stack.count - added,
+                    ..stack.stack()
+                });
+            }
         }
-        true
+        !loose.is_empty()
     }
 
     /// Throws `count` of the item in main slot `slot` out, as pressing Q on
@@ -222,6 +241,132 @@ impl Inventory {
             self.main[slot] = None;
         }
         Some(thrown)
+    }
+
+    /// The answer to a transaction's legacy request: what the slots the
+    /// client changed on its own now hold, as an accepted request.
+    ///
+    /// As after any request, the client goes on naming those stacks by the
+    /// request's ID, so the stack IDs they hold are remembered under it
+    /// (found live: a helmet put on by using it could not be clicked,
+    /// dropped or moved until the player rejoined).
+    pub fn legacy_response(&mut self, request: &LegacyRequest) -> StackResponse {
+        let touched: Vec<(FullContainerName, u8)> = request
+            .slots
+            .iter()
+            .flat_map(|(container, slots)| {
+                slots
+                    .iter()
+                    .map(|&slot| (FullContainerName::new(*container), slot))
+            })
+            .collect();
+        let changes = touched
+            .iter()
+            .filter_map(|&(container, slot)| {
+                let place = resolve(&StackSlot {
+                    container,
+                    slot,
+                    stack_id: 0,
+                })
+                .ok()?;
+                Some((place, self.slot(place).map_or(0, |stack| stack.id)))
+            })
+            .collect();
+        self.remember(request.id, changes);
+        StackResponse {
+            status: StackResponse::OK,
+            request_id: request.id,
+            containers: self.describe(&touched),
+        }
+    }
+
+    /// What the player wears, for others to see: helmet, chestplate,
+    /// leggings and boots.
+    pub fn armor(&self) -> [ItemInstance; ARMOR_SLOTS] {
+        self.armor
+            .map(|slot| slot.map_or(ItemInstance::EMPTY, |stack| stack.instance()))
+    }
+
+    /// Puts on the armour held in hotbar slot `held`, as using it does,
+    /// swapping it with what was worn there. Returns the armour slot, or
+    /// `None` if what is held is not worn.
+    pub fn equip_held(&mut self, held: usize) -> Option<usize> {
+        let stack = (*self.main.get(held)?)?;
+        let slot = armor_slot(&items().get(stack.item)?.name)?;
+        std::mem::swap(&mut self.main[held], &mut self.armor[slot]);
+        Some(slot)
+    }
+
+    /// Rejects armour slots holding what is not worn there.
+    fn check_armor(&self) -> Result<(), RequestError> {
+        for (slot, stack) in self.armor.iter().enumerate() {
+            let Some(stack) = stack else { continue };
+            let worn = items()
+                .get(stack.item)
+                .and_then(|item| armor_slot(&item.name));
+            if worn != Some(slot) {
+                return Err(RequestError::NotWornThere {
+                    item: stack.item,
+                    slot,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Brings the item a picked block gives into the hotbar, as vanilla's
+    /// pick block does, with `held` the hotbar slot held. Returns the hotbar
+    /// slot to hold afterwards and whether the inventory changed, or `None`
+    /// if nothing changes.
+    ///
+    /// - Already on the hotbar: that slot is held.
+    /// - Elsewhere in the inventory: it swaps with the held slot.
+    /// - Otherwise, only for creative players: one of it goes in the first
+    ///   empty hotbar slot, which is held; with the hotbar full, what is held
+    ///   moves to the first empty slot and the item takes its place; with no
+    ///   room at all, it replaces what is held.
+    pub fn pick(
+        &mut self,
+        picked: ItemStack,
+        held: usize,
+        creative: bool,
+    ) -> Option<(usize, bool)> {
+        if held >= HOTBAR_SLOTS {
+            return None;
+        }
+        let same = |slot: &Option<Stack>| {
+            slot.is_some_and(|stack| {
+                stack.item == picked.item
+                    && stack.metadata == picked.metadata
+                    && stack.nbt == picked.nbt
+            })
+        };
+        if let Some(slot) = self.main.iter().position(same) {
+            if slot >= HOTBAR_SLOTS {
+                self.main.swap(slot, held);
+                return Some((held, true));
+            }
+            return Some((slot, false));
+        }
+        if !creative {
+            return None;
+        }
+        let stack = self.new_stack(picked.item, 1, picked.metadata, picked.nbt);
+        match self.main.iter().position(Option::is_none) {
+            Some(empty) if empty < HOTBAR_SLOTS => {
+                self.main[empty] = Some(stack);
+                Some((empty, true))
+            }
+            Some(empty) => {
+                self.main.swap(empty, held);
+                self.main[held] = Some(stack);
+                Some((held, true))
+            }
+            None => {
+                self.main[held] = Some(stack);
+                Some((held, true))
+            }
+        }
     }
 
     /// The items thrown out since the last call, for the world to take.
@@ -314,14 +459,15 @@ impl Inventory {
         inventory
     }
 
-    /// The inventory to save. What is on the cursor goes back into the
-    /// inventory if there is room, as the client does when the screen closes.
+    /// The inventory to save. What is on the cursor and in the crafting grid
+    /// goes back into the inventory if there is room, as when the screen
+    /// closes.
     pub fn saved(&self) -> SavedInventory {
         let mut main = self.main;
-        if let Some(cursor) = self.cursor
-            && let Some(free) = main.iter_mut().find(|slot| slot.is_none())
-        {
-            *free = Some(cursor);
+        for loose in self.cursor.iter().chain(self.crafting.iter().flatten()) {
+            if let Some(free) = main.iter_mut().find(|slot| slot.is_none()) {
+                *free = Some(*loose);
+            }
         }
         let save = |slots: &[Option<Stack>]| {
             slots
@@ -371,15 +517,22 @@ impl Inventory {
         ]
     }
 
-    /// Where the cursor's content goes: slot 0 of the UI window.
-    pub fn cursor_slot(&self) -> InventorySlot {
-        InventorySlot {
+    /// The packets that show the client what the inventory screen holds:
+    /// the cursor (slot 0 of the UI window) and the crafting grid.
+    pub fn screen_slots(&self) -> Vec<InventorySlot> {
+        let slot = |slot, stack: Option<Stack>| InventorySlot {
             window_id: UI_WINDOW,
-            slot: 0,
-            item: self
-                .cursor
-                .map_or(ItemInstance::EMPTY, |stack| stack.instance()),
-        }
+            slot,
+            item: stack.map_or(ItemInstance::EMPTY, |stack| stack.instance()),
+        };
+        std::iter::once(slot(0, self.cursor))
+            .chain(
+                self.crafting
+                    .iter()
+                    .zip(u32::from(CRAFTING_GRID_OFFSET)..)
+                    .map(|(stack, index)| slot(index, *stack)),
+            )
+            .collect()
     }
 
     /// The stack in a hotbar slot.
@@ -429,17 +582,15 @@ impl Inventory {
         let result = request
             .actions
             .iter()
-            .try_for_each(|action| working.apply(action, request.id, creative, &mut touched));
+            .try_for_each(|action| working.apply(action, request.id, creative, &mut touched))
+            .and_then(|()| working.check_armor());
         // Whatever a creative pick left over is gone once the request ends.
         working.created = None;
         match result {
             Ok(()) => {
                 *self = working;
                 let changes = std::mem::take(&mut self.changes);
-                self.recent.push_back((request.id, changes));
-                if self.recent.len() > RECENT_REQUESTS {
-                    self.recent.pop_front();
-                }
+                self.remember(request.id, changes);
                 StackResponse {
                     status: StackResponse::OK,
                     request_id: request.id,
@@ -611,6 +762,15 @@ impl Inventory {
         Ok(())
     }
 
+    /// Remembers the stack IDs a request left in the slots it changed, for
+    /// later requests that name them by its ID.
+    fn remember(&mut self, request: i32, changes: Vec<(Place, i32)>) {
+        self.recent.push_back((request, changes));
+        if self.recent.len() > RECENT_REQUESTS {
+            self.recent.pop_front();
+        }
+    }
+
     /// Remembers the stack ID a changed slot now holds, for later actions and
     /// requests that refer to it by request ID.
     fn note(&mut self, place: Place) {
@@ -673,6 +833,7 @@ impl Inventory {
             Place::Armor(slot) => &mut self.armor[slot],
             Place::Offhand => &mut self.offhand,
             Place::Cursor => &mut self.cursor,
+            Place::Crafting(slot) => &mut self.crafting[slot],
             Place::CreatedOutput => &mut self.created,
         }
     }
@@ -743,6 +904,14 @@ fn resolve(slot: &StackSlot) -> Result<Place, RequestError> {
         // The offhand is slot 1 on the wire; accept 0 too.
         container::OFFHAND if index <= 1 => Some(Place::Offhand),
         container::CURSOR if index == 0 => Some(Place::Cursor),
+        container::CRAFTING_INPUT
+            if (CRAFTING_GRID_OFFSET..CRAFTING_GRID_OFFSET + CRAFTING_GRID_SLOTS as u8)
+                .contains(&slot.slot) =>
+        {
+            Some(Place::Crafting(usize::from(
+                slot.slot - CRAFTING_GRID_OFFSET,
+            )))
+        }
         container::CREATED_OUTPUT if slot.slot == CREATED_OUTPUT_SLOT => Some(Place::CreatedOutput),
         _ => None,
     };
@@ -1259,10 +1428,10 @@ mod tests {
         let mut inventory = Inventory::default();
         let stone = items().by_name("minecraft:stone").unwrap().network_id;
         let pick = |count| ItemStack {
-            nbt: None,
             item: stone,
             count,
             metadata: 0,
+            nbt: None,
         };
         assert_eq!(inventory.add(pick(40)), 40);
         assert_eq!(inventory.add(pick(40)), 40);
@@ -1274,10 +1443,10 @@ mod tests {
             .unwrap()
             .network_id;
         let swords = ItemStack {
-            nbt: None,
             item: sword,
             count: 3,
             metadata: 0,
+            nbt: None,
         };
         assert_eq!(inventory.add(swords), 3);
         assert_eq!(inventory.main[4].unwrap().item, sword);
@@ -1285,18 +1454,18 @@ mod tests {
         // A full inventory takes what fits and no more.
         for slot in inventory.main.iter_mut() {
             *slot = Some(Stack {
-                nbt: None,
                 item: sword,
                 count: 1,
                 metadata: 0,
+                nbt: None,
                 id: 99,
             });
         }
         inventory.main[35] = Some(Stack {
-            nbt: None,
             item: stone,
             count: 60,
             metadata: 0,
+            nbt: None,
             id: 100,
         });
         assert_eq!(inventory.add(pick(10)), 4);
@@ -1311,41 +1480,196 @@ mod tests {
             .network_id;
         for slot in inventory.main.iter_mut().filter(|slot| slot.is_none()) {
             *slot = Some(Stack {
-                nbt: None,
                 item: sword,
                 count: 1,
                 metadata: 0,
+                nbt: None,
                 id: 99,
             });
         }
         let held = ItemStack {
-            nbt: None,
             item: sword,
             count: 1,
             metadata: 0,
+            nbt: None,
         };
         inventory.cursor = Some(Stack {
-            nbt: None,
             item: sword,
             count: 1,
             metadata: 0,
+            nbt: None,
             id: 100,
         });
-        assert!(inventory.return_cursor());
+        assert!(inventory.return_screen_items());
         assert_eq!(inventory.cursor, None);
         assert_eq!(inventory.take_dropped(), [held]);
+    }
+
+    #[test]
+    fn armour_only_goes_where_it_is_worn() {
+        let mut inventory = Inventory::with_hotbar(&[
+            "minecraft:diamond_helmet",
+            "minecraft:diamond_boots",
+            "minecraft:stone",
+        ]);
+        let [helmet, boots, stone] = [0, 1, 2].map(|slot| inventory.main[slot].unwrap());
+        // Moves all of hotbar slot `from` onto armour slot `to`.
+        let mut wear = |id, from: u8, stack: Stack, to| {
+            inventory.handle(
+                &request(
+                    id,
+                    vec![StackAction::Place {
+                        count: stack.count,
+                        source: at(container::HOTBAR, from, stack.id),
+                        destination: at(container::ARMOR, to, 0),
+                    }],
+                ),
+                false,
+            )
+        };
+        assert_eq!(
+            wear(-1, 2, stone, 0),
+            StackResponse::rejected(-1),
+            "stone is not worn"
+        );
+        assert_eq!(
+            wear(-2, 1, boots, 0),
+            StackResponse::rejected(-2),
+            "boots go on the feet"
+        );
+        assert_eq!(wear(-3, 1, boots, 3).status, StackResponse::OK);
+        assert_eq!(wear(-4, 0, helmet, 0).status, StackResponse::OK);
+        assert_eq!(inventory.armor()[0].network_id, helmet.item);
+
+        // Using a held helmet swaps it with the one worn.
+        let mut inventory = Inventory::with_hotbar(&["minecraft:iron_helmet", "minecraft:stone"]);
+        let iron = inventory.main[0].unwrap();
+        inventory.armor[0] = Some(helmet);
+        assert_eq!(inventory.equip_held(0), Some(0));
+        assert_eq!(inventory.main[0], Some(helmet));
+        assert_eq!(inventory.equip_held(1), None, "stone is not worn");
+
+        // The client, which made the swap itself, hears what both slots hold.
+        let response = inventory.legacy_response(&LegacyRequest {
+            id: -9,
+            slots: vec![(container::ARMOR, vec![0]), (container::INVENTORY, vec![0])],
+        });
+        assert_eq!(response.status, StackResponse::OK);
+        assert_eq!(response.request_id, -9);
+        assert_eq!(
+            slots(&response),
+            [
+                (container::ARMOR, 0, 1, iron.id),
+                (container::INVENTORY, 0, 1, helmet.id)
+            ]
+        );
+    }
+
+    #[test]
+    fn picking_brings_items_into_the_hotbar() {
+        let one = |name: &str| ItemStack {
+            item: items().by_name(name).unwrap().network_id,
+            count: 1,
+            metadata: 0,
+            nbt: None,
+        };
+        let mut inventory = Inventory::with_hotbar(&TEST_KIT);
+        // On the hotbar: held, nothing moves.
+        assert_eq!(
+            inventory.pick(one("minecraft:dirt"), 0, false),
+            Some((2, false))
+        );
+        // Elsewhere: swapped with the held slot.
+        let log = inventory.new_stack(one("minecraft:oak_log").item, 5, 0, None);
+        inventory.main[20] = Some(log);
+        assert_eq!(
+            inventory.pick(one("minecraft:oak_log"), 4, false),
+            Some((4, true))
+        );
+        assert_eq!(inventory.main[4], Some(log));
+        assert_eq!(
+            inventory.main[20].unwrap().item,
+            one("minecraft:oak_planks").item
+        );
+        // Not carried: survival players get nothing, creative ones get one.
+        let tnt = one("minecraft:tnt");
+        assert_eq!(inventory.pick(tnt, 0, false), None);
+        assert_eq!(inventory.pick(tnt, 0, true), Some((0, true)));
+        assert_eq!(inventory.main[0].unwrap().stack(), tnt);
+        assert_eq!(inventory.main[9].unwrap().item, one("minecraft:stone").item);
+        // With no room anywhere, it replaces what is held.
+        for slot in inventory.main.iter_mut().filter(|slot| slot.is_none()) {
+            *slot = Some(log);
+        }
+        let glowstone = one("minecraft:glowstone");
+        assert_eq!(inventory.pick(glowstone, 3, true), Some((3, true)));
+        assert_eq!(inventory.main[3].unwrap().stack(), glowstone);
+    }
+
+    #[test]
+    fn the_crafting_grid_holds_items_until_the_screen_closes() {
+        let mut inventory = Inventory::with_hotbar(&TEST_KIT);
+        let stone = inventory.main[0].unwrap();
+        let response = inventory.handle(
+            &request(
+                -1,
+                vec![StackAction::Place {
+                    count: 10,
+                    source: at(container::HOTBAR, 0, stone.id),
+                    destination: at(container::CRAFTING_INPUT, CRAFTING_GRID_OFFSET + 3, 0),
+                }],
+            ),
+            false,
+        );
+        assert_eq!(response.status, StackResponse::OK);
+        let placed = inventory.crafting[3].unwrap();
+        assert_eq!(
+            slots(&response),
+            [
+                (container::HOTBAR, 0, 54, stone.id),
+                (container::CRAFTING_INPUT, 31, 10, placed.id)
+            ]
+        );
+        assert_eq!(inventory.screen_slots()[4].slot, 31);
+        assert_eq!(inventory.screen_slots()[4].item.count, 10);
+        // Past the 2x2 grid there is nothing.
+        let past = inventory.handle(
+            &request(
+                -2,
+                vec![StackAction::Place {
+                    count: 1,
+                    source: at(container::HOTBAR, 0, stone.id),
+                    destination: at(container::CRAFTING_INPUT, CRAFTING_GRID_OFFSET + 4, 0),
+                }],
+            ),
+            false,
+        );
+        assert_eq!(past, StackResponse::rejected(-2));
+
+        // Saved as if back in the inventory, and put back there on closing.
+        let saved: u32 = inventory
+            .saved()
+            .main
+            .iter()
+            .map(|stack| u32::from(stack.count))
+            .sum();
+        assert_eq!(saved, 64 * 9);
+        assert!(inventory.return_screen_items());
+        assert_eq!(inventory.crafting, [None; CRAFTING_GRID_SLOTS]);
+        assert_eq!(inventory.main[0].unwrap().count, 64, "back onto its stack");
+        assert!(inventory.take_dropped().is_empty());
     }
 
     #[test]
     fn the_cursor_goes_back_into_the_inventory() {
         let mut inventory = Inventory::with_hotbar(&TEST_KIT);
         inventory.cursor = inventory.main[0].take();
-        assert_eq!(inventory.cursor_slot().item.count, 64);
-        assert!(inventory.return_cursor());
+        assert_eq!(inventory.screen_slots()[0].item.count, 64);
+        assert!(inventory.return_screen_items());
         assert_eq!(inventory.cursor, None);
         assert_eq!(inventory.main[0].unwrap().count, 64, "the first free slot");
-        assert!(inventory.cursor_slot().item.is_empty());
-        assert!(!inventory.return_cursor());
+        assert!(inventory.screen_slots()[0].item.is_empty());
+        assert!(!inventory.return_screen_items());
         assert!(inventory.take_dropped().is_empty());
     }
 
@@ -1371,25 +1695,25 @@ mod tests {
         let odd = SavedInventory {
             main: vec![
                 SavedStack {
-                    nbt: None,
                     slot: 99,
                     item: "minecraft:stone".into(),
                     count: 1,
                     meta: 0,
+                    nbt: None,
                 },
                 SavedStack {
-                    nbt: None,
                     slot: 3,
                     item: "minecraft:no_such_item".into(),
                     count: 1,
                     meta: 0,
+                    nbt: None,
                 },
                 SavedStack {
-                    nbt: None,
                     slot: 4,
                     item: "minecraft:diamond_sword".into(),
                     count: 5,
                     meta: 0,
+                    nbt: None,
                 },
             ],
             armor: Vec::new(),

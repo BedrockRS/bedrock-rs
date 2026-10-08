@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
     console.close();
     // Players are shown why they were disconnected, rather than timing out,
     // and saved as they leave.
-    server.logins.close_all();
+    server.close();
     let ended = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while sessions.join_next().await.is_some() {}
     })

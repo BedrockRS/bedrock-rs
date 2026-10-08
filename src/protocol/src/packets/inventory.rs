@@ -322,14 +322,45 @@ impl InventoryAction {
     }
 }
 
-/// An inventory transaction. Normal and item-use transactions are decoded;
-/// others keep just their type.
+/// An inventory transaction.
 #[derive(Debug, Clone, PartialEq)]
-pub enum InventoryTransaction {
+pub struct InventoryTransaction {
+    /// Set when the client already changed slots itself, predicting what
+    /// the transaction does (armour put on by using it, an item thrown from
+    /// the HUD). Those slots stay locked on the client until the server
+    /// answers with an ItemStackResponse for this request, listing what the
+    /// slots hold.
+    pub legacy_request: Option<LegacyRequest>,
+    pub data: TransactionData,
+}
+
+/// What an inventory transaction does. Normal and item-use transactions are
+/// decoded; others keep just their type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransactionData {
     /// Items moved by actions alone, such as throwing the held item.
     Normal(Vec<InventoryAction>),
     UseItem(UseItem),
     Other(u32),
+}
+
+impl From<TransactionData> for InventoryTransaction {
+    fn from(data: TransactionData) -> Self {
+        Self {
+            legacy_request: None,
+            data,
+        }
+    }
+}
+
+/// See [`InventoryTransaction::legacy_request`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRequest {
+    /// Negative, like the IDs of item stack requests.
+    pub id: i32,
+    /// The slots the client changed: a container ID, as item stack requests
+    /// number containers, and slots in it.
+    pub slots: Vec<(u8, Vec<u8>)>,
 }
 
 impl Packet for InventoryTransaction {
@@ -339,48 +370,66 @@ impl Packet for InventoryTransaction {
 impl Decode for InventoryTransaction {
     fn decode_payload(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         // Legacy request ID, then optional legacy slots: container ID and slot bytes.
-        reader.var_i32()?;
+        let id = reader.var_i32()?;
+        let mut slots = Vec::new();
         if reader.bool()? {
             for _ in 0..list_len(reader, "legacy slot count")? {
-                reader.u8()?;
-                reader.byte_array()?;
+                slots.push((reader.u8()?, reader.byte_array()?.to_vec()));
             }
         }
+        let legacy_request = (id != 0).then_some(LegacyRequest { id, slots });
         let kind = reader.var_u32()?;
         let actions = (0..list_len(reader, "inventory action count")?)
             .map(|_| InventoryAction::read(reader))
             .collect::<Result<Vec<_>, _>>()?;
-        match kind {
-            NORMAL_TRANSACTION => Ok(Self::Normal(actions)),
-            USE_ITEM_TRANSACTION => Ok(Self::UseItem(UseItem::read(reader)?)),
+        let data = match kind {
+            NORMAL_TRANSACTION => TransactionData::Normal(actions),
+            USE_ITEM_TRANSACTION => TransactionData::UseItem(UseItem::read(reader)?),
             _ => {
                 reader.take(reader.remaining())?;
-                Ok(Self::Other(kind))
+                TransactionData::Other(kind)
             }
-        }
+        };
+        Ok(Self {
+            legacy_request,
+            data,
+        })
     }
 }
 
 impl Encode for InventoryTransaction {
-    /// Writes a transaction as a client would, without legacy slots. Item use
-    /// has no inventory actions; other kinds are written without their data.
+    /// Writes a transaction as a client would. Item use has no inventory
+    /// actions; other kinds are written without their data.
     fn encode_payload(&self, writer: &mut Writer) {
-        writer.var_i32(0);
-        writer.bool(false);
-        match self {
-            Self::Normal(actions) => {
+        match &self.legacy_request {
+            Some(request) => {
+                writer.var_i32(request.id);
+                writer.bool(true);
+                writer.var_u32(u32::try_from(request.slots.len()).expect("a few slots"));
+                for (container, slots) in &request.slots {
+                    writer.u8(*container);
+                    writer.byte_array(slots);
+                }
+            }
+            None => {
+                writer.var_i32(0);
+                writer.bool(false);
+            }
+        }
+        match &self.data {
+            TransactionData::Normal(actions) => {
                 writer.var_u32(NORMAL_TRANSACTION);
                 writer.var_u32(u32::try_from(actions.len()).expect("a few actions"));
                 for action in actions {
                     action.write(writer);
                 }
             }
-            Self::UseItem(use_item) => {
+            TransactionData::UseItem(use_item) => {
                 writer.var_u32(USE_ITEM_TRANSACTION);
                 writer.var_u32(0);
                 use_item.write(writer);
             }
-            Self::Other(kind) => {
+            TransactionData::Other(kind) => {
                 writer.var_u32(*kind);
                 writer.var_u32(0);
             }
@@ -423,6 +472,85 @@ impl Encode for MobEquipment {
         writer.u8(self.inventory_slot);
         writer.u8(self.hotbar_slot);
         writer.u8(self.window_id);
+    }
+}
+
+/// What an entity wears, for others to see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MobArmorEquipment {
+    pub entity_runtime_id: u64,
+    /// Helmet, chestplate, leggings and boots.
+    pub armor: [ItemInstance; 4],
+    /// Worn on the body, as horses and wolves wear armour; empty for players.
+    pub body: ItemInstance,
+}
+
+impl Packet for MobArmorEquipment {
+    const ID: u32 = id::MOB_ARMOR_EQUIPMENT;
+}
+
+impl Encode for MobArmorEquipment {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_u64(self.entity_runtime_id);
+        for piece in &self.armor {
+            piece.write(writer);
+        }
+        self.body.write(writer);
+    }
+}
+
+/// The player picked a block (middle click): its item should go in their
+/// hotbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockPickRequest {
+    pub position: BlockPos,
+    /// Ctrl was held: the item should carry the block's data (a chest's
+    /// contents and the like), so it places the same block.
+    pub add_block_nbt: bool,
+    /// The hotbar slot held when picking.
+    pub hotbar_slot: u8,
+}
+
+impl Packet for BlockPickRequest {
+    const ID: u32 = id::BLOCK_PICK_REQUEST;
+}
+
+impl Decode for BlockPickRequest {
+    fn decode_payload(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            position: BlockPos::read(reader)?,
+            add_block_nbt: reader.bool()?,
+            hotbar_slot: reader.u8()?,
+        })
+    }
+}
+
+impl Encode for BlockPickRequest {
+    fn encode_payload(&self, writer: &mut Writer) {
+        self.position.write(writer);
+        writer.bool(self.add_block_nbt);
+        writer.u8(self.hotbar_slot);
+    }
+}
+
+/// Changes which hotbar slot the client holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerHotBar {
+    pub selected_slot: u32,
+    pub window_id: u8,
+    /// Whether the client should switch to `selected_slot`.
+    pub select_slot: bool,
+}
+
+impl Packet for PlayerHotBar {
+    const ID: u32 = id::PLAYER_HOTBAR;
+}
+
+impl Encode for PlayerHotBar {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_u32(self.selected_slot);
+        writer.u8(self.window_id);
+        writer.bool(self.select_slot);
     }
 }
 
@@ -573,7 +701,14 @@ mod tests {
             block_runtime_id: 99,
             client_prediction: 1,
         };
-        let transaction = InventoryTransaction::UseItem(use_item);
+        // Armour put on by using it: the client changed two slots itself.
+        let transaction = InventoryTransaction {
+            legacy_request: Some(LegacyRequest {
+                id: -3,
+                slots: vec![(6, vec![0]), (29, vec![2])],
+            }),
+            data: TransactionData::UseItem(use_item),
+        };
         let bytes = transaction.encode();
         let (header, payload) = read_header(&bytes).unwrap();
         assert_eq!(header.id, id::INVENTORY_TRANSACTION);
@@ -592,7 +727,7 @@ mod tests {
 
     #[test]
     fn hud_drops_decode_with_their_actions() {
-        let drop = InventoryTransaction::Normal(vec![
+        let drop = InventoryTransaction::from(TransactionData::Normal(vec![
             InventoryAction {
                 source: action_source::WORLD,
                 window_id: None,
@@ -616,7 +751,7 @@ mod tests {
                     ..stone()
                 },
             },
-        ]);
+        ]));
         let bytes = drop.encode();
         let (_, payload) = read_header(&bytes).unwrap();
         assert_eq!(decode::<InventoryTransaction>(payload).unwrap(), drop);
@@ -639,11 +774,9 @@ mod tests {
 
     #[test]
     fn other_transactions_keep_only_their_type() {
-        let bytes = InventoryTransaction::Other(4).encode();
+        let other = InventoryTransaction::from(TransactionData::Other(4));
+        let bytes = other.encode();
         let (_, payload) = read_header(&bytes).unwrap();
-        assert_eq!(
-            decode::<InventoryTransaction>(payload).unwrap(),
-            InventoryTransaction::Other(4)
-        );
+        assert_eq!(decode::<InventoryTransaction>(payload).unwrap(), other);
     }
 }

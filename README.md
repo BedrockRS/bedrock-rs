@@ -53,13 +53,18 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 
 - [x] Block breaking and placing, with reach and overlap checks
 - [x] Full 1.26.50 block palette with placement rules (facing, slabs, stairs, connections)
+- [x] Mojang's JSON-defined vanilla blocks (wool and concrete slabs and stairs, red shrub, shelf mushroom)
 - [x] World persistence (compressed chunk files, versioned format)
 - [x] Player persistence (position, rotation, flying state, inventory, game mode)
 - [x] Per-player game modes: survival, creative, adventure and spectator
 
 ### Milestone 4: Inventories 🟡
 
-- [x] Every vanilla item and the vanilla creative inventory
+- [x] Every vanilla 1.26.50 item and the full creative inventory, in vanilla's order
+- [x] Items with NBT (enchanted books, fireworks, patterned banners), kept in inventories and saves
+- [x] Armour: equipped from the inventory or by using it, with sounds, and shown to others
+- [x] Pick block for every block (Ctrl+pick waits for block entities)
+- [x] The inventory screen's crafting grid holds items (no crafting yet)
 - [x] Server-owned player inventories (main, armour, offhand, cursor)
 - [x] Item drops, item entities and held items shown to others
 - [ ] Inventory protocol verified with a live client

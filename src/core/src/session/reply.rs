@@ -43,6 +43,8 @@ pub enum SessionEvent {
         inventory: SavedInventory,
         /// What they hold and in which hotbar slot.
         held: (ItemInstance, u8),
+        /// What they wear (boxed: the join happens once, other events often).
+        armor: Box<[ItemInstance; 4]>,
     },
     /// The player moved or looked around.
     Moved(Movement),
@@ -78,6 +80,11 @@ pub enum SessionEvent {
     PickedUp(Vec<PickedUp>),
     /// What the player holds changed: another slot, or the stack in it.
     Holding { item: ItemInstance, slot: u8 },
+    /// What the player wears changed: helmet, chestplate, leggings, boots.
+    ArmorChanged([ItemInstance; 4]),
+    /// The player put armour on: this sound (a sound event) plays where
+    /// they stand, for them and those around.
+    Equipped(&'static str),
     /// The player said something in chat.
     Chat(String),
     /// The player typed a slash command; its output goes back with `origin`.

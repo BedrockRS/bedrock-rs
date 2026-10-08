@@ -507,11 +507,11 @@ mod tests {
             flying: true,
             inventory: Some(SavedInventory {
                 main: vec![SavedStack {
-                    nbt: None,
                     slot: 4,
                     item: "minecraft:stone".into(),
                     count: 12,
                     meta: 0,
+                    nbt: None,
                 }],
                 ..SavedInventory::default()
             }),

@@ -46,16 +46,20 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
     session.set_game_rules(server.game_rules.values());
     let mut joined = None;
     serve(&mut connection, &server, &mut session, &mut joined).await;
-    // However the session ended, remember where the player left.
+    // However the session ended, remember where the player left. When the
+    // server stops, everyone leaves at once and nobody needs telling.
+    let closing = server.is_closing();
     if let Some((uuid, player)) = session.saved_player() {
-        tracing::info!("{} left the game", session.player());
+        if !closing {
+            tracing::info!("{} left the game", session.player());
+        }
         server.save_player(uuid, &player);
     }
     // Plugins that heard of the join hear of the quit, and may replace
     // vanilla's message.
     if let Some(player) = joined {
         let event = Event::PlayerQuit(player.clone());
-        if !cancelled(&server.plugins, event, "a quit message").await {
+        if !cancelled(&server.plugins, event, "a quit message").await && !closing {
             server
                 .players
                 .broadcast_translation(LEFT_MESSAGE, &[player.name]);
@@ -284,6 +288,7 @@ impl Link<'_> {
                 view,
                 inventory,
                 held,
+                armor,
             } => {
                 let player = Player {
                     name: profile.name.clone(),
@@ -298,6 +303,7 @@ impl Link<'_> {
                     view,
                     inventory,
                     held,
+                    armor: *armor,
                     game_mode: session.game_mode(),
                     health: session.health().value,
                     outbound: self.outbound.clone(),
@@ -360,6 +366,8 @@ impl Link<'_> {
             SessionEvent::Holding { item, slot } => {
                 self.with_membership(|it| it.holding(item, slot));
             }
+            SessionEvent::ArmorChanged(armor) => self.with_membership(|it| it.armor(armor)),
+            SessionEvent::Equipped(sound) => server.play_sound(session.movement.position, sound),
             SessionEvent::Flying(flying) => self.with_membership(|it| it.flying(flying)),
             SessionEvent::Command { line, origin } => {
                 let reply = server.run_command(&session.command_sender(), &line).await;

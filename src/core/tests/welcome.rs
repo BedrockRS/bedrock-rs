@@ -80,6 +80,7 @@ async fn the_sample_plugin_greets_a_joining_player_once() {
         },
         inventory: Default::default(),
         held: (bedrockrs_protocol::packets::ItemInstance::EMPTY, 0),
+        armor: [bedrockrs_protocol::packets::ItemInstance::EMPTY; 4],
         game_mode: GameMode::Creative,
         health: 20.0,
         outbound,

@@ -11,6 +11,7 @@ use bedrockrs_protocol::types::BlockPos;
 
 use crate::entities::ItemEntities;
 use crate::inventory::HOTBAR_SLOTS;
+use crate::items::{equip_sound, items};
 use crate::players::STANDING_HEIGHT;
 
 use super::{Reply, Session, SessionEvent, Stage};
@@ -28,7 +29,8 @@ impl Session {
     }
 
     /// The player closed a window: confirmed, as the client waits for it.
-    /// Closing the inventory puts what is on the cursor back into it.
+    /// Closing the inventory puts what is on the cursor and in the crafting
+    /// grid back into it.
     pub(super) fn container_close(&mut self, close: ContainerClose) -> Reply {
         match close.window_id {
             OWN_INVENTORY_WINDOW => {
@@ -41,8 +43,9 @@ impl Session {
                     }
                     .encode(),
                 ]);
-                if self.inventory.return_cursor() {
-                    // The cursor too, or the client keeps showing the item on it.
+                if self.inventory.return_screen_items() {
+                    // The screen's slots too, or the client keeps showing the
+                    // items in them.
                     reply.packets.extend(self.inventory_sync());
                     reply
                         .events
@@ -81,6 +84,40 @@ impl Session {
             events: self.held_event().into_iter().collect(),
             ..Reply::default()
         }
+    }
+
+    /// Using an item in the air: armour is put on, swapping with what was
+    /// worn, as Dragonfly does. The client already shows it on, so it is
+    /// only confirmed.
+    pub(super) fn use_in_air(&mut self) -> Reply {
+        let armor_before = self.inventory.armor();
+        if self.is_dead() || self.inventory.equip_held(self.held_slot.into()).is_none() {
+            return Reply::default();
+        }
+        let mut reply = Reply::send(self.inventory_sync());
+        reply
+            .events
+            .push(SessionEvent::InventoryChanged(self.inventory.saved()));
+        reply.events.extend(self.armor_events(armor_before));
+        reply.events.extend(self.held_event());
+        reply
+    }
+
+    /// What to tell others now that the player wears something other than
+    /// `before`: what they wear, and the sound of what was put on.
+    pub(super) fn armor_events(&self, before: [ItemInstance; 4]) -> Vec<SessionEvent> {
+        let after = self.inventory.armor();
+        if after == before {
+            return Vec::new();
+        }
+        let put_on = after
+            .iter()
+            .zip(&before)
+            .find(|(now, was)| !now.is_empty() && now != was)
+            .and_then(|(now, _)| items().get(now.network_id));
+        std::iter::once(SessionEvent::ArmorChanged(after))
+            .chain(put_on.map(|item| SessionEvent::Equipped(equip_sound(&item.name))))
+            .collect()
     }
 
     /// What the player now holds, if others have not been shown it yet.
@@ -181,13 +218,14 @@ impl Session {
             .iter()
             .map(Encode::encode)
             .collect();
-        packets.push(self.inventory.cursor_slot().encode());
+        packets.extend(self.inventory.screen_slots().iter().map(Encode::encode));
         packets
     }
 
     /// Applies each request to the inventory and answers them all. Accepted
     /// changes are passed on, so saves include them.
     pub(super) fn item_stack_request(&mut self, packet: ItemStackRequest) -> Reply {
+        let armor_before = self.inventory.armor();
         let responses: Vec<StackResponse> = packet
             .requests
             .iter()
@@ -213,6 +251,7 @@ impl Session {
         }
         events.extend(dropped);
         events.extend(self.held_event());
+        events.extend(self.armor_events(armor_before));
         Reply {
             packets,
             events,

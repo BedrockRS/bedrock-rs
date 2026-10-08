@@ -19,12 +19,13 @@ use bedrockrs_protocol::block::{BlockState, StateValue};
 use bedrockrs_protocol::login::{ConnectionRequest, IdentityClaims};
 use bedrockrs_protocol::packet::{self, Decode, Encode, id};
 use bedrockrs_protocol::packets::{
-    Animate, BlockAction, ContainerClose, ContainerOpen, Disconnect, DisconnectReason, Interact,
-    InventoryTransaction, ItemInstance, ItemStackRequest, Login, MobEquipment,
-    NetworkChunkPublisherUpdate, NetworkSettings, OWN_INVENTORY_WINDOW, PackResponse, PlayStatus,
-    PlayStatusCode, PlayerAction, PlayerAuthInput, RequestChunkRadius, RequestNetworkSettings,
-    ResourcePackClientResponse, Respawn, RespawnState, SetLocalPlayerAsInitialized, Text, TextType,
-    UseItem, action_source, input_flag, interact_action, player_action, use_item_action,
+    Animate, BlockAction, BlockPickRequest, ContainerClose, ContainerOpen, Disconnect,
+    DisconnectReason, Interact, InventoryTransaction, ItemInstance, ItemStackRequest, Login,
+    MobEquipment, NetworkChunkPublisherUpdate, NetworkSettings, OWN_INVENTORY_WINDOW, PackResponse,
+    PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput, RequestChunkRadius,
+    RequestNetworkSettings, ResourcePackClientResponse, Respawn, RespawnState,
+    SetLocalPlayerAsInitialized, Text, TextType, TransactionData, UseItem, action_source,
+    input_flag, interact_action, player_action, use_item_action,
 };
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 

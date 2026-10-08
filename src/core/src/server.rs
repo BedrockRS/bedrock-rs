@@ -1,7 +1,7 @@
 //! State every session shares, and what plugins ask of it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bedrockrs_plugins::{Action, Dispatcher};
 use bedrockrs_protocol::packet::Encode as _;
@@ -55,6 +55,8 @@ pub struct Server {
     tick: AtomicU64,
     /// Signalled when something asks the server to stop.
     stop: Notify,
+    /// Set once the server disconnects everyone to stop.
+    closing: AtomicBool,
 }
 
 impl Server {
@@ -72,6 +74,7 @@ impl Server {
             game_rules: GameRules::in_memory(),
             tick: AtomicU64::new(0),
             stop: Notify::new(),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -127,6 +130,18 @@ impl Server {
     /// Resolves once something asked the server to stop.
     pub async fn stop_requested(&self) {
         self.stop.notified().await;
+    }
+
+    /// Disconnects every player as the server stops. Their sessions still
+    /// save them and tell plugins they quit, but nobody hears they left.
+    pub fn close(&self) {
+        self.closing.store(true, Ordering::Relaxed);
+        self.logins.close_all();
+    }
+
+    /// Whether the server is disconnecting everyone to stop.
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Relaxed)
     }
 
     pub fn current_tick(&self) -> u64 {
@@ -270,6 +285,20 @@ impl Server {
             .send_to_viewers(chunk, &Bytes::from(sound.encode()));
         self.update_neighbours(pos);
         true
+    }
+
+    /// Plays `sound` (a sound event, such as `armor.equip_iron`) at
+    /// `position`, for everyone with its chunk.
+    pub fn play_sound(&self, position: Vec3, sound: &str) {
+        let packet = LevelSoundEvent {
+            sound: sound.to_owned(),
+            position,
+            data: -1,
+        };
+        self.players.send_to_viewers(
+            ChunkPos::of_block(BlockPos::containing(position)),
+            &Bytes::from(packet.encode()),
+        );
     }
 
     /// Recomputes the blocks around `pos` whose connections or shape depend
@@ -442,6 +471,7 @@ mod tests {
             },
             inventory: Default::default(),
             held: (bedrockrs_protocol::packets::ItemInstance::EMPTY, 0),
+            armor: [bedrockrs_protocol::packets::ItemInstance::EMPTY; 4],
             game_mode: crate::game_mode::GameMode::Creative,
             health: 20.0,
             outbound,

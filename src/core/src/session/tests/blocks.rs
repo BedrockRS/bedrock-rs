@@ -3,7 +3,7 @@ use super::*;
 fn place(slot: i32, block_position: BlockPos, face: u8) -> Vec<u8> {
     let held_item =
         Inventory::with_hotbar(&TEST_KIT).content()[0].content[slot.clamp(0, 35) as usize];
-    InventoryTransaction::UseItem(UseItem {
+    InventoryTransaction::from(TransactionData::UseItem(UseItem {
         action: use_item_action::CLICK_BLOCK,
         trigger: 1,
         block_position,
@@ -14,7 +14,7 @@ fn place(slot: i32, block_position: BlockPos, face: u8) -> Vec<u8> {
         clicked_position: Vec3::default(),
         block_runtime_id: 0,
         client_prediction: 1,
-    })
+    }))
     .encode()
 }
 
@@ -47,7 +47,7 @@ fn use_on_block(
     click_y: f32,
 ) -> Vec<u8> {
     let held_item = session.inventory().hotbar(slot).unwrap().instance();
-    InventoryTransaction::UseItem(UseItem {
+    InventoryTransaction::from(TransactionData::UseItem(UseItem {
         action: use_item_action::CLICK_BLOCK,
         trigger: 1,
         block_position,
@@ -62,7 +62,7 @@ fn use_on_block(
         },
         block_runtime_id: 0,
         client_prediction: 1,
-    })
+    }))
     .encode()
 }
 
@@ -162,7 +162,7 @@ fn placing_uses_what_the_server_says_is_held() {
 
     // Holding what the server has there, dirt, places dirt.
     let held = session.inventory().hotbar(0).unwrap().instance();
-    let transaction = InventoryTransaction::UseItem(UseItem {
+    let transaction = InventoryTransaction::from(TransactionData::UseItem(UseItem {
         action: use_item_action::CLICK_BLOCK,
         trigger: 1,
         block_position: grass,
@@ -173,7 +173,7 @@ fn placing_uses_what_the_server_says_is_held() {
         clicked_position: Vec3::default(),
         block_runtime_id: 0,
         client_prediction: 1,
-    });
+    }));
     let reply = session.handle(&transaction.encode()).unwrap();
     let dirt = bedrockrs_protocol::block::BlockState::new("minecraft:dirt").network_id();
     assert!(reply.events.contains(&SessionEvent::PlacedBlock {
@@ -374,5 +374,76 @@ fn survival_placing_uses_up_the_held_block() {
             .iter()
             .any(|event| matches!(event, SessionEvent::InventoryChanged(_))),
         "the change is saved"
+    );
+}
+
+fn pick(position: BlockPos, add_block_nbt: bool) -> Vec<u8> {
+    BlockPickRequest {
+        position,
+        add_block_nbt,
+        hotbar_slot: 0,
+    }
+    .encode()
+}
+
+#[test]
+fn picking_a_block_brings_its_item_into_the_hotbar() {
+    let mut session = in_game_session();
+    // The grass under the spawn is already in hotbar slot 1: it is held.
+    let grass = BlockPos { x: 0, y: -61, z: 0 };
+    let reply = session.handle(&pick(grass, false)).unwrap();
+    assert_eq!(ids(&reply), [id::PLAYER_HOTBAR]);
+    assert_eq!(session.held_slot, 1);
+    assert!(matches!(
+        reply.events[..],
+        [SessionEvent::Holding { slot: 1, .. }]
+    ));
+
+    // A double slab gives its slab. The hotbar is full, so what is held
+    // moves into the inventory and the slab takes its place.
+    let slab_at = BlockPos { x: 2, y: -60, z: 0 };
+    let double = BlockState::new("minecraft:oak_double_slab").with(
+        "minecraft:vertical_half",
+        StateValue::String("bottom".into()),
+    );
+    session.world.set_block(slab_at, double.network_id());
+    let reply = session.handle(&pick(slab_at, true)).unwrap();
+    assert_eq!(ids(&reply).last(), Some(&id::PLAYER_HOTBAR));
+    assert!(ids(&reply).contains(&id::INVENTORY_CONTENT));
+    let slab = items().by_name("minecraft:oak_slab").unwrap().network_id;
+    assert_eq!(session.inventory().hotbar(1).unwrap().item, slab);
+    let saved = session.inventory().saved();
+    assert!(
+        saved
+            .main
+            .iter()
+            .any(|stack| stack.slot == 9 && stack.item == "minecraft:grass_block")
+    );
+
+    // Air, and blocks out of reach, give nothing.
+    let air = BlockPos { x: 0, y: -50, z: 0 };
+    assert!(ids(&session.handle(&pick(air, false)).unwrap()).is_empty());
+    let far = BlockPos {
+        x: 40,
+        y: -61,
+        z: 0,
+    };
+    assert!(ids(&session.handle(&pick(far, false)).unwrap()).is_empty());
+}
+
+#[test]
+fn survival_players_only_pick_what_they_carry() {
+    let mut session = in_game_session();
+    session.set_game_mode(GameMode::Survival);
+    // Logs are not in their inventory.
+    let log_at = BlockPos { x: 2, y: -60, z: 0 };
+    let log =
+        BlockState::new("minecraft:oak_log").with("pillar_axis", StateValue::String("y".into()));
+    session.world.set_block(log_at, log.network_id());
+    assert!(ids(&session.handle(&pick(log_at, false)).unwrap()).is_empty());
+    let grass = BlockPos { x: 0, y: -61, z: 0 };
+    assert_eq!(
+        ids(&session.handle(&pick(grass, false)).unwrap()),
+        [id::PLAYER_HOTBAR]
     );
 }

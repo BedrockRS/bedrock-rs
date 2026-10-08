@@ -740,15 +740,17 @@ DTLS, SCTP, and multi-segment messages both ways.
     (base64). What a client sends an item to carry is never taken.
   - The ItemRegistry and CreativeContent packets are encoded once and shared.
 - **Inventories (implemented)** in `inventory`: the server owns each player's 36 main
-  slots (hotbar 0 to 8), four armour slots, the offhand and the cursor.
+  slots (hotbar 0 to 8), four armour slots, the offhand, the cursor and the inventory
+  screen's 2x2 crafting grid.
   - New players start with nothing; the creative inventory has everything.
   - **Opening the screen:** the inventory key sends Interact action 6 (open
     inventory), and the client shows the screen only once the server answers with
     ContainerOpen (window 0, type 0xFF, the player's block, entity -1). A second open
     while it is open is not answered: Dragonfly notes that opening twice crashes the
     client. The client's ContainerClose (47) for window 0 is echoed back (type 0, not
-    server-side), and anything left on the cursor goes into the first free slot, with
-    the inventory and cursor sent again;
+    server-side), and anything left on the cursor or in the crafting grid goes back into
+    the inventory (onto stacks of the same item, then free slots, the rest thrown out),
+    with the inventory, cursor and grid sent again;
     window 0xFF (inventory and chat together) just marks it closed. Without these, the
     screen never opens (found live on 2026-09-27).
   - Every stack has a stack network ID, unique per player. A whole stack that moves
@@ -762,6 +764,43 @@ DTLS, SCTP, and multi-segment messages both ways.
     craft-results and mine-block actions. Drop (from any slot, cursor included) takes
     the items out and the world throws them (see Item entities). Consume, create and
     crafting are rejected for now.
+  - **Crafting grid:** container 13 (`CRAFTING_INPUT`), slots 28 to 31 of the UI
+    window, as Dragonfly numbers them (a crafting table's 3x3 grid is 32 to 40). Items
+    can be put in and taken out; nothing is crafted yet. Saves count grid items as back
+    in the inventory, as for the cursor.
+  - **Armour:** armour slots only take what is worn there (`items::armor_slot`:
+    helmets, skulls, heads and the carved pumpkin on the head; chestplates and the
+    elytra on the chest; leggings; boots); a request breaking that is rejected. Using
+    armour in the air (UseItem, click air) swaps it with what is worn, as Dragonfly
+    does: the client predicts the swap, and before this the server ignored it, so the
+    next click on the armour slot was rejected and the item snapped back (found live,
+    2026-10-08).
+  - **Legacy requests:** a transaction the client already carried out on its side
+    (armour put on by using it, an item thrown from the HUD) carries a legacy request
+    ID and the slots it changed. As gophertunnel documents, the server must answer
+    with an ItemStackResponse for that ID listing what those slots hold; until then
+    the client keeps them locked. And as after any request, the client goes on naming
+    the stacks in those slots by the request's ID, so the stack IDs they hold are
+    remembered under it with the other recent requests. Before both, a helmet put on
+    by using it could not be clicked, dropped or moved until the player rejoined
+    (found live, 2026-10-08). Dragonfly only resends the slots, without the response.
+  - Whichever way armour goes on, its sound plays where the player stands
+    (LevelSoundEvent `armor.equip_<material>`, generic for others, by Dragonfly's
+    mapping), and others see it (MobArmorEquipment, 32), as do players who come into
+    view later. Armour does not protect yet.
+  - **Pick block** (BlockPickRequest, 34; middle click): `Items::pick` maps the block
+    to the item vanilla gives: a table for blocks whose item has another name (crops
+    give seeds, redstone wire redstone, plain signs the oak sign, candle cakes cake),
+    nothing for air, liquids, fire and portals, double slabs their slab, then the
+    same-name item if the creative inventory has it, then lit, powered, inverted and
+    wall forms stripped (`lit_furnace` → furnace, `spruce_wall_sign` → spruce sign),
+    and last the same-name item even if it is not in the creative inventory (barriers,
+    command and light blocks). A test checks every block in the palette. As in
+    Dragonfly, an item already on the hotbar is held; one elsewhere swaps with the held
+    slot; otherwise creative players get one in the first empty hotbar slot (or the held
+    slot, its stack moving to the first empty slot). PlayerHotBar (48) switches the
+    client's slot. Ctrl (`add_block_nbt`) should copy the block's block entity data,
+    but there are no block entities yet.
   - Each slot names the stack the client believes is there: its stack ID, 0 for an
     empty slot, or a negative request ID. The client sends requests without waiting
     for answers, so a request ID stands for the stack that request (this one or an

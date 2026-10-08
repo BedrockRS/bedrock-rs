@@ -1,12 +1,15 @@
-//! Breaking and placing blocks, and arm swings.
+//! Breaking, placing and picking blocks, and arm swings.
 
 use bedrockrs_protocol::block::{BlockState, StateValue};
 use bedrockrs_protocol::packet::Encode;
 use bedrockrs_protocol::packets::{
-    Animate, InventoryTransaction, PlayerAction, UseItem, player_action, use_item_action,
+    Animate, BlockPickRequest, INVENTORY_WINDOW, InventoryTransaction, ItemStackResponse,
+    PlayerAction, PlayerHotBar, TransactionData, UseItem, player_action, use_item_action,
 };
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 
+use crate::entities::ItemStack;
+use crate::game_mode::GameMode;
 use crate::items::items;
 use crate::placement::{self, Placing};
 use crate::players::{STANDING_HEIGHT, View, body_overlaps};
@@ -20,19 +23,42 @@ use super::{Reply, Session, SessionEvent};
 const MAX_REACH: f32 = 12.0;
 
 impl Session {
-    /// Right-clicking a block with a block item places it against the clicked
-    /// face. The held stack is the server's, and must be the item the client
-    /// says it holds. Outside creative mode, placing uses one up. The client
-    /// predicts the placement, so a refused one is undone with the block that
-    /// is really there.
+    /// An inventory transaction: using the held item, or throwing it from the
+    /// HUD. Other transactions change items the client already moved on its
+    /// side; none are carried out, so it is shown what it really has.
     pub(super) fn inventory_transaction(&mut self, transaction: InventoryTransaction) -> Reply {
-        // Other transactions change items the client already moved on its
-        // side; none are carried out, so it is shown what it really has.
-        let use_item = match transaction {
-            InventoryTransaction::UseItem(use_item) => use_item,
-            InventoryTransaction::Normal(actions) => return self.hud_drop(&actions),
-            InventoryTransaction::Other(_) => return Reply::send(self.inventory_sync()),
+        let InventoryTransaction {
+            legacy_request,
+            data,
+        } = transaction;
+        let mut reply = match data {
+            TransactionData::UseItem(use_item) => self.use_item(use_item),
+            TransactionData::Normal(actions) => self.hud_drop(&actions),
+            TransactionData::Other(_) => Reply::send(self.inventory_sync()),
         };
+        // The client changed those slots itself and keeps them locked until
+        // it hears what they hold (found live: a helmet put on by using it
+        // could not be taken off).
+        if let Some(request) = legacy_request {
+            tracing::debug!(player = %self.player, id = request.id, slots = ?request.slots, "answering a legacy request");
+            let response = ItemStackResponse {
+                responses: vec![self.inventory.legacy_response(&request)],
+            };
+            reply.packets.insert(0, response.encode());
+        }
+        reply
+    }
+
+    /// Using the held item: in the air, armour is put on. Right-clicking a
+    /// block with a block item places it against the clicked face. The held
+    /// stack is the server's, and must be the item the client says it holds.
+    /// Outside creative mode, placing uses one up. The client predicts the
+    /// placement, so a refused one is undone with the block that is really
+    /// there.
+    fn use_item(&mut self, use_item: UseItem) -> Reply {
+        if use_item.action == use_item_action::CLICK_AIR {
+            return self.use_in_air();
+        }
         if use_item.action != use_item_action::CLICK_BLOCK || use_item.held_item.is_empty() {
             return Reply::default();
         }
@@ -175,6 +201,16 @@ impl Session {
             tracing::debug!(player = %self.player, ?pos, mode = self.game_mode.name(), "refusing to change a block in this game mode");
             return None;
         }
+        if !self.within_reach(pos) {
+            tracing::debug!(player = %self.player, ?pos, "refusing to break an unreachable block");
+            return None;
+        }
+        Some(SessionEvent::BrokeBlock(pos))
+    }
+
+    /// Whether the block at `pos` is inside the world's height, within reach,
+    /// and in a chunk the player's client has.
+    fn within_reach(&self, pos: BlockPos) -> bool {
         let centre = Vec3 {
             x: pos.x as f32 + 0.5,
             y: pos.y as f32 + 0.5,
@@ -190,11 +226,54 @@ impl Session {
             }
             .contains(ChunkPos::of_block(pos))
         });
-        if !(MIN_Y..=MAX_Y).contains(&pos.y) || reach_squared > MAX_REACH * MAX_REACH || !in_view {
-            tracing::debug!(player = %self.player, ?pos, "refusing to break an unreachable block");
-            return None;
+        (MIN_Y..=MAX_Y).contains(&pos.y) && reach_squared <= MAX_REACH * MAX_REACH && in_view
+    }
+
+    /// Picking a block (middle click) brings its item into the hotbar, as
+    /// [`Inventory::pick`](crate::inventory::Inventory::pick) describes. With
+    /// Ctrl held the item would also carry the block's data, but no block
+    /// keeps any yet (there are no block entities).
+    pub(super) fn pick_block(&mut self, request: BlockPickRequest) -> Reply {
+        let pos = request.position;
+        if self.is_dead() || self.game_mode == GameMode::Spectator || !self.within_reach(pos) {
+            return Reply::default();
         }
-        Some(SessionEvent::BrokeBlock(pos))
+        let block = self.world.block_name(self.world.block(pos));
+        let Some(item) = items().pick(block) else {
+            return Reply::default();
+        };
+        if request.add_block_nbt {
+            tracing::debug!(player = %self.player, ?pos, block, "no block data to copy into a picked item");
+        }
+        let picked = ItemStack {
+            item: item.network_id,
+            count: 1,
+            metadata: 0,
+            nbt: None,
+        };
+        let creative = self.game_mode.is_creative();
+        let Some((slot, changed)) = self.inventory.pick(picked, self.held_slot.into(), creative)
+        else {
+            return Reply::default();
+        };
+        self.held_slot = slot as u8;
+        let mut reply = Reply::default();
+        if changed {
+            reply.packets = self.inventory_sync();
+            reply
+                .events
+                .push(SessionEvent::InventoryChanged(self.inventory.saved()));
+        }
+        reply.packets.push(
+            PlayerHotBar {
+                selected_slot: u32::from(self.held_slot),
+                window_id: INVENTORY_WINDOW as u8,
+                select_slot: true,
+            }
+            .encode(),
+        );
+        reply.events.extend(self.held_event());
+        reply
     }
 }
 

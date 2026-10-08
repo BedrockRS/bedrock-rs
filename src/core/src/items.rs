@@ -16,6 +16,8 @@ use bedrockrs_protocol::packets::{
 };
 use serde::Deserialize;
 
+use crate::blocks::palette;
+
 const DATA: &str = include_str!("../data/items.json");
 
 /// An item the server knows.
@@ -75,6 +77,8 @@ pub struct Items {
     creative_groups: Vec<CreativeGroup>,
     /// Creative items; creative network ID `n` is entry `n - 1`.
     creative: Vec<(CreativeEntry, u32)>,
+    /// The items the creative inventory offers, by network ID.
+    in_creative: HashSet<i16>,
 }
 
 /// The registry, loaded on first use.
@@ -105,6 +109,50 @@ impl Items {
     pub fn creative(&self, id: u32) -> Option<CreativeEntry> {
         let index = usize::try_from(id.checked_sub(1)?).ok()?;
         self.creative.get(index).map(|(entry, _)| *entry)
+    }
+
+    /// The item picking `block` (a block name) gives, as vanilla's pick block
+    /// does: the obtainable item that places it, or `None` for blocks with
+    /// none (air, liquids, fire, portals).
+    pub fn pick(&self, block: &str) -> Option<&ItemType> {
+        let name = block.strip_prefix("minecraft:")?;
+        if NOT_PICKABLE.contains(&name) {
+            return None;
+        }
+        let item = |name: &str| self.by_name(&format!("minecraft:{name}"));
+        let obtainable =
+            |name: &str| item(name).filter(|item| self.in_creative.contains(&item.network_id));
+        if let Some(&(_, picked)) = PICKED_AS.iter().find(|(block, _)| *block == name) {
+            return item(picked);
+        }
+        if name.ends_with("_candle_cake") {
+            return item("cake");
+        }
+        if let Some(single) = palette().single_slab(block) {
+            return self.by_name(single);
+        }
+        if let Some(found) = obtainable(name) {
+            return Some(found);
+        }
+        // The forms a block takes while lit, powered or on a wall.
+        let mut forms = Vec::new();
+        for prefix in ["lit_", "unlit_", "powered_", "unpowered_"] {
+            forms.extend(name.strip_prefix(prefix).map(str::to_owned));
+        }
+        forms.extend(name.strip_suffix("_inverted").map(str::to_owned));
+        for suffix in ["_wall_sign", "_standing_sign"] {
+            forms.extend(name.strip_suffix(suffix).map(|wood| format!("{wood}_sign")));
+        }
+        forms.extend(
+            name.strip_suffix("_wall_fan")
+                .map(|coral| format!("{coral}_fan")),
+        );
+        if let Some(found) = forms.iter().find_map(|form| obtainable(form)) {
+            return Some(found);
+        }
+        // Blocks only operators get (barriers, command and light blocks)
+        // still give their own item.
+        item(name)
     }
 
     /// Every block state an item places.
@@ -167,6 +215,7 @@ impl Items {
             by_name: HashMap::new(),
             creative_groups: Vec::new(),
             creative: Vec::new(),
+            in_creative: HashSet::new(),
         };
         for raw in data.items {
             let block = raw.block.map(RawBlock::state).transpose()?;
@@ -225,10 +274,106 @@ impl Items {
             ));
         }
         items.creative_groups = groups;
+        items.in_creative = creative.iter().map(|(entry, _)| entry.network_id).collect();
         items.creative = creative;
         Ok(items)
     }
 }
+
+/// The armour slot an item is worn in (0 head, 1 chest, 2 legs, 3 feet), or
+/// `None` if it is not worn. Heads include skulls and the carved pumpkin.
+pub fn armor_slot(name: &str) -> Option<usize> {
+    let name = name.strip_prefix("minecraft:")?;
+    if name.ends_with("_helmet")
+        || name.ends_with("_skull")
+        || name.ends_with("_head")
+        || name == "carved_pumpkin"
+    {
+        Some(0)
+    } else if name.ends_with("_chestplate") || name == "elytra" {
+        Some(1)
+    } else if name.ends_with("_leggings") {
+        Some(2)
+    } else if name.ends_with("_boots") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// The sound of putting `name` on, as a sound event: by the armour's
+/// material, as Dragonfly picks it.
+pub fn equip_sound(name: &str) -> &'static str {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    let materials = [
+        ("leather_", "armor.equip_leather"),
+        ("chainmail_", "armor.equip_chain"),
+        ("iron_", "armor.equip_iron"),
+        ("golden_", "armor.equip_gold"),
+        ("diamond_", "armor.equip_diamond"),
+        ("netherite_", "armor.equip_netherite"),
+        ("copper_", "armor.equip_copper"),
+    ];
+    if name == "elytra" {
+        return "armor.equip_elytra";
+    }
+    materials
+        .iter()
+        .find(|(prefix, _)| name.starts_with(prefix))
+        .map_or("armor.equip_generic", |(_, sound)| sound)
+}
+
+/// Blocks picking gives nothing for, as in vanilla.
+const NOT_PICKABLE: &[&str] = &[
+    "air",
+    "water",
+    "flowing_water",
+    "lava",
+    "flowing_lava",
+    "fire",
+    "soul_fire",
+    "portal",
+    "end_portal",
+    "end_gateway",
+    "bubble_column",
+    "frosted_ice",
+    "moving_block",
+    "piston_arm_collision",
+    "sticky_piston_arm_collision",
+    "client_request_placeholder_block",
+    "unknown",
+];
+
+/// Blocks whose item has another name: crops give their seeds, wires what
+/// they are made of.
+const PICKED_AS: &[(&str, &str)] = &[
+    ("wheat", "wheat_seeds"),
+    ("beetroot", "beetroot_seeds"),
+    ("carrots", "carrot"),
+    ("potatoes", "potato"),
+    ("melon_stem", "melon_seeds"),
+    ("pumpkin_stem", "pumpkin_seeds"),
+    ("torchflower_crop", "torchflower_seeds"),
+    ("pitcher_crop", "pitcher_pod"),
+    ("cocoa", "cocoa_beans"),
+    ("sweet_berry_bush", "sweet_berries"),
+    ("cave_vines", "glow_berries"),
+    ("cave_vines_body_with_berries", "glow_berries"),
+    ("cave_vines_head_with_berries", "glow_berries"),
+    ("bamboo_sapling", "bamboo"),
+    ("reeds", "sugar_cane"),
+    ("redstone_wire", "redstone"),
+    ("trip_wire", "string"),
+    ("powder_snow", "powder_snow_bucket"),
+    ("candle_cake", "cake"),
+    ("standing_sign", "oak_sign"),
+    ("wall_sign", "oak_sign"),
+    ("darkoak_standing_sign", "dark_oak_sign"),
+    ("darkoak_wall_sign", "dark_oak_sign"),
+    ("standing_banner", "banner"),
+    ("wall_banner", "banner"),
+    ("stonecutter", "stonecutter_block"),
+];
 
 /// The shield, whose item data carries an extra field on the wire.
 pub const SHIELD: &str = "minecraft:shield";
@@ -335,6 +480,70 @@ mod tests {
                     .with("pillar_axis", StateValue::String("y".into()))
             )
         );
+    }
+
+    #[test]
+    fn armour_has_a_slot_and_a_sound() {
+        assert_eq!(armor_slot("minecraft:turtle_helmet"), Some(0));
+        assert_eq!(armor_slot("minecraft:carved_pumpkin"), Some(0));
+        assert_eq!(armor_slot("minecraft:creeper_head"), Some(0));
+        assert_eq!(armor_slot("minecraft:elytra"), Some(1));
+        assert_eq!(armor_slot("minecraft:copper_leggings"), Some(2));
+        assert_eq!(armor_slot("minecraft:netherite_boots"), Some(3));
+        assert_eq!(armor_slot("minecraft:pumpkin"), None);
+        assert_eq!(armor_slot("minecraft:diamond_sword"), None);
+        assert_eq!(equip_sound("minecraft:golden_helmet"), "armor.equip_gold");
+        assert_eq!(
+            equip_sound("minecraft:chainmail_boots"),
+            "armor.equip_chain"
+        );
+        assert_eq!(equip_sound("minecraft:elytra"), "armor.equip_elytra");
+        assert_eq!(
+            equip_sound("minecraft:turtle_helmet"),
+            "armor.equip_generic"
+        );
+    }
+
+    #[test]
+    fn every_block_can_be_picked_but_air_liquids_and_the_like() {
+        let items = items();
+        let picked = |block: &str| items.pick(block).map(|item| item.name.as_str());
+        for block in palette().names() {
+            let name = block.strip_prefix("minecraft:").unwrap();
+            assert_eq!(
+                picked(block).is_none(),
+                NOT_PICKABLE.contains(&name),
+                "{block} picks {:?}",
+                picked(block)
+            );
+        }
+        for (block, item) in [
+            ("stone", "stone"),
+            ("oak_double_slab", "oak_slab"),
+            ("white_wool_double_slab", "white_wool_slab"),
+            ("wheat", "wheat_seeds"),
+            ("carrots", "carrot"),
+            ("lit_furnace", "furnace"),
+            ("lit_pumpkin", "lit_pumpkin"),
+            ("powered_repeater", "repeater"),
+            ("unlit_redstone_torch", "redstone_torch"),
+            ("daylight_detector_inverted", "daylight_detector"),
+            ("spruce_wall_sign", "spruce_sign"),
+            ("wall_sign", "oak_sign"),
+            ("darkoak_standing_sign", "dark_oak_sign"),
+            ("tube_coral_wall_fan", "tube_coral_fan"),
+            ("red_candle_cake", "cake"),
+            ("redstone_wire", "redstone"),
+            ("barrier", "barrier"),
+            ("acacia_door", "acacia_door"),
+        ] {
+            assert_eq!(
+                picked(&format!("minecraft:{block}")),
+                Some(format!("minecraft:{item}").as_str()),
+                "{block}"
+            );
+        }
+        assert_eq!(picked("minecraft:water"), None);
     }
 
     #[test]

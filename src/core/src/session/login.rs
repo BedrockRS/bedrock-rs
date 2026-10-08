@@ -335,6 +335,7 @@ impl Session {
                 },
                 inventory: self.inventory.saved(),
                 held: (self.shown_held, self.held_slot),
+                armor: Box::new(self.inventory.armor()),
             }]
             .into_iter()
             // A returning player still flying: remembered for the next save.
