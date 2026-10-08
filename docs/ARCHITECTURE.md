@@ -951,8 +951,8 @@ DTLS, SCTP, and multi-segment messages both ways.
   A change goes to the player as SetPlayerGameType plus UpdateAbilities, and to
   everyone else as UpdatePlayerGameType. Health, hunger and damage do not exist yet,
   so survival players cannot be hurt.
-- **Health and damage (implemented)** in `damage`, modelled on vanilla so behavior
-  packs can drive them later:
+- **Health and damage (implemented)** in `damage`, modelled on vanilla so plugins
+  can drive them:
   - `Health { value, max }` is the `minecraft:health` component (players: 20/20),
     shown to the client as the `minecraft:health` attribute, rounded up.
   - `DamageCause` is vanilla's full list, by the Script API's names (`fall`, `void`,

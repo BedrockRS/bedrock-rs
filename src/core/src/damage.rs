@@ -1,9 +1,9 @@
 //! Health and damage, modelled on vanilla's: the `minecraft:health` component
-//! and the damage causes behavior packs and scripts name.
+//! and the damage causes vanilla's scripts name.
 
 /// Why something was hurt, as vanilla names it (`@minecraft/server`'s
-/// `EntityDamageCause`). Every vanilla cause is here so plugins (and later
-/// behavior packs) can use them all; the server itself deals only some.
+/// `EntityDamageCause`). Every vanilla cause is here so plugins can use them
+/// all; the server itself deals only some.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageCause {
     Anvil,
