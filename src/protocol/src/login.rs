@@ -3,8 +3,8 @@
 //! The request holds two blobs, each prefixed with a little-endian u32 length:
 //! authentication JSON (`AuthenticationType`, `Certificate`, `Token`) and a JWT
 //! with the client's settings. The multiplayer `Token` from the Minecraft
-//! services carries the player's identity (`xid`, `xname`) and key (`cpk`).
-//! Nothing here verifies signatures.
+//! services carries the player's identity (`xid`, `xname`, and `mid`, their
+//! PlayFab ID) and key (`cpk`). Nothing here verifies signatures.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD_INDIFFERENT;
@@ -41,6 +41,10 @@ pub struct ConnectionRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IdentityClaims {
     pub xuid: Option<String>,
+    /// The PlayFab ID of the player's master account (the multiplayer
+    /// token's `mid`): the persistent ID Mojang wants servers to key players
+    /// by, rather than the XUID. Only multiplayer tokens carry it.
+    pub pfid: Option<String>,
     pub display_name: Option<String>,
     /// The player's persistent UUID, which stays the same across sessions and
     /// name changes. Derived as vanilla does; see [`identity_from_xuid`].
@@ -123,6 +127,7 @@ impl ConnectionRequest {
         let extra = claims.get("extraData").unwrap_or(&Value::Null);
         Ok(IdentityClaims {
             xuid: text_claim(extra, "XUID"),
+            pfid: None,
             display_name: text_claim(extra, "displayName"),
             identity: uuid_claim(extra, "identity"),
             public_key: claims.get("identityPublicKey").cloned(),
@@ -146,14 +151,16 @@ fn jwt_claims(token: &str) -> Result<Value, LoginError> {
 }
 
 impl IdentityClaims {
-    /// The identity in a multiplayer token's claims: `xid`, `xname`, `cpk`,
-    /// and the UUID (the offline `leguuid`, or else derived from the XUID).
+    /// The identity in a multiplayer token's claims: `xid`, `mid`, `xname`,
+    /// `cpk`, and the UUID (the offline `leguuid`, or else derived from the
+    /// XUID).
     pub fn from_token_claims(claims: &Value) -> Self {
         let xuid = text_claim(claims, "xid");
         let identity =
             uuid_claim(claims, "leguuid").or_else(|| xuid.as_deref().map(identity_from_xuid));
         Self {
             xuid,
+            pfid: text_claim(claims, "mid"),
             display_name: text_claim(claims, "xname"),
             identity,
             public_key: claims.get("cpk").cloned(),
@@ -263,15 +270,19 @@ mod tests {
         let request = ConnectionRequest {
             authentication_type: 0,
             chain: Vec::new(),
-            token: unsigned_jwt(
-                json!({ "xid": "2535400000000000", "xname": "Steve", "cpk": "MHYw" }),
-            ),
+            token: unsigned_jwt(json!({
+                "xid": "2535400000000000",
+                "mid": "4A1B2C3D5E6F7A8B",
+                "xname": "Steve",
+                "cpk": "MHYw"
+            })),
             client_data: String::new(),
         };
         assert_eq!(
             request.identity().unwrap(),
             IdentityClaims {
                 xuid: Some("2535400000000000".into()),
+                pfid: Some("4A1B2C3D5E6F7A8B".into()),
                 display_name: Some("Steve".into()),
                 identity: Some(identity_from_xuid("2535400000000000")),
                 public_key: Some(json!("MHYw")),
@@ -327,6 +338,7 @@ mod tests {
             request.identity().unwrap(),
             IdentityClaims {
                 xuid: None,
+                pfid: None,
                 display_name: Some("Alex".into()),
                 identity: Uuid::parse_str("01234567-89ab-4cde-8f01-23456789abcd").ok(),
                 public_key: Some(json!("MHYw")),

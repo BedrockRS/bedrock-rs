@@ -190,19 +190,19 @@ impl Server {
         let line = line.strip_prefix('/').unwrap_or(line);
         let tokens = parse::tokenize(line);
         let Some((name, rest)) = tokens.split_first() else {
-            return CommandReply::error("Type /help for a list of commands.");
+            return CommandReply::error("Type /help for a list of commands");
         };
         let name = name.text.to_ascii_lowercase();
         let unknown = || {
             CommandReply::error(format!(
-                "Unknown command: /{name}. Type /help for a list of commands."
+                "Unknown command: /{name}. Type /help for a list of commands"
             ))
         };
         let Some(command) = self.commands.find(&name) else {
             return unknown();
         };
         if !command.visible_to(sender) {
-            return CommandReply::error(format!("You do not have permission to use /{name}."));
+            return CommandReply::error(format!("You do not have permission to use /{name}"));
         }
         let find_player = |name: &str| {
             self.players.find(name).map(|(uuid, name)| Player {
@@ -238,7 +238,7 @@ impl Server {
                             "Plugin {plugin} took too long to answer /{}",
                             command.spec.name
                         );
-                        CommandReply::error("The command took too long to answer.")
+                        CommandReply::error("The command took too long to answer")
                     }
                 }
             }
@@ -322,15 +322,15 @@ mod tests {
         };
         assert_eq!(
             error(server.run_command(&steve, "/fly").await),
-            "Unknown command: /fly. Type /help for a list of commands."
+            "Unknown command: /fly. Type /help for a list of commands"
         );
         assert_eq!(
             error(server.run_command(&steve, "/gamemode creative").await),
-            "You do not have permission to use /gamemode."
+            "You do not have permission to use /gamemode"
         );
         assert_eq!(
             error(server.run_command(&steve, "  /  ").await),
-            "Type /help for a list of commands."
+            "Type /help for a list of commands"
         );
         assert!(
             server.run_command(&steve, "/HELP").await.succeeded(),
@@ -348,7 +348,9 @@ mod tests {
         .with_default_game_mode(GameMode::Adventure);
         let uuid = Uuid::new_v4();
         let (controls, mut received) = tokio::sync::mpsc::channel(8);
-        let _claim = server.logins.claim(uuid, controls);
+        let _claim = server
+            .logins
+            .claim(uuid, crate::permissions::PlayerIds::default(), controls);
         let steve = Sender::Player(PlayerSender {
             uuid,
             name: "Steve".into(),
@@ -390,7 +392,9 @@ mod tests {
         );
         let uuid = Uuid::new_v4();
         let (controls, mut received) = tokio::sync::mpsc::channel(8);
-        let _claim = server.logins.claim(uuid, controls);
+        let _claim = server
+            .logins
+            .claim(uuid, crate::permissions::PlayerIds::default(), controls);
         let steve = Sender::Player(PlayerSender {
             uuid,
             name: "Steve".into(),

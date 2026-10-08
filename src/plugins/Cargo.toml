@@ -1,23 +1,15 @@
 [package]
 name = "bedrockrs_plugins"
-description = "Hot-reloading polyglot plugin engine for BedrockRS (Luau, JS/TS, Python)"
+description = "Hot-reloading plugin engine for BedrockRS: Luau and JavaScript side by side"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[features]
-default = ["luau"]
-luau = ["dep:mlua"]
-js = ["dep:deno_core", "dep:deno_ast"]
-python = ["dep:rustpython-vm"]
-
 [dependencies]
-deno_ast = { workspace = true, optional = true }
-deno_core = { workspace = true, optional = true }
-mlua = { workspace = true, optional = true }
+mlua.workspace = true
 notify.workspace = true
-rustpython-vm = { workspace = true, optional = true }
+rquickjs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

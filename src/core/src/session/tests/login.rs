@@ -35,10 +35,11 @@ fn a_verified_login_claims_its_uuid() {
         )
         .unwrap();
     let reply = log_in(&mut session, token);
-    let [SessionEvent::LoggedIn(uuid)] = reply.events[..] else {
+    let [SessionEvent::LoggedIn { uuid, ref ids }] = reply.events[..] else {
         panic!("expected a login, got {:?}", reply.events);
     };
     assert_eq!(uuid, session.uuid);
+    assert_eq!(ids, &session.ids);
     assert!(!uuid.is_nil());
 }
 

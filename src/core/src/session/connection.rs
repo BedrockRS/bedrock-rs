@@ -220,8 +220,8 @@ impl Link<'_> {
             // A newer login for this player, or a plugin: this session ends.
             Control::Kick(notice) => Reply::disconnect(notice.reason, notice.message),
             Control::SetGameMode(mode) => session.set_game_mode(mode),
-            Control::SetOperator(operator) => {
-                let mut reply = session.operator_changed(operator);
+            Control::SetPermission(permission) => {
+                let mut reply = session.permission_changed(permission);
                 if in_world {
                     reply
                         .packets
@@ -277,10 +277,10 @@ impl Link<'_> {
                 let result = server.authenticator.verify(&token).await;
                 return Some(session.authenticated(result));
             }
-            SessionEvent::LoggedIn(uuid) => {
+            SessionEvent::LoggedIn { uuid, ids } => {
+                session.set_permission(server.permissions.of(&ids));
                 // Kicks this player's older session, if any.
-                self.login_claim = Some(server.logins.claim(uuid, self.controls.clone()));
-                session.set_operator(server.ops.contains(uuid));
+                self.login_claim = Some(server.logins.claim(uuid, ids, self.controls.clone()));
             }
             SessionEvent::Joined {
                 profile,

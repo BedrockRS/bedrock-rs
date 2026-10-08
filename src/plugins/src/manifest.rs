@@ -6,8 +6,12 @@
 //! plugins/
 //!   hello/
 //!     plugin.json
-//!     main.luau
+//!     main.luau          (or index.js)
 //! ```
+//!
+//! What runs a plugin follows from its `main`: Luau for a `.luau` script,
+//! JavaScript for a `.js` or `.mjs` module. Both engines are built into the
+//! server.
 //!
 //! ```json
 //! {
@@ -43,6 +47,39 @@ pub struct Manifest {
     pub main: String,
 }
 
+/// What runs a plugin, by the extension of its `main`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// A `.luau` script.
+    Luau,
+    /// A `.js` or `.mjs` ES module.
+    JavaScript,
+}
+
+impl Engine {
+    fn of(main: &Path) -> Option<Self> {
+        let extension = main.extension()?.to_str()?.to_ascii_lowercase();
+        Some(match extension.as_str() {
+            "luau" => Self::Luau,
+            "js" | "mjs" => Self::JavaScript,
+            _ => return None,
+        })
+    }
+
+    /// Whether a file in the plugin's folder is part of the plugin, so a
+    /// change to it reloads it.
+    fn is_source(self, path: &Path) -> bool {
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            return false;
+        };
+        let extension = extension.to_ascii_lowercase();
+        match self {
+            Self::Luau => matches!(extension.as_str(), "luau" | "lua"),
+            Self::JavaScript => matches!(extension.as_str(), "js" | "mjs" | "json"),
+        }
+    }
+}
+
 /// Why a plugin folder could not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -54,25 +91,33 @@ pub enum ManifestError {
     Invalid(String),
 }
 
-/// A plugin folder read from disk: its manifest, entry script, and the other
-/// scripts it may `require`, so a change to any of them reloads it.
+/// A plugin folder read from disk: its manifest, entry file, and the other
+/// files it is made of, so a change to any of them reloads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSource {
     pub manifest: Manifest,
-    /// Where the entry script is, for error messages.
+    pub engine: Engine,
+    /// Where the entry file is.
     pub main_path: PathBuf,
-    pub source: String,
-    /// Every `.luau` and `.lua` file in the folder and below, by path, with
-    /// its contents. Symbolic links are skipped.
-    pub modules: Vec<(PathBuf, String)>,
+    /// The entry file's contents.
+    pub source: Vec<u8>,
+    /// The plugin's files in the folder and below, by path, with their
+    /// contents: Luau scripts; JavaScript, TypeScript and JSON files; or the
+    /// WebAssembly module. Symbolic links, hidden folders (such as the
+    /// build's `.bedrockrs`) and `node_modules` are skipped.
+    pub files: Vec<(PathBuf, Vec<u8>)>,
 }
 
-/// Most scripts a plugin folder may hold, so a stray huge folder cannot make
+/// Most files a plugin folder may hold, so a stray huge folder cannot make
 /// every rescan read it all.
-const MAX_SCRIPTS: usize = 1024;
+const MAX_FILES: usize = 1024;
 
-/// Reads the scripts in `folder` and below into `scripts`.
-fn read_scripts(folder: &Path, scripts: &mut Vec<(PathBuf, String)>) -> Result<(), ManifestError> {
+/// Reads the plugin's files in `folder` and below into `files`.
+fn read_files(
+    folder: &Path,
+    engine: Engine,
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result<(), ManifestError> {
     let read_error = |path: &Path, source| ManifestError::Read {
         path: path.to_owned(),
         source,
@@ -84,20 +129,20 @@ fn read_scripts(folder: &Path, scripts: &mut Vec<(PathBuf, String)>) -> Result<(
         let kind = entry
             .file_type()
             .map_err(|source| read_error(&path, source))?;
+        let name = entry.file_name();
+        let hidden = name.to_string_lossy().starts_with('.');
         if kind.is_dir() {
-            read_scripts(&path, scripts)?;
-        } else if kind.is_file()
-            && path.extension().is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("luau") || extension.eq_ignore_ascii_case("lua")
-            })
-        {
-            if scripts.len() == MAX_SCRIPTS {
+            if !hidden && name != "node_modules" {
+                read_files(&path, engine, files)?;
+            }
+        } else if kind.is_file() && engine.is_source(&path) {
+            if files.len() == MAX_FILES {
                 return Err(ManifestError::Invalid(format!(
-                    "the plugin folder holds more than {MAX_SCRIPTS} scripts"
+                    "the plugin folder holds more than {MAX_FILES} files"
                 )));
             }
-            let source = fs::read_to_string(&path).map_err(|source| read_error(&path, source))?;
-            scripts.push((path, source));
+            let contents = fs::read(&path).map_err(|source| read_error(&path, source))?;
+            files.push((path, contents));
         }
     }
     Ok(())
@@ -108,6 +153,11 @@ impl Manifest {
         let manifest: Self = serde_json::from_str(json)?;
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// What runs the plugin.
+    pub fn engine(&self) -> Engine {
+        Engine::of(Path::new(&self.main)).expect("validated when parsed")
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
@@ -131,11 +181,21 @@ impl Manifest {
             return invalid("\"version\" is empty".into());
         }
         let main = Path::new(&self.main);
-        if !main
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("luau"))
-        {
-            return invalid(format!("\"main\" {:?} is not a .luau script", self.main));
+        if Engine::of(main).is_none() {
+            let typescript = main.extension().is_some_and(|extension| {
+                ["ts", "mts", "cts", "tsx"]
+                    .iter()
+                    .any(|typescript| extension.eq_ignore_ascii_case(typescript))
+            });
+            let hint = if typescript {
+                "; TypeScript runs once compiled to JavaScript"
+            } else {
+                ""
+            };
+            return invalid(format!(
+                "\"main\" {:?} must be a .luau script or a .js module{hint}",
+                self.main
+            ));
         }
         // The entry script must be inside the plugin's folder.
         if !main
@@ -167,19 +227,21 @@ impl PluginSource {
             }
         };
         let manifest = Manifest::parse(&json)?;
+        let engine = manifest.engine();
         let main_path = folder.join(&manifest.main);
-        let source = fs::read_to_string(&main_path).map_err(|source| ManifestError::Read {
+        let source = fs::read(&main_path).map_err(|source| ManifestError::Read {
             path: main_path.clone(),
             source,
         })?;
-        let mut modules = Vec::new();
-        read_scripts(folder, &mut modules)?;
-        modules.sort();
+        let mut files = Vec::new();
+        read_files(folder, engine, &mut files)?;
+        files.sort();
         Ok(Some(Self {
             manifest,
+            engine,
             main_path,
             source,
-            modules,
+            files,
         }))
     }
 }
@@ -213,6 +275,14 @@ mod tests {
             }
         );
         assert!(Manifest::parse(&manifest_json("hello", "src/main.luau")).is_ok());
+        for (main, engine) in [
+            ("main.luau", Engine::Luau),
+            ("index.js", Engine::JavaScript),
+            ("src/plugin.mjs", Engine::JavaScript),
+        ] {
+            let manifest = Manifest::parse(&manifest_json("hello", main)).unwrap();
+            assert_eq!(manifest.engine(), engine, "{main}");
+        }
     }
 
     #[test]
@@ -228,6 +298,9 @@ mod tests {
             ("", "main.luau"),
             ("two words", "main.luau"),
             ("hello", "main.lua"),
+            ("hello", "main.py"),
+            ("hello", "index.ts"),
+            ("hello", "plugin.wasm"),
             ("hello", "../other/main.luau"),
             ("hello", "/etc/main.luau"),
         ] {
@@ -261,7 +334,7 @@ mod tests {
         fs::write(folder.join("main.luau"), "print('hi')").unwrap();
         let plugin = PluginSource::read(&folder).unwrap().unwrap();
         assert_eq!(plugin.manifest.name, "hello");
-        assert_eq!(plugin.source, "print('hi')");
+        assert_eq!(plugin.source, b"print('hi')");
         fs::remove_dir_all(&folder).unwrap();
     }
 }

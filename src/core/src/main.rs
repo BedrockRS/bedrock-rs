@@ -19,10 +19,13 @@
 //!
 //! Commands typed into the console run with every permission, with or without
 //! their `/`: `op <player>` makes the first operator, and `stop` stops the
-//! server, as Ctrl+C does. Operators are kept in `ops.json`. In a terminal,
-//! commands are typed at a `> ` prompt below the log, with history.
+//! server, as Ctrl+C does. Operators (and any visitors or members set by hand)
+//! are kept in `permissions.json`, by PlayFab ID, as vanilla keeps them by
+//! XUID (see [`permissions`]). In a terminal, commands are typed at a `> `
+//! prompt below the log, with history.
 //!
 //! [`config`]: bedrockrs_core::config
+//! [`permissions`]: bedrockrs_core::permissions
 //! [`storage`]: bedrockrs_core::storage
 
 use std::io::{BufRead as _, IsTerminal as _};
@@ -38,7 +41,7 @@ use bedrockrs_core::commands::Sender;
 use bedrockrs_core::config::{LevelType, OLD_CONFIG_FILE, PROPERTIES_FILE, ServerProperties};
 use bedrockrs_core::console::{ConsoleFormat, ConsoleOutput, Prompt, PromptInput};
 use bedrockrs_core::game_rules::GameRules;
-use bedrockrs_core::ops::{OPS_FILE, Operators};
+use bedrockrs_core::permissions::{OLD_OPS_FILE, PERMISSIONS_FILE, Permissions};
 use bedrockrs_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use bedrockrs_core::session;
 use bedrockrs_core::tick::TickLoop;
@@ -80,6 +83,11 @@ async fn main() -> anyhow::Result<()> {
             "{OLD_CONFIG_FILE} is no longer read: settings are in {PROPERTIES_FILE} (log-level, log-chat and gamemode)"
         );
     }
+    if Path::new(OLD_OPS_FILE).exists() {
+        tracing::warn!(
+            "{OLD_OPS_FILE} is no longer read: operators are in {PERMISSIONS_FILE}, by PlayFab ID. Op them again with /op"
+        );
+    }
     if !properties.ignored.is_empty() {
         tracing::debug!(properties = ?properties.ignored, "ignoring properties BedrockRS does not use yet");
     }
@@ -118,14 +126,15 @@ async fn main() -> anyhow::Result<()> {
         );
         Authenticator::offline()
     };
-    let ops = Operators::open(Path::new(OPS_FILE))?;
+    let permissions =
+        Permissions::open(Path::new(PERMISSIONS_FILE))?.with_default(properties.default_permission);
     let game_rules = match world.level() {
         Some(level) => GameRules::of_level(Arc::clone(level), &world_directory),
         None => GameRules::in_memory(),
     };
     let server = Arc::new(
         Server::new(world, plugins.dispatcher(), authenticator)
-            .with_operators(ops)
+            .with_permissions(permissions)
             .with_default_game_mode(properties.default_game_mode)
             .with_game_rules(game_rules),
     );
@@ -177,7 +186,8 @@ async fn main() -> anyhow::Result<()> {
                         if line.success {
                             tracing::info!("{}", line.text);
                         } else {
-                            tracing::warn!("{}", line.text);
+                            // In red, as players see it.
+                            tracing::warn!("§c{}", line.text);
                         }
                     }
                 }
@@ -201,6 +211,9 @@ async fn main() -> anyhow::Result<()> {
     if ended.is_err() {
         tracing::debug!(sessions = sessions.len(), "sessions still open at shutdown");
     }
+    // Plugins hear everyone leave, then disable (and save what they keep)
+    // before the server says it stopped.
+    drop(plugins);
     tracing::info!("Server stopped");
     Ok(())
 }

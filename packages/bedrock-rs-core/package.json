@@ -1,0 +1,23 @@
+{
+  "name": "@bedrock-rs/core",
+  "version": "0.1.0",
+  "description": "Types for the BedrockRS plugin API, which the server provides to JavaScript plugins",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "sideEffects": true,
+  "keywords": ["bedrockrs", "minecraft", "bedrock", "plugin", "types"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BedrockRS/bedrock-rs.git",
+    "directory": "packages/bedrock-rs-core"
+  }
+}

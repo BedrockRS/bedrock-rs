@@ -1,0 +1,7 @@
+{
+  "name": "HelloJS",
+  "description": "Greets players and shows off the plugin API, in JavaScript",
+  "version": "2.0.0",
+  "author": "Mistvale Studios",
+  "main": "index.js"
+}

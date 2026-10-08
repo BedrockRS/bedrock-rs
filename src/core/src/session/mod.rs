@@ -57,6 +57,7 @@ use crate::game_mode::GameMode;
 use crate::game_rules;
 use crate::inventory::Inventory;
 use crate::items::items;
+use crate::permissions::{Permission, PlayerIds};
 use crate::players::{EYE_HEIGHT, Movement};
 use crate::storage::SavedPlayer;
 use crate::view::ChunkView;
@@ -139,6 +140,8 @@ pub struct Session {
     player: String,
     /// The player's persistent identity, known after login.
     uuid: Uuid,
+    /// What the player's login named them by, for their permission.
+    ids: PlayerIds,
     /// The runtime and unique ID of the player's entity.
     entity_id: u64,
     /// The chunks around the player and those the client already has.
@@ -165,8 +168,8 @@ pub struct Session {
     game_mode: GameMode,
     /// The game mode of new players, which the world reports as its own.
     default_game_mode: GameMode,
-    /// Whether the player may run operator commands.
-    operator: bool,
+    /// Whether the player is a visitor, member or operator.
+    permission: Permission,
     /// The player's `minecraft:health`; 0 while they are dead.
     health: Health,
     /// How far the player has fallen since they last stood on something.
@@ -192,6 +195,7 @@ impl Session {
             identity,
             player: String::from("<unknown>"),
             uuid: Uuid::nil(),
+            ids: PlayerIds::default(),
             entity_id,
             movement: Movement {
                 position: Vec3 {
@@ -214,7 +218,7 @@ impl Session {
             inventory_open: false,
             game_mode: default_game_mode,
             default_game_mode,
-            operator: false,
+            permission: Permission::Member,
             health: Health::PLAYER,
             fall_distance: 0.0,
             ticks: 0,

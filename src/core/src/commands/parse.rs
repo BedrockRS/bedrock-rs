@@ -92,7 +92,7 @@ pub fn match_line(
         path.push(name.clone());
         if !sender.may(sub.permission) {
             return Err(format!(
-                "You do not have permission to use /{} {}.",
+                "You do not have permission to use /{} {}",
                 spec.name,
                 path.join(" ")
             ));
@@ -162,8 +162,13 @@ fn match_args(
             }
             kind => {
                 rest = after;
-                parse_value(kind, &token.text, sender, find_player)
-                    .map_err(|problem| (args.len(), format!("{problem} ({})", describe(arg))))?
+                parse_value(kind, &token.text, sender, find_player).map_err(|problem| {
+                    let message = match problem {
+                        Problem::Malformed(problem) => format!("{problem} ({})", describe(arg)),
+                        Problem::NotOnline(message) => message,
+                    };
+                    (args.len(), message)
+                })?
             }
         };
         args.push((arg.name.clone(), value));
@@ -181,12 +186,33 @@ fn match_args(
     Ok(args)
 }
 
+/// Why an argument's text is not a value.
+enum Problem {
+    /// It is not written as one; said with the argument's usage, so it is
+    /// clear which argument is wrong.
+    Malformed(String),
+    /// It names a player who is not online, which says all there is to say.
+    NotOnline(String),
+}
+
 fn parse_value(
     kind: &ArgKind,
     text: &str,
     sender: &Sender,
     find_player: &dyn Fn(&str) -> Option<Player>,
-) -> Result<ArgValue, String> {
+) -> Result<ArgValue, Problem> {
+    if let ArgKind::Player = kind
+        && !text.starts_with('@')
+    {
+        return find_player(text)
+            .map(ArgValue::Player)
+            .ok_or_else(|| Problem::NotOnline(format!("No player named \"{text}\" is online")));
+    }
+    value_of(kind, text, sender).map_err(Problem::Malformed)
+}
+
+/// The value of an argument whose text is not a player's name.
+fn value_of(kind: &ArgKind, text: &str, sender: &Sender) -> Result<ArgValue, String> {
     match kind {
         ArgKind::String | ArgKind::Text => Ok(ArgValue::String(text.to_owned())),
         ArgKind::Int => text
@@ -211,14 +237,9 @@ fn parse_value(
                     Sender::Console => Err("the console is not a player".to_owned()),
                 };
             }
-            if text.starts_with('@') {
-                return Err(format!(
-                    "the selector {text} is not supported yet; use a player's name or @s"
-                ));
-            }
-            find_player(text)
-                .map(ArgValue::Player)
-                .ok_or_else(|| format!("no player named \"{text}\" is online"))
+            Err(format!(
+                "the selector {text} is not supported yet; use a player's name or @s"
+            ))
         }
         ArgKind::Enum { values, .. } => values
             .iter()
@@ -428,7 +449,7 @@ mod tests {
         );
         assert_eq!(
             error("warp give bob 1"),
-            "no player named \"bob\" is online (<player: target>)"
+            "No player named \"bob\" is online"
         );
         assert_eq!(
             error("warp give alex 1 hardcore"),
@@ -454,7 +475,7 @@ mod tests {
     fn groups_need_a_subcommand_and_check_permissions() {
         assert_eq!(
             run("warp admin reload", &steve(false)).unwrap_err(),
-            "You do not have permission to use /warp admin."
+            "You do not have permission to use /warp admin"
         );
         assert_eq!(
             run("warp admin", &steve(true)).unwrap_err(),
@@ -505,7 +526,7 @@ mod tests {
         // Neither matches: the overload that got furthest explains.
         assert_eq!(
             run("gamemode creative bob").unwrap_err(),
-            "no player named \"bob\" is online ([player: target])"
+            "No player named \"bob\" is online"
         );
         assert!(
             run("gamemode sp")

@@ -1,45 +1,55 @@
-//! Polyglot plugin engine for BedrockRS.
+//! The BedrockRS plugin engine: Luau and JavaScript plugins side by side,
+//! with one API and one lifecycle.
 //!
-//! Loads plugins from their own folders in the `plugins/` directory, each
-//! described by a `plugin.json` [`Manifest`], and reloads them when they
-//! change, with no build step. Each scripting engine runs on its
-//! own thread with one isolated VM per plugin and talks to the game loop only
-//! through messages.
+//! Each plugin lives in its own folder in `plugins/`, described by a
+//! `plugin.json` [`Manifest`] whose `main` decides what runs it. Both engines
+//! are built into the server, so a plugin runs from its source with nothing
+//! to install or compile:
 //!
-//! Engines are selected with cargo features:
-//! - `luau` (default): Luau via `mlua`
-//! - `js`: JavaScript/TypeScript via `deno_core` (TypeScript is transpiled on load)
-//! - `python`: Python via RustPython
+//! - a `.luau` script runs in a sandboxed Luau VM (`luau`);
+//! - a `.js` or `.mjs` module runs in its own QuickJS runtime (`javascript`).
 //!
-//! Only the Luau engine exists so far; [`PluginHost`] runs Luau plugins.
-//! Plugins listen for game [`Event`]s with `server.on(name, handler)`, may
-//! cancel some (`player_join`, `player_quit`, `player_chat`, `player_damage`),
-//! and ask the server for
-//! [`Action`]s such as
-//! `server.broadcast(message)`, or, on a player from an event,
-//! `player.send_message(message)` and `player.kick(reason)`. Plugins add
-//! slash commands, with subcommands and typed arguments, with
-//! `server.command(definition)`; see [`command`] for how they are described.
+//! Either way the plugin is a [`Plugin`] with exactly three lifecycle
+//! functions, `on_load`, `on_enable` and `on_disable` (see [`plugin`]), and
+//! uses the same API, imported from `@bedrock-rs/core`:
+//!
+//! - `Logger`: `trace`, `debug`, `info`, `warn`, `error`;
+//! - `Server`: `on(event, handler)` for game [`Event`]s, some cancellable;
+//!   `broadcast`, `getPlayer`, `getPlayers`, `registerCommand` (only in
+//!   `on_load`; see [`definition`]) and `getWorld()`;
+//! - `Player`: `sendMessage`, `kick`, `setGameMode`, `setHealth`, `damage`;
+//! - `World`, from `Server.getWorld()`: the scheduler, `run`, `runTimeout`,
+//!   `runInterval`, `clearRun` and `waitTicks` (see [`scheduler`]), in place
+//!   of a per-tick hook.
+//!
+//! Each engine binds the API as native functions; the checks and rules
+//! behind them live once, in `state`, for both.
+//! Plugins run on one thread, talk to the game only through messages, and
+//! reload when their files change.
 
 mod api;
 pub mod command;
-#[cfg(feature = "luau")]
+pub mod definition;
 mod host;
-#[cfg(feature = "luau")]
+mod javascript;
+mod javascript_modules;
 mod luau;
-#[cfg(feature = "luau")]
-mod luau_commands;
-#[cfg(feature = "luau")]
 mod luau_require;
+mod manager;
 mod manifest;
 mod output;
+pub mod plugin;
+pub mod scheduler;
+mod state;
+pub mod wire;
 
 pub use api::{Action, BlockChange, DAMAGE_CAUSES, Damage, Event, Player, Position};
 pub use command::{
     ArgKind, ArgSpec, ArgValue, CommandCall, CommandNode, CommandReply, CommandSender, CommandSpec,
     GAME_MODE_VALUES, Permission, PluginCommand, ReplyLine,
 };
-#[cfg(feature = "luau")]
-pub use host::{Dispatcher, PluginConfig, PluginError, PluginHost};
-pub use manifest::{MANIFEST_FILE, Manifest, ManifestError, PluginSource};
+pub use host::{Dispatcher, HostError, PluginConfig, PluginHost};
+pub use manifest::{Engine, MANIFEST_FILE, Manifest, ManifestError, PluginSource};
 pub use output::{Output, PLUGIN_FIELD, PLUGIN_TARGET, tracing_output};
+pub use plugin::{Plugin, PluginError};
+pub use state::{Phase, TOP_LEVEL};

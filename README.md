@@ -14,7 +14,7 @@
 
 # ℹ️ Information
 
-BedrockRS is a high-performance Minecraft: Bedrock Edition dedicated server written in safe Rust. It speaks the modern **NetherNet** (WebRTC) transport and has a sandboxed, hot-reloading **Luau** plugin environment: plugins are plain script files, with no build step.
+BedrockRS is a high-performance Minecraft: Bedrock Edition dedicated server written in safe Rust. It speaks the modern **NetherNet** (WebRTC) transport and has a sandboxed, hot-reloading plugin environment: plugins are written in **Luau** or **JavaScript**, against one API. Both engines are built into the server, so a plugin is just its source files: nothing to install, nothing to build.
 
 > [!IMPORTANT]
 > BedrockRS is not affiliated with Mojang or Microsoft.
@@ -24,7 +24,7 @@ BedrockRS is a high-performance Minecraft: Bedrock Edition dedicated server writ
 | Target | Minecraft Bedrock Edition **26.51**, network protocol **2193** |
 | Transport | **NetherNet only** (WebRTC). RakNet is not implemented. |
 | Language | Rust, edition 2024, MSRV 1.93, `unsafe_code = "forbid"`, tokio |
-| Plugins | Zero-build, hot-reloaded scripts: Luau (JS/TS and Python planned) |
+| Plugins | Hot-reloaded, with one API: Luau and JavaScript, both embedded |
 
 ## 🚧 Current status
 
@@ -77,13 +77,15 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 
 - [x] Luau sandbox with hot reload
 - [x] `plugin.json` manifests
+- [x] `on_load` / `on_enable` / `on_disable` lifecycle, the same in every engine
+- [x] JavaScript engine (QuickJS, embedded) beside Luau, with ES modules and `async`/`await`
 - [x] Events: `player_join`, `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`, `player_damage` (cancellable), `player_death`, `player_respawn`
-- [x] Player methods: `send_message`, `set_game_mode`, `set_health`, `damage`, `kick`; `server.broadcast`, `server.player(uuid)`
+- [x] `Logger`, `Server` (`broadcast`, `getPlayer`, `getPlayers`, `on`, `registerCommand`) and `Player` (`sendMessage`, `kick`, `setGameMode`, `setHealth`, `damage`)
+- [x] Scheduler: `run`, `runTimeout`, `runInterval`, `clearRun`, `waitTicks`
 - [x] Slash commands with nested subcommands, typed arguments, aliases and permissions
 - [ ] `player.give` and item events
 - [ ] Cancellable block events
-- [ ] JavaScript/TypeScript engine
-- [ ] Python engine
+- [ ] Storage API
 
 ### Milestone 6: Survival 🟡
 
@@ -102,7 +104,7 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 ### Milestone 7: Production ready ⬜
 
 - [x] Slash commands for players and the server console
-- [x] Operators (`/op`, `/deop`, `ops.json`)
+- [x] Permissions as vanilla's `permissions.json` (operator, member, visitor), by PlayFab ID; `/op`, `/deop`
 - [ ] Movement validation (speed, teleport and breaking-time checks)
 - [ ] Advertised public addresses for NAT'd deployments
 - [x] Vanilla world import (LevelDB)
@@ -120,13 +122,15 @@ bedrock-rs/
 │   ├── net/              # bedrockrs_net: NetherNet signaling and WebRTC transport
 │   ├── plugins/          # bedrockrs_plugins: sandboxed, hot-reloading plugin engine
 │   └── protocol/         # bedrockrs_protocol: packet codec, batching and NBT
-├── server/               # where the server runs
+├── server/               # where the server runs; only the start scripts and README are tracked
 │   ├── server.properties # configuration, vanilla's format (created on first run)
-│   ├── ops.json          # operators (created by the first /op)
-│   ├── plugins/          # plugins, one folder each
-│   ├── worlds/           # saved worlds
+│   ├── permissions.json  # operators, members and visitors, by PlayFab ID (created on first run)
+│   ├── plugins/          # plugins, one folder each (created on first run)
+│   ├── worlds/           # saved worlds (created on first run)
 │   └── keys/             # server identity key (created on first run)
 ├── docs/                 # architecture and design notes
+├── examples/plugins/     # the same plugin in Luau and in JavaScript
+├── packages/             # @bedrock-rs/core, the npm package of the JavaScript API
 └── tools/                # scripts that generate the vanilla data in src/core/data
 ```
 
@@ -189,11 +193,11 @@ Network settings can be overridden with environment variables:
 
 ## 🧩 Plugins
 
-Each plugin is a folder in `server/plugins/` with a `plugin.json` and an entry script. Saving a file reloads the plugin while the server runs.
+Each plugin is a folder in `server/plugins/` with a `plugin.json` and an entry file. Saving any file in the folder reloads the plugin while the server runs.
 
 ```json
 {
-  "name": "hello",
+  "name": "Welcome",
   "description": "Welcomes players",
   "version": "1.0.0",
   "author": "Mistvale Studios",
@@ -201,57 +205,92 @@ Each plugin is a folder in `server/plugins/` with a `plugin.json` and an entry s
 }
 ```
 
-```lua
--- Replace vanilla's "joined the game" message with your own.
-server.on("player_join", function(event)
-	event.cancel()
-	server.broadcast(`§a+ {event.player.name}`)
-end)
+`main` picks the engine:
+
+| `main` | Engine |
+|---|---|
+| `.luau` | Luau, run in a sandbox. Nothing to install. |
+| `.js`, `.mjs` | A JavaScript ES module, run by the server's built-in engine (QuickJS). Nothing to install. It can import its own files by relative path; editors get the API's types from the [`@bedrock-rs/core`](packages/bedrock-rs-core) package. |
+
+Both engines have the same API, `@bedrock-rs/core`, and the same lifecycle. A plugin can export three functions, all optional:
+
+- `on_load`: register commands (only here) and set up;
+- `on_enable`: the plugin is live; events reach it and scheduled tasks run;
+- `on_disable`: before it is unloaded, reloaded, or the server stops: tidy up and save.
+
+There is no per-tick hook: the world's scheduler (`run`, `runTimeout`, `runInterval`, `clearRun`, `waitTicks`) runs code over time. The top level of the script is for plain setup; the API opens with `on_load`.
+
+```js
+// index.js
+import { Server } from "@bedrock-rs/core";
+
+export function on_enable() {
+  // Replace vanilla's "joined the game" message with your own.
+  Server.on("player_join", (event) => {
+    event.cancel();
+    Server.broadcast(`§a+ ${event.player.name}`);
+  });
+}
 ```
+
+```lua
+-- main.luau
+local Server = require("@bedrock-rs/core").Server
+
+return {
+	on_enable = function()
+		-- Replace vanilla's "joined the game" message with your own.
+		Server.on("player_join", function(event)
+			event.cancel()
+			Server.broadcast(`§a+ {event.player.name}`)
+		end)
+	end,
+}
+```
+
+Luau calls methods with `:` (`player:sendMessage(...)`, `world:runInterval(...)`); otherwise the two read line for line alike.
 
 ### Slash commands
 
 Plugins add real slash commands, with subcommands nested as deep as you like. Players get them in `/help` and autocompleted as they type, and the server checks every argument before your code runs:
 
-```lua
-server.command({
-	name = "warp",
-	description = "Travel between warps",
-	aliases = { "w" },
-	-- /warp <name>
-	args = { { name = "name", type = "string" } },
-	run = function(ctx)
-		ctx.reply(`Warping to {ctx.args.name}...`)
-	end,
-	subcommands = {
-		-- /warp set <name> [public]
-		set = {
-			description = "Make a warp where you stand",
-			args = {
-				{ name = "name", type = "string" },
-				{ name = "public", type = "bool", optional = true },
-			},
-			run = function(ctx)
-				if not ctx.sender then
-					return ctx.error("Only players can set warps.")
-				end
-				ctx.reply(`Set warp {ctx.args.name}.`)
-			end,
-		},
-		-- /warp admin reload, for operators only
-		admin = {
-			permission = "operator",
-			subcommands = {
-				reload = { run = function(ctx) return "Warps reloaded." end },
-			},
-		},
-	},
-})
+```js
+export function on_load() {
+  Server.registerCommand({
+    name: "warp",
+    description: "Travel between warps",
+    aliases: ["w"],
+    // /warp <name>
+    args: [{ name: "name", type: "string" }],
+    run: (ctx) => ctx.reply(`Warping to ${ctx.args.name}...`),
+    subcommands: {
+      // /warp set <name> [public]
+      set: {
+        description: "Make a warp where you stand",
+        args: [
+          { name: "name", type: "string" },
+          { name: "public", type: "bool", optional: true },
+        ],
+        run: (ctx) => {
+          if (!ctx.sender) return ctx.error("Only players can set warps.");
+          ctx.reply(`Set warp ${ctx.args.name}.`);
+        },
+      },
+      // /warp admin reload, for operators only
+      admin: {
+        permission: "operator",
+        subcommands: {
+          reload: { run: () => "Warps reloaded." },
+        },
+      },
+    },
+  });
+}
 ```
 
-Argument types are `string`, `text` (the rest of the line), `int`, `number`, `bool`, `player`, `gamemode` and `enum` (with `values = { ... }`). Commands follow hot reload like everything else.
+Argument types are `string`, `text` (the rest of the line), `int`, `number`, `bool`, `player`, `gamemode` and `enum` (with `values`). Commands follow hot reload like everything else.
 
-See [server/plugins/hello](server/plugins/hello) for a fuller example.
+See [examples/plugins](examples/plugins) for a fuller plugin, written once in Luau and once in JavaScript.
 
 ## 🧱 Project goals
 

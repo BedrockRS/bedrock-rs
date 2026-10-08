@@ -76,6 +76,7 @@ impl Session {
             && !self.sneaking
             && !self.is_dead()
             && self.game_mode != GameMode::Spectator
+            && self.permission.may_build()
             && self.within_reach(clicked)
         {
             return Reply {
@@ -434,14 +435,18 @@ impl Session {
     }
 
     /// Checks that the player may break the block at `pos`: their game mode
-    /// lets them build, and it is inside the world's height, within reach,
-    /// and in a chunk their client has.
+    /// and permission let them build, and it is inside the world's height,
+    /// within reach, and in a chunk their client has.
     pub(super) fn break_block(&self, pos: BlockPos) -> Option<SessionEvent> {
         if self.is_dead() {
             return None;
         }
         if !self.game_mode.may_build() {
             tracing::debug!(player = %self.player, ?pos, mode = self.game_mode.name(), "refusing to change a block in this game mode");
+            return None;
+        }
+        if !self.permission.may_build() {
+            tracing::debug!(player = %self.player, ?pos, "refusing to let a visitor change a block");
             return None;
         }
         if !self.within_reach(pos) {

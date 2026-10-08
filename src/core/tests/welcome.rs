@@ -1,4 +1,4 @@
-//! The sample plugin, end to end: it must leave vanilla's join message alone
+//! The sample plugin (examples/plugins/hello-luau), end to end: it must leave vanilla's join message alone
 //! and greet a joining player privately exactly once, and answer its slash
 //! command, subcommands included, through the plugin host.
 
@@ -27,7 +27,7 @@ fn sample_plugin_server(test: &str) -> (Arc<Server>, PluginHost, PathBuf) {
     std::fs::create_dir_all(&hello).unwrap();
     for file in ["plugin.json", "main.luau"] {
         std::fs::copy(
-            format!("../../server/plugins/hello/{file}"),
+            format!("../../examples/plugins/hello-luau/{file}"),
             hello.join(file),
         )
         .unwrap();
@@ -136,13 +136,13 @@ async fn the_sample_plugin_answers_its_command() {
         lines(server.run_command(&Sender::Console, "/hi").await),
         [(
             true,
-            "Hello! Try /hello wave, /hello to <player> or /hello kickme.".to_owned()
+            "Hello! Try /hello wave, /hello to <player> or /hello kickme".to_owned()
         )],
         "the alias runs the command"
     );
     assert_eq!(
         lines(server.run_command(&Sender::Console, "hello kickme").await),
-        [(false, "Only players can be kicked.".to_owned())]
+        [(false, "Only players can be kicked".to_owned())]
     );
     assert_eq!(
         lines(
@@ -150,10 +150,7 @@ async fn the_sample_plugin_answers_its_command() {
                 .run_command(&Sender::Console, "hello to Nobody")
                 .await
         ),
-        [(
-            false,
-            "no player named \"Nobody\" is online (<player: target>)".to_owned()
-        )],
+        [(false, "No player named \"Nobody\" is online".to_owned())],
         "arguments are checked before the plugin hears of the command"
     );
     assert_eq!(
@@ -165,7 +162,7 @@ async fn the_sample_plugin_answers_its_command() {
                 )
                 .await
         ),
-        [(true, "Announced.".to_owned())]
+        [(true, "Announced".to_owned())]
     );
     drop(plugins);
     let _ = std::fs::remove_dir_all(&directory);

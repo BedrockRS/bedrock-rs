@@ -1,7 +1,8 @@
 //! One session per player: a verified login with a UUID that is already
 //! connected kicks the older session, as vanilla does. The rest of the server
 //! reaches a player's session through the same registry, to kick them or
-//! change their game mode or operator status.
+//! change their game mode or permission, and finds the IDs their login
+//! carried (for `permissions.json`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use uuid::Uuid;
 use crate::damage::DamageCause;
 use crate::game_mode::GameMode;
 use crate::game_rules;
+use crate::permissions::{Permission, PlayerIds};
 
 /// Why a session must disconnect its player, and what the player is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,8 +30,9 @@ pub enum Control {
     /// Disconnect the player.
     Kick(KickNotice),
     SetGameMode(GameMode),
-    /// The player became an operator, or stopped being one.
-    SetOperator(bool),
+    /// The player's permission changed: they became an operator, or
+    /// stopped being one.
+    SetPermission(Permission),
     /// The commands players may use changed; send the player theirs.
     RefreshCommands,
     /// Set the player's health; 0 kills them.
@@ -59,7 +62,17 @@ pub const SERVER_CLOSED: &str = "Server closed";
 #[derive(Debug, Default)]
 pub struct Logins {
     last_id: AtomicU64,
-    active: Mutex<HashMap<Uuid, (u64, Controls)>>,
+    active: Mutex<HashMap<Uuid, Active>>,
+}
+
+/// A logged-in session.
+#[derive(Debug, Clone)]
+struct Active {
+    /// Tells a newer session's claim from an older one's.
+    id: u64,
+    controls: Controls,
+    /// What the player's verified login named them by.
+    ids: PlayerIds,
 }
 
 impl Logins {
@@ -67,13 +80,15 @@ impl Logins {
         Self::default()
     }
 
-    /// Records the session logged in as `uuid`, kicking any older session
-    /// logged in as the same player. The claim lasts until it is dropped.
-    pub fn claim(&self, uuid: Uuid, controls: Controls) -> LoginClaim<'_> {
+    /// Records the session logged in as `uuid`, with the IDs its login
+    /// carried, kicking any older session logged in as the same player. The
+    /// claim lasts until it is dropped.
+    pub fn claim(&self, uuid: Uuid, ids: PlayerIds, controls: Controls) -> LoginClaim<'_> {
         let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some((_, older)) = self.active().insert(uuid, (id, controls)) {
+        let active = Active { id, controls, ids };
+        if let Some(older) = self.active().insert(uuid, active) {
             tracing::debug!(%uuid, "the player logged in again; kicking the older session");
-            let _ = older.try_send(Control::Kick(KickNotice {
+            let _ = older.controls.try_send(Control::Kick(KickNotice {
                 reason: DisconnectReason::LOGGED_IN_OTHER_LOCATION,
                 message: LOGGED_IN_ELSEWHERE.to_owned(),
             }));
@@ -87,6 +102,11 @@ impl Logins {
 
     pub fn is_logged_in(&self, uuid: Uuid) -> bool {
         self.active().contains_key(&uuid)
+    }
+
+    /// The IDs the login of the player logged in as `uuid` carried.
+    pub fn ids(&self, uuid: Uuid) -> Option<PlayerIds> {
+        self.active().get(&uuid).map(|active| active.ids.clone())
     }
 
     /// Disconnects the player logged in as `uuid`, showing them `message`.
@@ -112,7 +132,11 @@ impl Logins {
     /// Tells the session logged in as `uuid` to do something. Returns whether
     /// there is such a session.
     pub fn send(&self, uuid: Uuid, control: Control) -> bool {
-        let Some((_, controls)) = self.active().get(&uuid).cloned() else {
+        let Some(controls) = self
+            .active()
+            .get(&uuid)
+            .map(|active| active.controls.clone())
+        else {
             return false;
         };
         if controls.try_send(control).is_err() {
@@ -126,14 +150,14 @@ impl Logins {
         let sessions: Vec<Controls> = self
             .active()
             .values()
-            .map(|(_, controls)| controls.clone())
+            .map(|active| active.controls.clone())
             .collect();
         for controls in sessions {
             let _ = controls.try_send(control.clone());
         }
     }
 
-    fn active(&self) -> MutexGuard<'_, HashMap<Uuid, (u64, Controls)>> {
+    fn active(&self) -> MutexGuard<'_, HashMap<Uuid, Active>> {
         self.active.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -151,7 +175,10 @@ pub struct LoginClaim<'a> {
 impl Drop for LoginClaim<'_> {
     fn drop(&mut self) {
         let mut active = self.logins.active();
-        if active.get(&self.uuid).is_some_and(|(id, _)| *id == self.id) {
+        if active
+            .get(&self.uuid)
+            .is_some_and(|active| active.id == self.id)
+        {
             active.remove(&self.uuid);
         }
     }
@@ -168,9 +195,9 @@ mod tests {
         let (first_kick, mut first) = mpsc::channel(1);
         let (second_kick, mut second) = mpsc::channel(1);
 
-        let first_claim = logins.claim(uuid, first_kick);
+        let first_claim = logins.claim(uuid, PlayerIds::default(), first_kick);
         assert!(first.try_recv().is_err());
-        let second_claim = logins.claim(uuid, second_kick);
+        let second_claim = logins.claim(uuid, PlayerIds::default(), second_kick);
         let Control::Kick(notice) = first.try_recv().unwrap() else {
             panic!("expected a kick");
         };
@@ -192,7 +219,7 @@ mod tests {
         assert!(!logins.kick(uuid, "bye".into()), "not logged in");
 
         let (kick, mut kicks) = mpsc::channel(1);
-        let _claim = logins.claim(uuid, kick);
+        let _claim = logins.claim(uuid, PlayerIds::default(), kick);
         assert!(logins.kick(uuid, "bye".into()));
         assert_eq!(
             kicks.try_recv().unwrap(),
@@ -208,8 +235,8 @@ mod tests {
         let logins = Logins::new();
         let (first, mut first_controls) = mpsc::channel(1);
         let (second, mut second_controls) = mpsc::channel(1);
-        let _first = logins.claim(Uuid::new_v4(), first);
-        let _second = logins.claim(Uuid::new_v4(), second);
+        let _first = logins.claim(Uuid::new_v4(), PlayerIds::default(), first);
+        let _second = logins.claim(Uuid::new_v4(), PlayerIds::default(), second);
         logins.close_all();
         let closed = Control::Kick(KickNotice {
             reason: DisconnectReason::SHUTDOWN,
@@ -224,11 +251,17 @@ mod tests {
         let logins = Logins::new();
         let uuid = Uuid::new_v4();
         assert!(
-            !logins.send(uuid, Control::SetOperator(true)),
+            !logins.send(uuid, Control::SetPermission(Permission::Operator)),
             "not logged in"
         );
+        assert_eq!(logins.ids(uuid), None);
         let (controls, mut received) = mpsc::channel(CONTROL_QUEUE);
-        let _claim = logins.claim(uuid, controls);
+        let ids = PlayerIds {
+            pfid: Some("4A1B2C3D5E6F7A8B".into()),
+            xuid: None,
+        };
+        let _claim = logins.claim(uuid, ids.clone(), controls);
+        assert_eq!(logins.ids(uuid), Some(ids));
         assert!(logins.send(uuid, Control::SetGameMode(GameMode::Survival)));
         logins.send_all(&Control::RefreshCommands);
         assert_eq!(
@@ -242,8 +275,8 @@ mod tests {
     fn different_players_do_not_kick_each_other() {
         let logins = Logins::new();
         let (kick, mut kicks) = mpsc::channel(1);
-        let _steve = logins.claim(Uuid::new_v4(), kick.clone());
-        let _alex = logins.claim(Uuid::new_v4(), kick);
+        let _steve = logins.claim(Uuid::new_v4(), PlayerIds::default(), kick.clone());
+        let _alex = logins.claim(Uuid::new_v4(), PlayerIds::default(), kick);
         assert!(kicks.try_recv().is_err());
     }
 }

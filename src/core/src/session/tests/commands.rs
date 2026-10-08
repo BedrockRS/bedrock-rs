@@ -209,7 +209,7 @@ fn slash_commands_are_passed_on_and_answered() {
         panic!("a player sends commands");
     };
     assert!(!sender.operator);
-    let reply = session.operator_changed(true);
+    let reply = session.permission_changed(Permission::Operator);
     assert_eq!(ids(&reply), [id::UPDATE_ABILITIES, id::TEXT]);
     let Sender::Player(sender) = session.command_sender() else {
         panic!("a player sends commands");

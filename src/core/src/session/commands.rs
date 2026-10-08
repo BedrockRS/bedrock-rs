@@ -1,4 +1,4 @@
-//! Chat, slash commands, game modes and operator status.
+//! Chat, slash commands, game modes and permissions.
 
 use bedrockrs_plugins::CommandReply;
 use bedrockrs_protocol::packet::Encode;
@@ -8,14 +8,15 @@ use bedrockrs_protocol::packets::{
 
 use crate::commands::{PlayerSender, Sender};
 use crate::game_mode::GameMode;
+use crate::permissions::Permission;
 
 use super::{MAX_CHAT_LENGTH, Reply, Session, SessionEvent};
 
 impl Session {
-    /// Whether the player is an operator; set from the operator list at
-    /// login, before they spawn.
-    pub fn set_operator(&mut self, operator: bool) {
-        self.operator = operator;
+    /// The player's permission, from `permissions.json` at login, before
+    /// they spawn.
+    pub fn set_permission(&mut self, permission: Permission) {
+        self.permission = permission;
     }
 
     /// The player, as someone running commands.
@@ -23,7 +24,7 @@ impl Session {
         Sender::Player(PlayerSender {
             uuid: self.uuid,
             name: self.player.clone(),
-            operator: self.operator,
+            operator: self.permission.is_operator(),
         })
     }
 
@@ -55,17 +56,19 @@ impl Session {
         }
     }
 
-    /// The player became an operator or stopped being one: their client is
-    /// told their new permissions, and they are told in chat.
-    pub fn operator_changed(&mut self, operator: bool) -> Reply {
-        self.operator = operator;
+    /// The player's permission changed (they became an operator or stopped
+    /// being one): their client is told what they may do now, and they are
+    /// told in chat.
+    pub fn permission_changed(&mut self, permission: Permission) -> Reply {
+        let was_operator = self.permission.is_operator();
+        self.permission = permission;
         if !self.stage.in_world() {
             return Reply::default();
         }
-        let message = if operator {
-            "§eYou are now an operator."
-        } else {
-            "§eYou are no longer an operator."
+        let message = match (was_operator, permission.is_operator()) {
+            (false, true) => "§eYou are now an operator".to_owned(),
+            (true, false) => "§eYou are no longer an operator".to_owned(),
+            _ => format!("§eYour permission level is now {}", permission.name()),
         };
         Reply::send(vec![
             self.own_abilities().encode(),

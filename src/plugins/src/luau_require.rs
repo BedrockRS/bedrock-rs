@@ -7,6 +7,10 @@
 //! to the requiring module itself. Configuration files (`.luaurc`) and their
 //! aliases are not read: they could point anywhere on disk.
 //!
+//! One alias is built in: `require("@bedrock-rs/core")` is the plugin API
+//! (`Logger`, `Server`, `Player`, `World`), as JavaScript plugins import it
+//! from `@bedrock-rs/core`.
+//!
 //! Files are checked by where they really are, after following symbolic
 //! links, so a link inside the folder cannot reach outside it. A module runs
 //! once per VM; requiring it again returns what it returned the first time.
@@ -21,6 +25,19 @@ use mlua::{Function, Lua};
 /// File extensions a module may have, in the order tried.
 const EXTENSIONS: [&str; 2] = ["luau", "lua"];
 
+/// The built-in alias, `@bedrock-rs`, and its one module.
+const ALIAS: &str = "bedrock-rs";
+const CORE_MODULE: &str = "core";
+
+/// Where in the built-in alias the requirer points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Builtin {
+    /// `@bedrock-rs` itself.
+    Alias,
+    /// `@bedrock-rs/core`.
+    Core,
+}
+
 /// Finds and loads modules for one plugin.
 #[derive(Debug)]
 pub(crate) struct PluginRequirer {
@@ -32,6 +49,8 @@ pub(crate) struct PluginRequirer {
     module: Vec<String>,
     /// The file the current module is, if it is one.
     file: Option<PathBuf>,
+    /// Set while pointing inside `@bedrock-rs`, rather than the folder.
+    builtin: Option<Builtin>,
 }
 
 impl PluginRequirer {
@@ -42,6 +61,7 @@ impl PluginRequirer {
             root: fs::canonicalize(folder).ok(),
             module: Vec::new(),
             file: None,
+            builtin: None,
         }
     }
 
@@ -56,6 +76,7 @@ impl PluginRequirer {
         let file = self.resolve(&module)?;
         self.module = module;
         self.file = file;
+        self.builtin = None;
         Ok(())
     }
 
@@ -158,6 +179,7 @@ impl Require for PluginRequirer {
         // The requiring script already runs; only where it is matters.
         self.file = self.resolve(&module).ok().flatten();
         self.module = module;
+        self.builtin = None;
         Ok(())
     }
 
@@ -165,8 +187,21 @@ impl Require for PluginRequirer {
         Err(NavigateError::NotFound)
     }
 
+    /// `@bedrock-rs`, the built-in alias; others are unknown.
+    fn to_alias_override(&mut self, alias: &str) -> Result<(), NavigateError> {
+        if !alias.eq_ignore_ascii_case(ALIAS) {
+            return Err(NavigateError::NotFound);
+        }
+        self.builtin = Some(Builtin::Alias);
+        self.file = None;
+        Ok(())
+    }
+
     /// Up a folder, but not above the plugin's.
     fn to_parent(&mut self) -> Result<(), NavigateError> {
+        if self.builtin.is_some() {
+            return Err(NavigateError::NotFound);
+        }
         let mut module = self.module.clone();
         if module.pop().is_none() {
             return Err(NavigateError::NotFound);
@@ -175,6 +210,14 @@ impl Require for PluginRequirer {
     }
 
     fn to_child(&mut self, name: &str) -> Result<(), NavigateError> {
+        match self.builtin {
+            Some(Builtin::Alias) if name == CORE_MODULE => {
+                self.builtin = Some(Builtin::Core);
+                return Ok(());
+            }
+            Some(_) => return Err(NavigateError::NotFound),
+            None => {}
+        }
         let plain =
             !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':']);
         if !plain {
@@ -186,10 +229,13 @@ impl Require for PluginRequirer {
     }
 
     fn has_module(&self) -> bool {
-        self.file.is_some()
+        self.builtin == Some(Builtin::Core) || self.file.is_some()
     }
 
     fn cache_key(&self) -> String {
+        if self.builtin == Some(Builtin::Core) {
+            return format!("@{ALIAS}/{CORE_MODULE}");
+        }
         self.file
             .as_deref()
             .map(|file| file.display().to_string())
@@ -205,6 +251,10 @@ impl Require for PluginRequirer {
     }
 
     fn loader(&self, lua: &Lua) -> mlua::Result<Function> {
+        if self.builtin == Some(Builtin::Core) {
+            let core: mlua::Table = lua.named_registry_value(crate::luau::CORE)?;
+            return lua.create_function(move |_, ()| Ok(core.clone()));
+        }
         let file = self
             .file
             .as_deref()
@@ -231,7 +281,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::luau::{Limits, LuauEngine};
+    use crate::luau::LuauPlugin;
+    use crate::plugin::{Limits, PluginError};
+    use crate::state::{self, Phase, PluginState, Shared};
 
     /// A plugin folder `plugins/req` holding `files`, next to a folder the
     /// plugin must not reach, `outside/secret.luau`. Returns the directory
@@ -252,8 +304,9 @@ mod tests {
         base
     }
 
-    /// Runs `main` as the plugin in `base`, returning what it printed.
-    fn run(base: &Path, main: &str) -> (mlua::Result<bool>, Vec<String>) {
+    /// Runs `main` as the plugin in `base`, returning what it printed. The
+    /// API is let through at the top level, which is what these tests use.
+    fn run(base: &Path, main: &str) -> (Result<(), PluginError>, Vec<String>) {
         let printed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&printed);
         let limits = Limits {
@@ -261,14 +314,19 @@ mod tests {
             execution: Duration::from_millis(250),
         };
         let (actions, _) = mpsc::channel(4);
-        let mut engine = LuauEngine::new(
-            limits,
-            Arc::new(move |_, _, message| sink.lock().unwrap().push(message.to_owned())),
+        let shared = Shared::new(
             actions,
+            Arc::new(move |_, _, message: &str| sink.lock().unwrap().push(message.to_owned())),
         );
+        let plugin_state = PluginState::new("req", shared);
+        {
+            let mut plugin_state = state::lock(&plugin_state);
+            plugin_state.release_output();
+            plugin_state.phase = Phase::Loading;
+        }
         let folder = base.join("plugins").join("req");
-        let (result, held) = engine.load("req", &folder, Path::new("main.luau"), main);
-        drop(held);
+        let result =
+            LuauPlugin::new(plugin_state, &folder, Path::new("main.luau"), main, limits).map(drop);
         let printed = printed.lock().unwrap().clone();
         (result, printed)
     }
@@ -313,14 +371,18 @@ mod tests {
                 print(require("./lib"))
                 print(require("./deep/nested/thing"))
                 print(require("./util") == util, util.runs())
+                print(require("@bedrock-rs/core") == require("@bedrock-rs/core"))
+                print(pcall(require, "@bedrock-rs/other"))
             "#,
         );
         result.unwrap();
         assert_eq!(
-            printed,
-            ["util", "util and helper", "util", "true\t1"],
+            printed[..4],
+            ["util", "util and helper", "util", "true 1"],
             "a module runs once and is shared"
         );
+        assert_eq!(printed[4], "true", "the API is one module");
+        assert!(printed[5].starts_with("false"), "{}", printed[5]);
         fs::remove_dir_all(&base).unwrap();
     }
 

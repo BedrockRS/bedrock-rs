@@ -23,6 +23,7 @@ use crate::blocks::palette;
 use crate::game_mode::GameMode;
 use crate::game_rules;
 use crate::inventory::Inventory;
+use crate::permissions::{Permission, PlayerIds};
 use crate::players::{Movement, Profile, View, placeholder_skin, player_metadata};
 use crate::world::{OVERWORLD, World};
 
@@ -133,6 +134,10 @@ impl Session {
         self.player = claims
             .display_name
             .unwrap_or_else(|| String::from("Player"));
+        self.ids = PlayerIds {
+            pfid: claims.pfid,
+            xuid: claims.xuid,
+        };
         // Returning players start where they left.
         if let Some(saved) = self.world.load_player(self.uuid) {
             self.movement = Movement::from_saved(&saved);
@@ -169,7 +174,10 @@ impl Session {
                 .encode(),
                 ResourcePacksInfo::default().encode(),
             ],
-            events: vec![SessionEvent::LoggedIn(self.uuid)],
+            events: vec![SessionEvent::LoggedIn {
+                uuid: self.uuid,
+                ids: self.ids.clone(),
+            }],
             ..Reply::default()
         }
     }
@@ -208,6 +216,7 @@ impl Session {
                         &self.movement,
                         self.game_mode,
                         self.default_game_mode,
+                        self.permission,
                         &self.rules,
                     )
                     .encode(),
@@ -280,21 +289,30 @@ impl Session {
         }
     }
 
-    /// What the player's game mode lets them do, at vanilla walk and fly
-    /// speeds, and their permissions.
+    /// What the player's game mode and permission let them do, at vanilla
+    /// walk and fly speeds, and their permission.
     pub(super) fn own_abilities(&self) -> UpdateAbilities {
         // Flying is an ability value too: granting it keeps a player who
         // left in the air flying when they return.
         let mut values = self.game_mode.abilities(self.flying);
-        if self.operator {
-            values |= ability::OPERATOR_COMMANDS;
+        if !self.permission.may_build() {
+            // Visitors only look around.
+            values &= !(ability::BUILD
+                | ability::MINE
+                | ability::DOORS_AND_SWITCHES
+                | ability::OPEN_CONTAINERS
+                | ability::ATTACK_PLAYERS
+                | ability::ATTACK_MOBS);
+        }
+        if self.permission.is_operator() {
+            values |= ability::OPERATOR_COMMANDS | ability::TELEPORT;
         }
         UpdateAbilities(AbilityData {
             entity_unique_id: i64::try_from(self.entity_id)
                 .expect("entity IDs stay far below i64::MAX"),
-            // Member, or operator; commands at the "any" or operator level.
-            player_permissions: if self.operator { 2 } else { 1 },
-            command_permissions: u8::from(self.operator),
+            player_permissions: self.permission.id(),
+            // Commands at the "any" or operator level.
+            command_permissions: u8::from(self.permission.is_operator()),
             layers: vec![AbilityLayer::base(values)],
         })
     }
@@ -354,6 +372,7 @@ fn start_game(
     movement: &Movement,
     game_mode: GameMode,
     default_game_mode: GameMode,
+    permission: Permission,
     rules: &game_rules::Values,
 ) -> StartGame {
     let spawn = world.spawn();
@@ -395,7 +414,7 @@ fn start_game(
         experiments_previously_toggled: false,
         bonus_chest_enabled: false,
         start_with_map_enabled: false,
-        player_permissions: 1,
+        player_permissions: permission.id(),
         server_chunk_tick_radius: 4,
         has_locked_behaviour_pack: false,
         has_locked_texture_pack: false,

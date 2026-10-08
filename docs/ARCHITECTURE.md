@@ -7,7 +7,7 @@ Living design document. Plan approved 2026-09-25; research is current as of that
 | Target | Minecraft Bedrock Edition **26.51**, network protocol **2193** |
 | Transport | **NetherNet only** (WebRTC). RakNet is not implemented. |
 | Language | Rust, edition 2024, MSRV 1.93, safe Rust (`unsafe_code = "forbid"`), tokio |
-| Plugins | Zero-build, hot-reloaded scripts: Luau (`mlua`), JS/TS (`deno_core`), Python (RustPython) |
+| Plugins | Hot-reloaded, one API and lifecycle: Luau (`mlua`) and JavaScript (QuickJS, `rquickjs`), both embedded |
 
 Contents: [1 Goals](#1-goals-and-constraints) ·
 [2 Research findings](#2-research-findings) ·
@@ -27,9 +27,10 @@ Contents: [1 Goals](#1-goals-and-constraints) ·
   2026-09-16 elsewhere; server version 1.26.51.1).
 - NetherNet only. BDS has defaulted to `transport=nethernet` since 1.26.50, and 26.60
   (in preview) removes RakNet entirely.
-- Plugins are folders of plain text files in `plugins/`, each with a `plugin.json`
-  manifest, loaded and hot-reloaded with no build step.
-- Safe Rust: our crates forbid `unsafe`. FFI stays inside `mlua` and `rusty_v8`.
+- Plugins are folders in `plugins/`, each with a `plugin.json` manifest, loaded and
+  hot-reloaded with no build step: Luau and JavaScript run from source, in engines
+  built into the server, so there is nothing for a server admin to install.
+- Safe Rust: our crates forbid `unsafe`. FFI stays inside `mlua` and `rquickjs`.
 
 ## 2. Research findings
 
@@ -452,16 +453,18 @@ That is out of scope.
 bedrock-rs/
 ├── Cargo.toml              # workspace: resolver 3, edition 2024, MSRV 1.93, shared deps + lints
 ├── docs/ARCHITECTURE.md    # this document
+├── examples/plugins/       # the same plugin in Luau (hello-luau) and JavaScript (hello-js)
+├── packages/bedrock-rs-core/ # @bedrock-rs/core: the JavaScript API's types, for editors
 ├── tools/                  # Python scripts that generate src/core/data/*.json
-├── server/                 # the folder the server runs in
-│   ├── server.properties   # runtime: configuration, vanilla's format (created on first run, git-ignored)
-│   ├── keys/               # runtime: identity.pem (auto-generated, git-ignored)
-│   ├── plugins/            # hot-reloaded *.luau / *.ts / *.js / *.py
-│   └── worlds/             # runtime: saved worlds (git-ignored)
+├── server/                 # the folder the server runs in; only start.bat, start.sh and README.md tracked
+│   ├── server.properties   # runtime: configuration, vanilla's format (created on first run)
+│   ├── keys/               # runtime: identity.pem (created on first run)
+│   ├── plugins/            # runtime: hot-reloaded plugins, in Luau or JavaScript (created on first run)
+│   └── worlds/             # runtime: saved worlds (created on first run)
 └── src/
     ├── protocol/           # bedrockrs_protocol: varints, NBT, batch codec, packets @ 2193
     ├── net/                # bedrockrs_net: signaling + WebRTC + segmentation → byte messages
-    ├── plugins/            # bedrockrs_plugins: engine trait, Luau/JS/Python hosts, hot reload
+    ├── plugins/            # bedrockrs_plugins: Plugin trait, Luau and JavaScript engines, hot reload
     └── core/               # bedrockrs_core: 20 TPS loop, world, entities; binary `bedrockrs`
 ```
 
@@ -1314,11 +1317,27 @@ DTLS, SCTP, and multi-segment messages both ways.
     second, whole-number overload rather than being listed.
   - **Names:** built-in commands win; plugin commands follow in plugin name order, and
     a command or alias whose name is taken is left out with a warning.
-- **Operators (implemented)** in `ops`: `ops.json` in the working directory lists
-  them by UUID (with their name at the time, for people reading it). Operators get
-  operator commands and player permission level 2 (ability `OperatorCommands`). The
-  console makes the first one with `op <player>`; players must be online to be made
-  operators, since only their session knows their UUID.
+- **Permissions (implemented 2026-10-08)** in `permissions`: vanilla's
+  `permissions.json` in the working directory, `[{ "permission": "operator", "pfid":
+  "…" }]`, written empty on first run as vanilla ships it, replacing `ops.json` (by
+  UUID), which now only earns a warning.
+  - Players are named by PlayFab ID (`pfid`): the multiplayer token's `mid` claim, the
+    PlayFab master account ID Mojang wants servers to key players by rather than the
+    XUID. It is part of the verified token; the client data's `PlayFabId` is not
+    trusted, since the client writes it. Entries by `xuid`, as vanilla writes them,
+    match too, so a vanilla file can be copied in.
+  - `op` adds an entry (or makes the player's entry an operator's) and `deop` removes
+    it; nothing else writes the file, so hand-written members and visitors stay.
+    Players must be online for both, since only their session knows their IDs (kept
+    with their login in `logins::Logins`), and need a PlayFab ID to be written down.
+  - Without an entry, players get `default-player-permission-level` from
+    `server.properties` (member by default).
+  - Levels: operators get operator commands, player permission level 2 and the
+    `OperatorCommands` and `Teleport` abilities; members level 1; visitors level 0,
+    without `Build`, `Mine`, `DoorsAndSwitches`, `OpenContainers`, `AttackPlayers`
+    and `AttackMobs`, and the server refuses their breaking, placing and door use.
+    StartGame and UpdateAbilities carry the level; a change reaches the session as
+    `Control::SetPermission`.
 - **Server console (implemented)** in `main.rs`: lines typed into the console run as
   commands with every permission, with or without their `/`; output is logged.
   `stop` (or `/stop` from an operator) shuts down as Ctrl+C does.
@@ -1327,76 +1346,117 @@ DTLS, SCTP, and multi-segment messages both ways.
 
 ### 4.6 `bedrockrs_plugins`
 
-- **Threading:** each engine runs on its own OS thread, because the VMs are `!Send`, with
-  one isolated VM per plugin. Luau's thread is named `luau-plugins`. A `ScriptEngine`
-  trait will be extracted when the second engine arrives, so its shape comes from real
-  needs.
-- **Messaging only (implemented):** game → plugins for `Event`s, plugins → game for
-  `Action`s. Plugins have no direct access to the world.
+Two engines with one API (2026-10-08), both compiled into the server: **Luau** scripts
+(mlua) and **JavaScript** modules (QuickJS, through rquickjs). A plugin cannot tell which
+engine it is in, except that Luau calls methods with `:`.
+
+- **Lifecycle (implemented)** in `bedrockrs_plugins::plugin`. Every engine implements
+  the `Plugin` trait: `on_load`, `on_enable`, `on_disable` (all optional in the
+  script), plus the plumbing the manager drives them through (`dispatch`,
+  `run_command`, `run_tasks`). There is deliberately no `on_tick`: code runs over
+  time through the scheduler. `state::Phase` gates the API identically for both:
+
+  | Phase | What the plugin may do |
+  |---|---|
+  | top level | nothing: `TOP_LEVEL` is the error, in both engines. The top level sets the plugin up; everything that involves the server starts in `on_load`, so loading happens in one place |
+  | `on_load` | the whole API; `Server.registerCommand` only here, so the server knows every command before a plugin is enabled |
+  | enabled | events reach the plugin, its commands run, its tasks fire |
+  | `on_disable` | the API, except scheduling new tasks; its tasks are cleared afterwards |
+  | disabled | nothing; late callbacks are refused |
+
+  A reload disables the running version, then loads and enables the new one, so two
+  versions never run at once (what one saves in `on_disable`, the next can load in
+  `on_load`). Before anything stops, the new files must compile, with nothing run
+  (`luau::check` compiles every script; `javascript::check` declares the main module,
+  which compiles it and everything it imports, through the plugin's own loader), so a
+  save with a syntax error or a missing import leaves the running version as it is. A new version that
+  compiles but fails in its top level or `on_load` leaves the plugin unloaded until
+  its files change. (The first version loaded the new one before disabling the old,
+  which kept the old one through any failure but ran both at once.) If `on_enable`
+  fails, the plugin is disabled and unloaded. Shutdown disables every plugin.
+- **Threading:** one OS thread (`plugins`) runs every plugin, because Luau VMs are
+  `!Send`. `manager::PluginManager` holds them as `Box<dyn Plugin>`, in name order.
+- **Messaging only (implemented):** game → plugins for `Event`s, commands and ticks;
+  plugins → game for `Action`s. Plugins have no direct access to the world.
   - `Dispatcher::dispatch(Event)` queues an event for the plugin thread, which calls
-    every handler plugin by plugin in name order. Each handler call gets the full
-    execution limit, and a failing handler is logged without stopping the others.
+    every handler plugin by plugin in name order. Each call gets the full execution
+    limit, and a failing handler is logged without stopping the others.
   - `Dispatcher::dispatch_cancellable(Event)` does the same and resolves to whether a
     handler cancelled the event. Core waits at most 2 s for the verdict, then goes
-    ahead, so a stuck plugin cannot silence chat. Only `player_chat` is cancellable.
+    ahead, so a stuck plugin cannot silence chat.
+  - `Dispatcher::tick(tick)` is sent at the start of every server tick and runs the
+    tasks due by then.
   - Actions go through a bounded channel (1024) that core drains. When it is full,
-    the calling API function raises a Lua error instead of blocking.
+    the calling API function throws instead of blocking.
   - Players are named by UUID string: the persistent identity. The XUID is never
-    exposed. Every table a handler receives is read-only.
+    exposed. Everything a handler receives is read-only (Luau) or frozen (JavaScript).
   - Reload debouncing uses its own deadline, so a steady stream of events cannot
     postpone reloads.
 - **Events (implemented):**
 
   | Event | Handler receives | When |
   |---|---|---|
-  | `player_join` | `{ player, cancel(), is_cancelled() }` | 750 ms after SetLocalPlayerAsInitialized, so once the client is past the loading screen and its HUD shows messages once; unless cancelled, everyone then sees vanilla's `§e%multiplayer.player.joined` |
-  | `player_quit` | `{ player, cancel(), is_cancelled() }` | when the session of a player whose join plugins heard ends, however it ends; unless cancelled, everyone sees `§e%multiplayer.player.left` |
-  | `player_chat` | `{ player, message, cancel(), is_cancelled() }` | before a chat message is relayed; `cancel()` stops it, and later handlers still run and can check |
+  | `player_join` | `{ player, cancel(), isCancelled() }` | 750 ms after SetLocalPlayerAsInitialized, so once the client is past the loading screen and its HUD shows messages once; unless cancelled, everyone then sees vanilla's `§e%multiplayer.player.joined` |
+  | `player_quit` | `{ player, cancel(), isCancelled() }` | when the session of a player whose join plugins heard ends, however it ends; unless cancelled, everyone sees `§e%multiplayer.player.left` |
+  | `player_chat` | `{ player, message, cancel(), isCancelled() }` | before a chat message is relayed; `cancel()` stops it, and later handlers still run and can check |
   | `block_break` | `{ player, position = { x, y, z }, block }` | after a player broke a block; `block` is the broken block's name |
   | `block_place` | `{ player, position = { x, y, z }, block }` | after a player placed a block |
-  | `player_damage` | `{ player, cause, amount, health, cancel(), is_cancelled() }` | before damage is dealt |
+  | `player_damage` | `{ player, cause, amount, health, cancel(), isCancelled() }` | before damage is dealt |
   | `player_death` | `{ player, cause, message }` | after a player died; `message` is the death message in English |
-  | `player_respawn` | the player | after a dead player respawned |
+  | `player_respawn` | `{ player }` | after a dead player respawned |
 
   Block events report what already happened and cannot be cancelled yet. Cancellable
   events wait at most 2 s for the plugins; past that, what they describe goes ahead.
   The server sends the join and quit messages itself, so cancelling one and
   broadcasting another is how plugins replace them.
-- **Luau API (implemented):**
-  - `server.on(event, handler)`: unknown event names are an error. Handlers live in
-    the VM's registry, so a reload drops the old ones with the old VM.
-  - `server.broadcast(message)`: System chat to every player.
-  - `server.player(uuid)`: the online player with that UUID (any case) as a player
-    table, or `nil`. The engine keeps its own roster from the events it delivers,
-    so no round trip to the game thread is needed: a player can be looked up from
-    their `player_join` until their `player_quit` handlers finish, and plugins
-    loaded later see everyone already online.
-  - `server.command(definition)`: a slash command, with subcommands at any depth
-    (`bedrockrs_plugins::luau_commands` documents the table). The definition is
-    checked when the plugin loads, so a typo (an unknown field, a misnamed type, a
-    required argument after an optional one) stops the load with the reason. The
-    handlers stay in the VM's registry; the specs go to the server as
+- **The API (implemented):** the module `@bedrock-rs/core`, `require`d in Luau (a
+  built-in alias of the plugin's `require`) and `import`ed in JavaScript (a native
+  module; `packages/bedrock-rs-core` has its types for editors). Each engine binds it
+  as native functions over the same Rust in `state::PluginState`, so checks and error
+  messages are shared.
+  - `Logger.trace/debug/info/warn/error(...)`: the arguments joined with spaces,
+    under the plugin's name. `print` (Luau) and `console.*` (JavaScript) write here.
+  - `Server.on(event, handler)`: unknown event names are an error.
+  - `Server.broadcast(message)`: System chat to every player.
+  - `Server.getPlayer(uuid)`: the online player with that UUID (any case), or
+    nil/undefined. The plugins keep their own roster from the events they get, so no
+    round trip to the game thread is needed: a player can be looked up from their
+    `player_join` until their `player_quit` handlers finish, and plugins loaded later
+    see everyone already online. `Server.getPlayers()`: everyone online, by name.
+  - `Server.registerCommand(definition)`: a slash command, with subcommands at any
+    depth (`definition::parse_command` checks it; `index.d.ts` documents it). A typo
+    (an unknown field, a misnamed type, a required argument after an optional one)
+    fails `on_load` with the reason. The specs go to the server as
     `Action::SetCommands` whenever the plugins' commands change, including on hot
-    reload. A handler gets a `ctx` with `sender` (nil for the console), `console`,
-    `command`, `path`, `args` (parsed values; players as player tables) and
+    reload. A handler gets a `ctx` with `sender` (nil/undefined for the console),
+    `console`, `command`, `path`, `args` (parsed values; players as `Player`s) and
     `reply`/`error`; a string it returns is a reply. Replies made after it returned
-    reach the player as chat. A handler that fails gives the player a generic
-    error, and the details go to the log.
-  - The `server` table is read-only after sandboxing.
-  - Every player in an event is a read-only table `{ name, uuid, send_message,
-    set_game_mode, kick }`.
-    The methods work with `.` and `:` alike and keep working after the event; acting
-    on a player who has left does nothing.
-    - `player.send_message(message)`: System chat to that player only.
-    - `player.set_game_mode(mode)`: survival, creative, adventure or spectator (or
-      vanilla's short forms, or `default`); anything else is a Lua error.
-    - `player.set_health(health)`: within 0 and 20; 0 kills them (cause `override`).
-    - `player.damage(amount, cause?)`: hurts them as `cause` (a vanilla cause name,
-      `none` by default) would, game mode and `player_damage` handlers permitting.
-    - `player.kick(reason?)`: disconnects them with reason 55 (Kicked), showing
-      `reason` or "You were kicked from the server.". Core delivers it through the
-      same per-UUID channel as the duplicate-login kick.
-    - A missing, empty or non-string message and a non-string reason are Lua errors.
+    reach the player as chat. A handler that fails gives the player a generic error,
+    and the details go to the log.
+  - `Player`: `name`, `uuid` and methods that keep working after the event; acting on
+    a player who has left does nothing. Luau calls them with `:` (a `.` call is an
+    error that says so).
+    - `sendMessage(message)`: System chat to that player only.
+    - `setGameMode(mode)`: survival, creative, adventure or spectator (or vanilla's
+      short forms, or `default`); anything else is an error.
+    - `setHealth(health)`: within 0 and 20; 0 kills them (cause `override`).
+    - `damage(amount, cause?)`: hurts them as `cause` (a vanilla cause name, `none` by
+      default) would, game mode and `player_damage` handlers permitting.
+    - `kick(reason?)`: disconnects them with reason 55 (Kicked), showing `reason` or
+      "You were kicked from the server.". Core delivers it through the same per-UUID
+      channel as the duplicate-login kick.
+  - `Server.getWorld()`, the scheduler, modelled on `@minecraft/server`'s
+    `system.run*` (`scheduler::Tasks`, in server ticks):
+    - `run(callback)`: next tick; `runTimeout(callback, ticks = 1)`: once;
+      `runInterval(callback, ticks = 1)`: every `ticks`. Each returns an id for
+      `clearRun(id)`. Delays are whole ticks, up to a day (0 means the next tick);
+      intervals are at least 1.
+    - `waitTicks(ticks = 1)`: a Promise in JavaScript (`await world.waitTicks(20)`), a
+      yield in Luau (every callback runs as a coroutine). Either way the rest of the
+      function runs when the server runs that task, without holding up the thread.
+    - Tasks run only while the plugin is enabled, in due order, each within the
+      execution limit; a failing task is logged, and an interval keeps going.
+  - The API table is read-only in Luau, and frozen in JavaScript.
 - **Console (implemented)** in `bedrockrs_core::console`. `ConsoleFormat` prints
   `<YY/MM/DD HH:MM:SS.SSS> LEVEL [target] message key=value…`, for example
   `<26/09/26 14:30:05.123> INF [hello] Hello from Luau!`:
@@ -1420,54 +1480,97 @@ DTLS, SCTP, and multi-segment messages both ways.
 
   ```json
   {
-    "name": "hello",
-    "description": "Welcomes players",
-    "version": "1.1.0",
-    "author": "BedrockRS",
+    "name": "HelloLuau",
+    "description": "Greets players and shows off the plugin API, in Luau",
+    "version": "2.0.0",
+    "author": "Mistvale Studios",
     "main": "main.luau"
   }
   ```
 
   - All five fields are required and unknown fields are refused, so typos surface.
   - `name` is 1–64 letters, digits, `-` and `_`, and unique: a second folder with the
-    same name is not loaded. Logs and the VM use the name, not the folder.
-  - `main` is a `.luau` path inside the folder (no `..`, not absolute).
-  - A folder without `plugin.json` and loose `*.luau` files in `plugins/` are skipped
-    with a warning, once each.
+    same name is not loaded. Logs use the name, not the folder.
+  - `main` is a path inside the folder (no `..`, not absolute), and its extension
+    picks the engine (`manifest::Engine`): `.luau` for Luau, `.js` or `.mjs` for
+    JavaScript. TypeScript is refused with a hint to compile it first.
+  - A folder without `plugin.json` and loose files in `plugins/` are skipped with a
+    warning, once each.
 - **Hot reload (implemented):** a recursive `notify` watcher on `plugins/`, debounced by
-  200 ms. Once changes settle, the host rescans every folder: a plugin whose manifest
-  or entry script changed is reloaded into a fresh VM, and one whose folder or manifest
-  is gone is unloaded. A reload that fails, including an invalid manifest, logs the
-  error and keeps the running version. State-handoff hooks are not built yet.
-- **Luau (default, implemented)** in `bedrockrs_plugins::{host, luau}`. `PluginHost::start`
+  200 ms. Once changes settle, the host rescans every folder: a plugin any of whose
+  files changed is reloaded (see the lifecycle above), and one whose folder or
+  manifest is gone is disabled and unloaded. A reload that fails, including an
+  invalid manifest or a syntax error, logs the error and keeps the running version.
+  `PluginSource` carries the files that make up the plugin, for its engine (Luau
+  scripts, or JavaScript and JSON), up to 1024, skipping links, hidden folders and
+  `node_modules`, so saving any of them reloads the plugin. A plugin that failed is
+  remembered with what failed (its source, or why its folder could not be read) and
+  only tried again once that changes, so saving another plugin does not rerun it or
+  repeat its error. A folder reported as merely modified does not count as a change
+  (files report their own), since Windows reports one when a freshly copied folder
+  is first listed, which used to rescan right after startup. State-handoff hooks are
+  not built yet.
+- **Luau engine (implemented)** in `bedrockrs_plugins::luau`. `PluginHost::start`
   returns once every plugin has loaded, and a broken plugin never stops startup.
-  Each VM is set up in this order:
+  Each plugin gets its own VM, set up in this order:
   1. A memory limit (64 MiB by default).
-  2. `print` and a `log.{trace,debug,info,warn,error}` table, installed before
-     sandboxing so scripts cannot replace them. Output goes to `tracing` under the
-     `plugin` target through a swappable `Output` sink.
-  3. `require`, confined to the plugin's folder (`luau_require::PluginRequirer`), in
+  2. `require`, confined to the plugin's folder (`luau_require::PluginRequirer`), in
      place of mlua's default, which follows paths and `.luaurc` aliases anywhere on
      disk. Modules are tracked as names below the folder, so `../` stops at its top;
      every file is checked after following links (`canonicalize`) to be inside it;
-     configuration files are never read. Chunk names stay `@plugins/<folder>/<path>`,
-     which `reset` maps back to a module (a folder's `init.luau` being the folder).
-     Modules are cached per VM, and load inside the calling script's deadline.
+     configuration files are never read. Its one alias is the built-in
+     `@bedrock-rs/core`. Chunk names stay `@plugins/<folder>/<path>`, which `reset`
+     maps back to a module (a folder's `init.luau` being the folder). Modules are
+     cached per VM, and load inside the calling script's deadline.
+  3. The API, and `print` as `Logger.info`, installed before sandboxing so scripts
+     cannot replace them.
   4. `Lua::sandbox(true)`: read-only libraries and globals, with script writes kept local.
   5. An interrupt that aborts any call running past the execution limit (1 s by default).
 
-  `PluginSource` carries every `.luau`/`.lua` file in the folder (up to 1024, links
-  skipped), so saving a required module reloads the plugin like its entry script.
-- **JS/TS (`js` feature):** a `deno_core` `JsRuntime`. TypeScript is transpiled on load
-  with `deno_ast`, so there is still no build step. Pulls a prebuilt V8 of more than
-  100 MB.
-- **Python (`python` feature):** RustPython 0.5. It is much slower than CPython and its
-  stdlib is incomplete.
+  The script returns a table of its lifecycle functions (or nothing). Every call into
+  it (lifecycle, handler, command, task) runs as a coroutine, which is what lets
+  `waitTicks` yield; a waiting coroutine is resumed by its task, under a fresh
+  deadline.
+- **JavaScript engine (implemented)** in `bedrockrs_plugins::{javascript,
+  javascript_modules}`. QuickJS (quickjs-ng, through `rquickjs` 0.14), compiled into the
+  server, so a plugin runs from its source with nothing to install or build. Each
+  plugin gets its own `Runtime` and `Context`, set up in this order:
+  1. The memory limit (64 MiB by default) and a 512 KiB stack limit.
+  2. An interrupt handler that stops any call running past the execution limit (1 s by
+     default), the promise jobs it queued included.
+  3. The module loader (`javascript_modules::PluginModules`): relative imports
+     (`./util.js`, `./util`, `../lib` for its `index.js`, `./data.json`), confined to
+     the plugin's folder after following links, as Luau's `require` is; and
+     `@bedrock-rs/core` as a native module (`ModuleDef`) exporting the API objects
+     kept in the runtime's userdata. Anything else (npm packages) is refused with a
+     message saying what can be imported.
+  4. The API: `console` (as `Logger`) and `@bedrock-rs/core`'s frozen `Logger`,
+     `Server`, `Player` and `World`, whose functions are Rust closures over the
+     plugin's `PluginState`, as Luau's are. `Player` and `World` are classes (so
+     `instanceof Player` works) whose constructors throw: instances come from the
+     server.
+
+  The main module is declared and evaluated (its top level, where the API throws
+  `TOP_LEVEL`), and its namespace is kept: the lifecycle functions are its named
+  exports. Every call into the plugin runs within the deadline and then drains the
+  promise job queue within the same deadline. An `async` function's Promise that is
+  still pending gets a rejection handler, so a later failure is reported like any
+  other; `waitTicks` returns a Promise whose `resolve` is its task's callback; a
+  command handler's Promise that settles to a string during the call is its reply.
+
+  The functions a plugin hands the API are `Persistent` handles in a `Registry`, which
+  the plugin's `Drop` empties before the runtime is freed (QuickJS aborts if a value
+  is still held). The API's closures capture only Rust values (the state, the
+  registry), never JavaScript ones, so no reference cycle crosses the boundary.
+- **Parity tests:** `host::tests` runs one scenario (the lifecycle through shutdown, a
+  command, events with cancelling, and the scheduler, `waitTicks` included) against a
+  Luau plugin and its JavaScript twin, and requires identical observations. Another
+  test loads a Luau and a JavaScript plugin side by side.
 
 ### 4.7 Cross-cutting
 
 - **Safety:** `unsafe_code = "forbid"` across the workspace. FFI `unsafe` stays inside
-  mlua, rusty_v8 and RustPython.
+  mlua and rquickjs.
 - **Errors:** `thiserror` in libraries, `anyhow` in the binary.
 - **Logging:** `tracing`, filtered with `RUST_LOG`.
 - **Profiles:** the dev profile optimizes dependencies (opt-level 2), because pure-Rust
@@ -1527,9 +1630,21 @@ go-nethernet, and the receiver accepts any segment size.
 
 **4. `main.rs` lives in `bedrockrs_core` (bin `bedrockrs`).** This keeps exactly four crates.
 
-**5. JS (`js`) and Python (`python`) sit behind cargo features, off by default.**
-`deno_core` pulls a prebuilt V8 of more than 100 MB and links slowly. Keeping them off
-keeps everyday builds fast while the Luau bridge comes first.
+**5. Plugins: Luau and JavaScript, both embedded, with one API and lifecycle
+(2026-10-08).** This replaced the first plan, `deno_core` (JS/TS) and RustPython behind
+cargo features, which were never finished:
+- `deno_core` pulls a prebuilt V8 of more than 100 MB; RustPython is slow and its
+  standard library incomplete.
+- JavaScript first ran as WebAssembly through Extism, compiled by the server with
+  esbuild, extism-js and Binaryen. That needed those tools on every server that loaded
+  a JavaScript plugin, which spoiled drop-in plugins, so it was replaced the same day
+  by QuickJS embedded through `rquickjs`: a small C engine built with the server (as
+  Luau is), with no tools, no build step and no WebAssembly boundary. The API is bound
+  natively, as in Luau.
+- The Luau API was renamed to match JavaScript's (`Server.registerCommand`,
+  `player:sendMessage`, …) and gained the same lifecycle, so the two are
+  interchangeable. Luau plugins written for the old API (`server.command`,
+  top-level code) need updating.
 
 ## 6. Build plan
 
@@ -1566,6 +1681,8 @@ Each step starts only after explicit confirmation.
 | 27 | Health and death: the `minecraft:health` component and vanilla's damage causes; fall damage, the void and peaceful regeneration; the death screen, death messages, drops and respawning; game rules (`falldamage`, `keepinventory`, `naturalregeneration`, `showcoordinates`, `showdeathmessages`) with `/gamerule`, and `/kill`; `player_damage` (cancellable), `player_death` and `player_respawn` events and `player.set_health` / `player.damage` for plugins. The session loop now delivers every reply in one place | Survival players get hurt, die and respawn | 🟡 2026-10-07: tested in the session and from the console; not yet with a live client |
 | 28 | Vanilla storage and `server.properties`: worlds in vanilla's layout (`worlds/<level-name>/db`, LevelDB through `bedrock-leveldb`, and `levelname.txt` for the name); vanilla's chunk keys and sub-chunk format 9, players as vanilla NBT under `player_server_<uuid>`; little-endian NBT reading and writing; `server.properties` (`level-name`, `level-type` FLAT only, `gamemode`, `log-level`, `log-chat`) replacing `bedrockrs.toml`; the `.bin` and `.json` storage removed | A fresh start writes `server.properties` and a vanilla world folder; changes and players survive a restart; a vanilla world copied into `worlds/` opens under its own name with its terrain | 🧪 a real vanilla 1.21 world read in full and took a change (2026-10-08); joining, saving and reopening untested live; vanilla opening a world BedrockRS wrote is untested |
 | 29 | `level.dat`: written for new worlds with every field of a vanilla 1.26.52 superflat world (post-1.18 flat layers, spawn, game rules, versions), kept and updated for existing ones, with `level.dat_old`; game rules moved into it from `game_rules.json`; spawn read from it (or the highest block at (0, 0)) | Vanilla opens a world BedrockRS made, with its builds; `/gamerule` changes show in vanilla; an imported world's spawn and rules apply | 🧪 key set and types match vanilla's exactly; vanilla opening one untested (a `.mcworld` was made for it) |
+| 30 | Plugin architecture: a `Plugin` trait with `on_load` / `on_enable` / `on_disable` and a `PluginManager` of `Box<dyn Plugin>`; JavaScript plugins on QuickJS embedded through `rquickjs` beside Luau, replacing the unfinished JS and Python features (a first version through Extism, compiled by the server with esbuild and extism-js, was dropped the same day because servers needed those tools); one API bound natively in both engines (`Logger`, `Server`, `Player`, and the world's `run`, `runTimeout`, `runInterval`, `clearRun`, `waitTicks`), its JavaScript types in the `@bedrock-rs/core` package; ES module imports within the plugin's folder; the same plugin in both languages in `examples/plugins` | The Luau and JavaScript twins behave identically; a JavaScript plugin loads from source with nothing installed, and a syntax error is logged without stopping the server | 🧪 2026-10-08: parity, side-by-side and reload tests pass; hello-js and hello-luau ran in the server from the console; not yet with a live client |
+| 31 | Permissions as vanilla's `permissions.json` (operator, member, visitor), replacing `ops.json`: players named by PlayFab ID (the verified token's `mid`), vanilla's `xuid` entries matched too; `default-player-permission-level` in `server.properties`; visitors' abilities and the server's checks keep them from building, mining and using doors | `/op` writes `{ "permission": "operator", "pfid": … }` and `/deop` removes it; a visitor set by hand can only look around | 🧪 2026-10-08: tested in the session and from the console; not yet with a live client |
 
 Later steps are proposed but not yet scheduled:
 - `player.give` and item events for plugins; then block interactions and containers,
@@ -1574,7 +1691,8 @@ Later steps are proposed but not yet scheduled:
 - skin changes in game (the client's PlayerSkin)
 - movement validation (speed and teleport checks) and server corrections
 - cancellable block events (undoing the change on the client) and more plugin actions
-- the JS/TS and Python engines
+- a storage API for plugins (the examples' `on_disable` has nowhere to save yet)
+- TypeScript plugins, by stripping types when loading (an `oxc`-style transformer)
 
 ## 7. Risks and open questions
 
@@ -1667,8 +1785,11 @@ Later steps are proposed but not yet scheduled:
   needs an advertise-address setting.
 - **Data licensing.** Block palette, item and creative data come from BDS dumps, and
   Mojang's schemas are under the EULA.
-- **Optional engines.** `deno_core` is large and slow to compile; RustPython performs
-  poorly.
+- **JavaScript is QuickJS, not V8.** It covers modern JavaScript (modules, classes,
+  `async`/`await`) but is an interpreter, far slower than V8 on heavy computation;
+  plugins mostly wait on events, so this rarely matters. Plugins cannot import npm
+  packages directly (no `node_modules` resolution, no Node APIs) and TypeScript must
+  be compiled first.
 - **26.60** will bump the protocol (2216+ in preview).
 
 ## 8. Sources

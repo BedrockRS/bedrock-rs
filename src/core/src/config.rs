@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::game_mode::GameMode;
+use crate::permissions::Permission;
 use crate::world::DEFAULT_NAME;
 
 /// Where the server looks for its settings, relative to where it runs.
@@ -46,6 +47,11 @@ gamemode=creative
 # with /gamemode.
 # Allowed values: "survival", "creative", "adventure" or "spectator" (or 0, 1, 2).
 
+default-player-permission-level=member
+# Permission level of players who have none of their own in permissions.json.
+# Allowed values: "visitor", "member" or "operator". Visitors can only look around;
+# members also build, mine, use doors and fight; operators also run commands.
+
 log-level=info
 # BedrockRS only. How much the console shows.
 # Allowed values: "error", "warn", "info", "debug" or "trace". "info" shows what
@@ -67,6 +73,9 @@ pub struct ServerProperties {
     pub level_type: LevelType,
     /// `gamemode`: the game mode of players joining for the first time.
     pub default_game_mode: GameMode,
+    /// `default-player-permission-level`: the permission of players
+    /// without an entry in `permissions.json`.
+    pub default_permission: Permission,
     /// `log-level` and `log-chat`.
     pub logs: Logs,
     /// Properties in the file that the server does not use, in file order.
@@ -79,6 +88,7 @@ impl Default for ServerProperties {
             level_name: DEFAULT_NAME.to_owned(),
             level_type: LevelType::Flat,
             default_game_mode: GameMode::Creative,
+            default_permission: Permission::Member,
             logs: Logs::default(),
             ignored: Vec::new(),
         }
@@ -203,6 +213,9 @@ impl ServerProperties {
                 "gamemode" => {
                     properties.default_game_mode = game_mode(value).map_err(invalid)?;
                 }
+                "default-player-permission-level" => {
+                    properties.default_permission = permission(value).map_err(invalid)?;
+                }
                 "log-level" => properties.logs.level = log_level(value).map_err(invalid)?,
                 "log-chat" => properties.logs.chat = boolean(&key, value).map_err(invalid)?,
                 _ => {
@@ -291,6 +304,14 @@ fn game_mode(value: &str) -> Result<GameMode, String> {
                 "unknown gamemode {value:?}; expected survival, creative, adventure or spectator"
             )
         })
+}
+
+fn permission(value: &str) -> Result<Permission, String> {
+    Permission::from_name(value).ok_or_else(|| {
+        format!(
+            "unknown default-player-permission-level {value:?}; expected visitor, member or operator"
+        )
+    })
 }
 
 fn log_level(value: &str) -> Result<LogLevel, String> {
@@ -481,6 +502,12 @@ gamemode=adventure
             GameMode::Spectator
         );
         assert!(ServerProperties::parse("gamemode=hardcore").is_err());
+        assert_eq!(parse("").default_permission, Permission::Member);
+        assert_eq!(
+            parse("default-player-permission-level=Visitor").default_permission,
+            Permission::Visitor
+        );
+        assert!(ServerProperties::parse("default-player-permission-level=admin").is_err());
         let debug = parse("log-level=DEBUG\nlog-chat=false");
         assert_eq!(
             debug.logs.filter(),

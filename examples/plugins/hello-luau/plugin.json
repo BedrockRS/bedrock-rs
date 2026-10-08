@@ -1,0 +1,7 @@
+{
+  "name": "HelloLuau",
+  "description": "Greets players and shows off the plugin API, in Luau",
+  "version": "2.0.0",
+  "author": "Mistvale Studios",
+  "main": "main.luau"
+}

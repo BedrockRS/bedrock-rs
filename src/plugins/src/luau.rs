@@ -1,520 +1,611 @@
-//! Luau plugins, each running in its own sandboxed VM.
+//! [`LuauPlugin`]: a plugin written in Luau, each in its own sandboxed VM.
+//!
+//! The script imports the API as JavaScript does, and returns its lifecycle
+//! functions:
+//!
+//! ```lua
+//! local Core = require("@bedrock-rs/core")
+//! local Logger, Server = Core.Logger, Core.Server
+//!
+//! local plugin = {}
+//! function plugin.on_load() Server.registerCommand({ ... }) end
+//! function plugin.on_enable()
+//!     Server.getWorld():runInterval(function() Logger.info("tick tock") end, 20 * 60)
+//! end
+//! function plugin.on_disable() end
+//! return plugin
+//! ```
+//!
+//! The API is the JavaScript one with Luau's method calls (`world:runTimeout`
+//! where JavaScript writes `world.runTimeout`): the same names, arguments,
+//! rules and errors, since every call goes through [`crate::state`].
+//!
+//! Every call into the script (a lifecycle function, a handler, a task) runs
+//! as a coroutine, so `world:waitTicks(n)` can pause it until `n` ticks have
+//! passed, as `await world.waitTicks(n)` does in JavaScript. Each resumption
+//! is held to the execution time limit.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use mlua::{Function, Lua, MultiValue, Table, Value, VmState};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use mlua::thread::ThreadStatus;
+use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Thread, Value, VmState};
+use serde_json::Value as Json;
 use tracing::Level;
 
-use crate::luau_commands::{self, Registered};
+use crate::definition::parse_command;
 use crate::luau_require::PluginRequirer;
-use crate::{
-    Action, CommandCall, CommandReply, DAMAGE_CAUSES, Event, GAME_MODE_VALUES, Output, Player,
-    PluginCommand,
-};
+use crate::manifest::PluginSource;
+use crate::plugin::{HANDLER_FAILED, Limits, Plugin, PluginError};
+use crate::state::{self, Phase, State};
+use crate::{CommandCall, CommandReply, CommandSender, Event, wire};
 
-/// Registry key of each VM's table of event handlers: event name → list of functions.
-const HANDLERS: &str = "bedrockrs.handlers";
+/// Registry keys of each VM's tables.
+const HANDLERS: &str = "bedrockrs.handlers"; // event name → list of functions
+const COMMANDS: &str = "bedrockrs.commands"; // command → path → function
+const TASKS: &str = "bedrockrs.tasks"; // task id → function, or a waiting thread
+const PLAYER: &str = "bedrockrs.player"; // the metatable of player tables
+pub(crate) const CORE: &str = "bedrockrs.core"; // what `require("@bedrock-rs/core")` returns
 
-/// What a kicked player is shown when the plugin gives no reason.
-const DEFAULT_KICK_REASON: &str = "You were kicked from the server.";
-
-/// Lines a loading plugin printed, while it loads; `None` once it has.
-type Hold = Arc<Mutex<Option<Vec<(Level, String)>>>>;
-
-/// Output that goes into `hold` while it holds lines, and to `output` after.
-fn held_back(output: &Output, hold: &Hold) -> Output {
-    let (output, hold) = (Arc::clone(output), Arc::clone(hold));
-    Arc::new(move |plugin, level, message| {
-        let mut held = hold.lock().unwrap_or_else(PoisonError::into_inner);
-        match held.as_mut() {
-            Some(lines) => lines.push((level, message.to_owned())),
-            None => {
-                drop(held);
-                output(plugin, level, message);
-            }
-        }
-    })
-}
-
-/// What a plugin printed while it loaded, released when this is dropped.
-#[must_use = "the plugin's output comes out when this is dropped"]
-pub(crate) struct HeldOutput {
-    plugin: String,
-    lines: Vec<(Level, String)>,
-    output: Output,
-}
-
-impl Drop for HeldOutput {
-    fn drop(&mut self) {
-        for (level, message) in self.lines.drain(..) {
-            (self.output)(&self.plugin, level, &message);
-        }
-    }
-}
-
-/// Resource limits applied to every plugin VM.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Limits {
-    pub memory: usize,
-    /// Longest a single call into a plugin may run.
-    pub execution: Duration,
-}
-
-/// The players plugins know are online, by UUID: those whose `player_join`
-/// plugins heard and whose `player_quit` they have not. Shared by every VM.
-#[derive(Clone, Default)]
-struct Roster(Rc<RefCell<BTreeMap<String, Player>>>);
-
-/// Runs Luau plugins by name. Lives on one thread, since Luau VMs are not `Send`.
-pub(crate) struct LuauEngine {
-    limits: Limits,
-    output: Output,
-    actions: mpsc::Sender<Action>,
-    plugins: BTreeMap<String, Plugin>,
-    roster: Roster,
-}
-
-struct Plugin {
+/// A Luau plugin.
+pub(crate) struct LuauPlugin {
+    name: String,
+    state: State,
     lua: Lua,
-    /// The slash commands the plugin registered.
-    commands: Registered,
+    /// The table the script returned: its lifecycle functions.
+    exports: Option<Table>,
     /// When the running call must stop; checked by the VM's interrupt callback.
     deadline: Rc<Cell<Option<Instant>>>,
+    limits: Limits,
 }
 
-impl LuauEngine {
-    pub fn new(limits: Limits, output: Output, actions: mpsc::Sender<Action>) -> Self {
-        Self {
-            limits,
-            output,
-            actions,
-            plugins: BTreeMap::new(),
-            roster: Roster::default(),
-        }
-    }
-
-    /// Runs `source`, the script `main` in the plugin's `folder`, as plugin
-    /// `name` in a fresh VM, where `require` loads modules from that folder.
-    /// The new VM replaces a running plugin of the same name only if the
-    /// script succeeds. Returns whether it did.
-    ///
-    /// What the script prints while it loads is held back, so the caller can
-    /// first say whether it loaded: it comes out when the [`HeldOutput`] is
-    /// dropped.
-    pub fn load(
-        &mut self,
-        name: &str,
+impl LuauPlugin {
+    /// Runs `source`, the script `main` in the plugin's `folder`, in a fresh
+    /// VM: its top level, up to the table of lifecycle functions it returns.
+    pub fn new(
+        state: State,
         folder: &Path,
         main: &Path,
         source: &str,
-    ) -> (mlua::Result<bool>, HeldOutput) {
-        let hold: Hold = Arc::new(Mutex::new(Some(Vec::new())));
-        let result = self.create_plugin(name, folder, &hold).and_then(|plugin| {
-            plugin.run(self.limits.execution, || {
+        limits: Limits,
+    ) -> Result<Self, PluginError> {
+        let name = state::lock(&state).name.clone();
+        let lua = Lua::new();
+        let deadline = Rc::new(Cell::new(None::<Instant>));
+        let plugin = Self {
+            name,
+            state,
+            lua,
+            exports: None,
+            deadline,
+            limits,
+        };
+        plugin.install(folder).map_err(script_error)?;
+        let exports = plugin
+            .within_limit(|| {
                 plugin
                     .lua
                     .load(source)
                     .set_name(PluginRequirer::chunk_name(folder, main))
-                    .exec()
-            })?;
-            Ok(self.plugins.insert(name.to_owned(), plugin).is_some())
-        });
-        // From now on the plugin prints as it goes.
-        let lines = hold
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .unwrap_or_default();
-        let held = HeldOutput {
-            plugin: name.to_owned(),
-            lines,
-            output: Arc::clone(&self.output),
+                    .call::<Value>(())
+            })
+            .map_err(script_error)?;
+        let exports = match exports {
+            Value::Table(table) => Some(table),
+            Value::Nil => None,
+            other => {
+                return Err(PluginError::Script(format!(
+                    "a plugin script returns a table of its lifecycle functions, or nothing; \
+                     this one returned a {}",
+                    other.type_name()
+                )));
+            }
         };
-        (result, held)
+        Ok(Self { exports, ..plugin })
     }
 
-    /// Runs `source` as plugin `name` from a script called `main` in the
-    /// working directory, for tests; what it prints comes out right away.
-    #[cfg(test)]
-    pub fn load_script(&mut self, name: &str, main: &str, source: &str) -> mlua::Result<bool> {
-        self.load(name, Path::new("."), Path::new(main), source).0
-    }
-
-    /// Stops plugin `name`, dropping its VM. Returns whether it was running.
-    pub fn unload(&mut self, name: &str) -> bool {
-        self.plugins.remove(name).is_some()
-    }
-
-    pub fn names(&self) -> Vec<String> {
-        self.plugins.keys().cloned().collect()
-    }
-
-    /// Every command the running plugins registered, plugin by plugin in
-    /// name order.
-    pub fn commands(&self) -> Vec<PluginCommand> {
-        self.plugins
-            .iter()
-            .flat_map(|(name, plugin)| {
-                plugin
-                    .commands
-                    .borrow()
-                    .iter()
-                    .map(|spec| PluginCommand {
-                        plugin: name.clone(),
-                        spec: spec.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Runs the handler of a plugin command within the execution limit.
-    pub fn run_command(&self, call: &CommandCall) -> CommandReply {
-        let Some(plugin) = self.plugins.get(&call.plugin) else {
-            return CommandReply::error(format!("/{} is no longer available.", call.command));
-        };
-        plugin
-            .run(self.limits.execution, || {
-                luau_commands::run(&plugin.lua, call)
-            })
-            .unwrap_or_else(|err| {
-                tracing::error!(
-                    "Plugin {} failed running /{}: {err}",
-                    call.plugin,
-                    call.command
-                );
-                CommandReply::error("An error occurred while running this command.")
-            })
-    }
-
-    /// Calls every handler for `event`, plugin by plugin in name order. A
-    /// handler that fails is logged and skipped. Returns whether a handler
-    /// cancelled the event; later handlers still run and can check.
-    ///
-    /// A joining player can be looked up from `player_join` on, and a leaving
-    /// one until the `player_quit` handlers have run.
-    pub fn dispatch(&self, event: &Event) -> bool {
-        if let Event::PlayerJoin(player) = event {
-            self.roster
-                .0
-                .borrow_mut()
-                .insert(player.uuid.clone(), player.clone());
-        }
-        let cancelled = Rc::new(Cell::new(false));
-        for (name, plugin) in &self.plugins {
-            plugin.dispatch(name, event, &cancelled, self.limits.execution);
-        }
-        if let Event::PlayerQuit(player) = event {
-            self.roster.0.borrow_mut().remove(&player.uuid);
-        }
-        cancelled.get()
-    }
-
-    fn create_plugin(&self, name: &str, folder: &Path, hold: &Hold) -> mlua::Result<Plugin> {
-        let lua = Lua::new();
+    /// Sets up the VM: limits, `require`, the API, then the sandbox.
+    fn install(&self, folder: &Path) -> mlua::Result<()> {
+        let lua = &self.lua;
         lua.set_memory_limit(self.limits.memory)?;
         // Globals become read-only once sandboxed, so install ours first.
         // mlua's own `require` reads anywhere on disk; the plugin's stays in
-        // its folder.
+        // its folder, and knows `@bedrock-rs/core`.
         let require = lua.create_require_function(PluginRequirer::new(folder))?;
         lua.globals().raw_set("require", require)?;
-        let output = held_back(&self.output, hold);
-        install_output(&lua, name, &output)?;
-        let commands = Registered::default();
-        install_server(&lua, &self.actions, &self.roster, &commands)?;
+        for key in [HANDLERS, COMMANDS, TASKS] {
+            lua.set_named_registry_value(key, lua.create_table()?)?;
+        }
+        let core = self.core()?;
+        // `print` is `Logger.info`.
+        let logger: Table = core.raw_get("Logger")?;
+        lua.globals()
+            .raw_set("print", logger.raw_get::<Function>("info")?)?;
+        lua.set_named_registry_value(CORE, core)?;
         lua.sandbox(true)?;
 
-        let deadline = Rc::new(Cell::new(None::<Instant>));
-        let expiry = Rc::clone(&deadline);
+        let expiry = Rc::clone(&self.deadline);
         lua.set_interrupt(move |_| match expiry.get() {
             Some(deadline) if Instant::now() >= deadline => Err(mlua::Error::runtime(
                 "plugin exceeded its execution time limit",
             )),
             _ => Ok(VmState::Continue),
         });
-        Ok(Plugin {
-            lua,
-            commands,
-            deadline,
-        })
+        Ok(())
     }
-}
 
-impl Plugin {
-    fn run<T>(&self, limit: Duration, call: impl FnOnce() -> mlua::Result<T>) -> mlua::Result<T> {
-        self.deadline.set(Some(Instant::now() + limit));
+    /// The `@bedrock-rs/core` module: `{ Logger, Server, Player, World }`.
+    fn core(&self) -> mlua::Result<Table> {
+        let lua = &self.lua;
+        let core = lua.create_table()?;
+        core.raw_set("Logger", self.logger()?)?;
+        let player = self.player_class()?;
+        lua.set_named_registry_value(PLAYER, lua.create_table_from([("__index", &player)])?)?;
+        let world = self.world()?;
+        core.raw_set("Server", self.server(&world)?)?;
+        core.raw_set("Player", player)?;
+        core.raw_set("World", world)?;
+        core.set_readonly(true);
+        Ok(core)
+    }
+
+    /// `Logger.trace/debug/info/warn/error(...)`: the arguments, as
+    /// `tostring` shows them, separated by spaces.
+    fn logger(&self) -> mlua::Result<Table> {
+        let logger = self.lua.create_table()?;
+        for (name, level) in [
+            ("trace", Level::TRACE),
+            ("debug", Level::DEBUG),
+            ("info", Level::INFO),
+            ("warn", Level::WARN),
+            ("error", Level::ERROR),
+        ] {
+            let state = State::clone(&self.state);
+            let log = self.lua.create_function(move |_, args: MultiValue| {
+                let message = args
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<mlua::Result<Vec<_>>>()?
+                    .join(" ");
+                state::lock(&state)
+                    .log(level, &message)
+                    .map_err(mlua::Error::runtime)
+            })?;
+            logger.raw_set(name, log)?;
+        }
+        logger.set_readonly(true);
+        Ok(logger)
+    }
+
+    /// `Server`: `on`, `broadcast`, `getPlayer`, `getPlayers`,
+    /// `registerCommand` and `getWorld`.
+    fn server(&self, world: &Table) -> mlua::Result<Table> {
+        let lua = &self.lua;
+        let server = lua.create_table()?;
+
+        let state = State::clone(&self.state);
+        let on = lua.create_function(move |lua, (event, handler): (String, Function)| {
+            state::lock(&state)
+                .subscribe(&event)
+                .map_err(mlua::Error::runtime)?;
+            let handlers: Table = lua.named_registry_value(HANDLERS)?;
+            let list = match handlers.raw_get::<Option<Table>>(event.as_str())? {
+                Some(list) => list,
+                None => {
+                    let list = lua.create_table()?;
+                    handlers.raw_set(event, &list)?;
+                    list
+                }
+            };
+            list.raw_push(handler)
+        })?;
+        server.raw_set("on", on)?;
+
+        let state = State::clone(&self.state);
+        let broadcast = lua.create_function(move |_, message: String| {
+            state::lock(&state)
+                .broadcast(&message)
+                .map_err(mlua::Error::runtime)
+        })?;
+        server.raw_set("broadcast", broadcast)?;
+
+        let state = State::clone(&self.state);
+        let get_player = lua.create_function(move |lua, uuid: String| {
+            let player = state::lock(&state)
+                .player(&uuid)
+                .map_err(mlua::Error::runtime)?;
+            player
+                .map(|player| json_to_lua(lua, &wire::player(&player)))
+                .transpose()
+        })?;
+        server.raw_set("getPlayer", get_player)?;
+
+        let state = State::clone(&self.state);
+        let get_players = lua.create_function(move |lua, ()| {
+            let players = state::lock(&state)
+                .players()
+                .map_err(mlua::Error::runtime)?;
+            let list: Vec<Json> = players.iter().map(wire::player).collect();
+            json_to_lua(lua, &Json::Array(list))
+        })?;
+        server.raw_set("getPlayers", get_players)?;
+
+        let state = State::clone(&self.state);
+        let register = lua.create_function(move |lua, definition: Value| {
+            let mut handlers = Vec::new();
+            let json = definition_to_json(&definition, &mut Vec::new(), &mut handlers, false)
+                .map_err(|err| mlua::Error::runtime(format!("invalid command: {err}")))?;
+            let spec = parse_command(&json)
+                .map_err(|err| mlua::Error::runtime(format!("invalid command: {err}")))?;
+            let name = spec.name.clone();
+            state::lock(&state)
+                .register_command(spec)
+                .map_err(mlua::Error::runtime)?;
+            let paths = lua.create_table()?;
+            for (path, handler) in handlers {
+                paths.raw_set(path, handler)?;
+            }
+            lua.named_registry_value::<Table>(COMMANDS)?
+                .raw_set(name, paths)
+        })?;
+        server.raw_set("registerCommand", register)?;
+
+        let (state, world) = (State::clone(&self.state), world.clone());
+        let get_world = lua.create_function(move |_, ()| {
+            // Usable from on_load on, like the rest.
+            if state::lock(&state).phase == Phase::TopLevel {
+                return Err(mlua::Error::runtime(state::TOP_LEVEL));
+            }
+            Ok(world.clone())
+        })?;
+        server.raw_set("getWorld", get_world)?;
+
+        server.set_readonly(true);
+        Ok(server)
+    }
+
+    /// `Player`: the methods of player tables, which are `{ name, uuid }`.
+    fn player_class(&self) -> mlua::Result<Table> {
+        let lua = &self.lua;
+        let player = lua.create_table()?;
+        let method = |name: &'static str,
+                      act: fn(&state::PluginState, &str, &[Value]) -> Result<(), String>|
+         -> mlua::Result<Function> {
+            let state = State::clone(&self.state);
+            lua.create_function(move |_, args: MultiValue| {
+                let mut args = args.into_iter();
+                let uuid = match args.next() {
+                    Some(Value::Table(this)) => this.raw_get::<String>("uuid").ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    mlua::Error::runtime(format!(
+                        "{name} is a method: call it as player:{name}(...)"
+                    ))
+                })?;
+                let rest: Vec<Value> = args.collect();
+                act(&state::lock(&state), &uuid, &rest).map_err(mlua::Error::runtime)
+            })
+        };
+        player.raw_set(
+            "sendMessage",
+            method("sendMessage", |state, uuid, args| {
+                state.send_message(
+                    uuid,
+                    &text_arg(args.first(), "sendMessage expects a message string")?,
+                )
+            })?,
+        )?;
+        player.raw_set(
+            "kick",
+            method("kick", |state, uuid, args| {
+                let reason = optional_text(args.first(), "kick expects a reason string")?;
+                state.kick(uuid, reason.as_deref())
+            })?,
+        )?;
+        player.raw_set(
+            "setGameMode",
+            method("setGameMode", |state, uuid, args| {
+                state.set_game_mode(
+                    uuid,
+                    &text_arg(args.first(), "setGameMode expects a game mode name")?,
+                )
+            })?,
+        )?;
+        player.raw_set(
+            "setHealth",
+            method("setHealth", |state, uuid, args| {
+                state.set_health(
+                    uuid,
+                    number_arg(args.first(), "setHealth expects a number")?,
+                )
+            })?,
+        )?;
+        player.raw_set(
+            "damage",
+            method("damage", |state, uuid, args| {
+                let amount = number_arg(args.first(), "damage expects an amount above 0")?;
+                let cause = optional_text(args.get(1), "damage expects a cause string")?;
+                state.damage(uuid, amount, cause.as_deref())
+            })?,
+        )?;
+        player.set_readonly(true);
+        Ok(player)
+    }
+
+    /// The world, `Server.getWorld()`: its scheduler. `run(callback)`,
+    /// `runTimeout(callback, ticks = 1)`, `runInterval(callback, ticks = 1)`,
+    /// `clearRun(id)` and `waitTicks(ticks = 1)`, as methods.
+    fn world(&self) -> mlua::Result<Table> {
+        let lua = &self.lua;
+        let world = lua.create_table()?;
+
+        let schedule = |repeats: bool, default: f64| -> mlua::Result<Function> {
+            let state = State::clone(&self.state);
+            lua.create_function(move |lua, args: MultiValue| {
+                let mut args = without_self(args);
+                let callback = match args.next() {
+                    Some(Value::Function(callback)) => callback,
+                    _ => return Err(mlua::Error::runtime("expected a callback function")),
+                };
+                let ticks = match args.next() {
+                    None | Some(Value::Nil) => default,
+                    Some(value) => number_arg(Some(&value), "ticks must be a number")
+                        .map_err(mlua::Error::runtime)?,
+                };
+                let id = state::lock(&state)
+                    .schedule(ticks, repeats.then_some(ticks))
+                    .map_err(mlua::Error::runtime)?;
+                lua.named_registry_value::<Table>(TASKS)?
+                    .raw_set(id, callback)?;
+                Ok(id)
+            })
+        };
+        world.raw_set("run", schedule(false, 0.0)?)?;
+        world.raw_set("runTimeout", schedule(false, 1.0)?)?;
+        world.raw_set("runInterval", schedule(true, 1.0)?)?;
+
+        let state = State::clone(&self.state);
+        let clear = lua.create_function(move |lua, args: MultiValue| {
+            let id = number_arg(
+                without_self(args).next().as_ref(),
+                "clearRun expects a task id",
+            )
+            .map_err(mlua::Error::runtime)?;
+            state::lock(&state)
+                .clear_run(id)
+                .map_err(mlua::Error::runtime)?;
+            lua.named_registry_value::<Table>(TASKS)?
+                .raw_set(id, Value::Nil)
+        })?;
+        world.raw_set("clearRun", clear)?;
+
+        // `waitTicks` yields the running coroutine; a task resumes it.
+        let state = State::clone(&self.state);
+        let wait = lua.create_function(move |lua, (thread, ticks): (Thread, Option<f64>)| {
+            let id = state::lock(&state)
+                .schedule(ticks.unwrap_or(1.0), None)
+                .map_err(mlua::Error::runtime)?;
+            lua.named_registry_value::<Table>(TASKS)?
+                .raw_set(id, thread)
+        })?;
+        let wait_ticks: Function = lua
+            .load(
+                r#"
+                local wait = ...
+                return function(...)
+                    local args = { ... }
+                    -- Called as world:waitTicks(n) or world.waitTicks(n).
+                    local ticks = if type(args[1]) == "table" then args[2] else args[1]
+                    wait(coroutine.running(), ticks)
+                    return coroutine.yield()
+                end
+            "#,
+            )
+            .set_name("=bedrockrs")
+            .call(wait)?;
+        world.raw_set("waitTicks", wait_ticks)?;
+        world.set_readonly(true);
+        Ok(world)
+    }
+
+    fn within_limit<T>(&self, call: impl FnOnce() -> mlua::Result<T>) -> mlua::Result<T> {
+        self.deadline
+            .set(Some(Instant::now() + self.limits.execution));
         let result = call();
         self.deadline.set(None);
         result
     }
 
-    /// Calls this plugin's handlers for `event` in the order they were
-    /// registered, each within the execution limit.
-    fn dispatch(&self, plugin: &str, event: &Event, cancelled: &Rc<Cell<bool>>, limit: Duration) {
-        let handlers = match self.handlers(event.name()) {
-            Ok(handlers) => handlers,
-            Err(err) => {
-                tracing::error!(
-                    "Couldn't find plugin {plugin}'s {} handlers: {err}",
-                    event.name()
-                );
-                return;
+    /// Resumes `thread` within the time limit: the values it returned, or
+    /// `None` if it is waiting (`waitTicks`).
+    fn resume(&self, thread: &Thread, args: impl IntoLuaMulti) -> mlua::Result<Option<MultiValue>> {
+        let values = self.within_limit(|| thread.resume::<MultiValue>(args))?;
+        Ok(match thread.status() {
+            ThreadStatus::Resumable => None,
+            _ => Some(values),
+        })
+    }
+
+    /// Calls `function` as a coroutine; see [`LuauPlugin::resume`].
+    fn call(
+        &self,
+        function: Function,
+        args: impl IntoLuaMulti,
+    ) -> mlua::Result<Option<MultiValue>> {
+        let thread = self.lua.create_thread(function)?;
+        self.resume(&thread, args)
+    }
+
+    /// Calls the lifecycle function `name`, if the plugin has one.
+    fn lifecycle(&mut self, name: &str) -> Result<(), PluginError> {
+        let Some(exports) = &self.exports else {
+            return Ok(());
+        };
+        let function = match exports.raw_get::<Value>(name).map_err(script_error)? {
+            Value::Nil => return Ok(()),
+            Value::Function(function) => function,
+            other => {
+                return Err(PluginError::Script(format!(
+                    "{name} must be a function, not a {}",
+                    other.type_name()
+                )));
             }
         };
-        if handlers.is_empty() {
-            return;
-        }
-        let payload = match event_payload(&self.lua, event, cancelled) {
+        self.call(function, ()).map_err(script_error)?;
+        Ok(())
+    }
+
+    fn report(&self, what: &str, error: &mlua::Error) {
+        state::lock(&self.state).report_failure(what, &error.to_string());
+    }
+}
+
+impl Plugin for LuauPlugin {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_load(&mut self) -> Result<(), PluginError> {
+        self.lifecycle("on_load")
+    }
+
+    fn on_enable(&mut self) -> Result<(), PluginError> {
+        self.lifecycle("on_enable")
+    }
+
+    fn on_disable(&mut self) -> Result<(), PluginError> {
+        self.lifecycle("on_disable")
+    }
+
+    fn dispatch(&mut self, event: &Event) -> bool {
+        let handlers = self
+            .lua
+            .named_registry_value::<Table>(HANDLERS)
+            .and_then(|handlers| handlers.raw_get::<Option<Table>>(event.name()));
+        let handlers: Vec<Function> = match handlers {
+            Ok(Some(list)) => list.sequence_values().filter_map(Result::ok).collect(),
+            Ok(None) => return false,
+            Err(err) => {
+                self.report(&format!("{} handlers", event.name()), &err);
+                return false;
+            }
+        };
+        let cancelled = Rc::new(Cell::new(false));
+        let payload = match event_payload(&self.lua, event, &cancelled) {
             Ok(payload) => payload,
             Err(err) => {
-                tracing::error!(
-                    "Couldn't give plugin {plugin} the {} event: {err}",
-                    event.name()
-                );
-                return;
+                self.report(&format!("{} event", event.name()), &err);
+                return false;
             }
         };
         for handler in handlers {
-            if let Err(err) = self.run(limit, || handler.call::<()>(&payload)) {
-                tracing::error!("Plugin {plugin}'s {} handler failed: {err}", event.name());
+            if let Err(err) = self.call(handler, &payload) {
+                self.report(&format!("{} handler", event.name()), &err);
             }
         }
+        cancelled.get()
     }
 
-    /// A snapshot of the handlers for `event`, so handlers may register more
-    /// while being called.
-    fn handlers(&self, event: &str) -> mlua::Result<Vec<Function>> {
-        let handlers: Table = self.lua.named_registry_value(HANDLERS)?;
-        match handlers.raw_get::<Option<Table>>(event)? {
-            Some(list) => list.sequence_values().collect(),
-            None => Ok(Vec::new()),
+    fn run_command(&mut self, call: &CommandCall) -> CommandReply {
+        let handler = self
+            .lua
+            .named_registry_value::<Table>(COMMANDS)
+            .and_then(|commands| commands.raw_get::<Option<Table>>(call.command.as_str()))
+            .and_then(|paths| {
+                paths
+                    .map(|paths| paths.raw_get::<Option<Function>>(call.path.join(" ")))
+                    .transpose()
+            })
+            .map(Option::flatten);
+        let handler = match handler {
+            Ok(Some(handler)) => handler,
+            Ok(None) => {
+                return CommandReply::error(format!("/{} is no longer available", call.command));
+            }
+            Err(err) => {
+                self.report(&format!("/{}", call.command), &err);
+                return CommandReply::error(HANDLER_FAILED);
+            }
+        };
+        let reply = Rc::new(RefCell::new(CommandReply::default()));
+        let finished = Rc::new(Cell::new(false));
+        let result = command_context(&self.lua, &self.state, call, &reply, &finished)
+            .and_then(|ctx| self.call(handler, ctx));
+        finished.set(true);
+        let mut reply = reply.take();
+        match result {
+            Ok(Some(values)) => {
+                if let Some(Value::String(text)) = values.into_iter().next()
+                    && let Ok(text) = text.to_str()
+                {
+                    reply.push_ok(text.to_owned());
+                }
+            }
+            // Waiting: what it replies from now on is a late reply.
+            Ok(None) => {}
+            Err(err) => {
+                self.report(&format!("/{} command", call.command), &err);
+                reply.push_error(HANDLER_FAILED);
+            }
+        }
+        reply
+    }
+
+    fn run_tasks(&mut self, ids: &[u32]) {
+        let Ok(tasks) = self.lua.named_registry_value::<Table>(TASKS) else {
+            return;
+        };
+        for id in ids {
+            let Ok(task) = tasks.raw_get::<Value>(*id) else {
+                continue;
+            };
+            // A one-off is done once it runs.
+            if !state::lock(&self.state).tasks.contains(*id) {
+                let _ = tasks.raw_set(*id, Value::Nil);
+            }
+            let result = match task {
+                Value::Function(callback) => self.call(callback, ()),
+                Value::Thread(thread) if thread.status() == ThreadStatus::Resumable => {
+                    self.resume(&thread, ())
+                }
+                _ => continue,
+            };
+            if let Err(err) = result {
+                self.report("scheduled task", &err);
+            }
         }
     }
 }
 
-/// The value handlers receive: a read-only table describing the event.
-///
-/// - `player_join`, `player_quit`: `{ player, cancel(), is_cancelled() }`;
-///   cancelling stops vanilla's join or quit message.
-/// - `player_chat`: `{ player, message, cancel(), is_cancelled() }`.
-/// - `block_break`, `block_place`: `{ player, position = { x, y, z }, block }`.
-/// - `player_damage`: `{ player, cause, amount, health, cancel(), is_cancelled() }`.
-/// - `player_death`: `{ player, cause, message }`.
-/// - `player_respawn`: the player.
-fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::Result<Table> {
-    let payload = match event {
-        Event::PlayerJoin(player) | Event::PlayerQuit(player) => {
-            let table = lua.create_table()?;
-            table.raw_set("player", player_table(lua, player)?)?;
-            table
-        }
-        Event::PlayerRespawn(player) => player_table(lua, player)?,
-        Event::PlayerDamage(damage) => {
-            let table = lua.create_table()?;
-            table.raw_set("player", player_table(lua, &damage.player)?)?;
-            table.raw_set("cause", damage.cause.as_str())?;
-            table.raw_set("amount", damage.amount)?;
-            table.raw_set("health", damage.health)?;
-            table
-        }
-        Event::PlayerDeath {
-            player,
-            cause,
-            message,
-        } => {
-            let table = lua.create_table()?;
-            table.raw_set("player", player_table(lua, player)?)?;
-            table.raw_set("cause", cause.as_str())?;
-            table.raw_set("message", message.as_str())?;
-            table
-        }
-        Event::PlayerChat { player, message } => {
-            let table = lua.create_table()?;
-            table.raw_set("player", player_table(lua, player)?)?;
-            table.raw_set("message", message.as_str())?;
-            table
-        }
-        Event::BlockBreak(change) | Event::BlockPlace(change) => {
-            let position = lua.create_table()?;
-            position.raw_set("x", change.position.x)?;
-            position.raw_set("y", change.position.y)?;
-            position.raw_set("z", change.position.z)?;
-            position.set_readonly(true);
-            let table = lua.create_table()?;
-            table.raw_set("player", player_table(lua, &change.player)?)?;
-            table.raw_set("position", position)?;
-            table.raw_set("block", change.block.as_str())?;
-            table
-        }
-    };
-    if event.is_cancellable() {
-        let cancel = Rc::clone(cancelled);
-        payload.raw_set(
-            "cancel",
-            lua.create_function(move |_, ()| {
-                cancel.set(true);
-                Ok(())
-            })?,
-        )?;
-        let cancel = Rc::clone(cancelled);
-        payload.raw_set(
-            "is_cancelled",
-            lua.create_function(move |_, ()| Ok(cancel.get()))?,
-        )?;
+/// Compiles every Luau file of a plugin without running any of it: what a
+/// reload checks before it stops the version that runs.
+pub(crate) fn check(
+    folder: &Path,
+    source: &PluginSource,
+    limits: Limits,
+) -> Result<(), PluginError> {
+    let lua = Lua::new();
+    lua.set_memory_limit(limits.memory).map_err(script_error)?;
+    for (path, contents) in &source.files {
+        let relative = path.strip_prefix(folder).unwrap_or(path);
+        lua.load(contents.as_slice())
+            .set_name(PluginRequirer::chunk_name(folder, relative))
+            .into_function()
+            .map_err(script_error)?;
     }
-    payload.set_readonly(true);
-    Ok(payload)
+    Ok(())
 }
 
-/// A player as handlers see them: `{ name, uuid, send_message(message),
-/// set_game_mode(mode), set_health(health), damage(amount, cause?),
-/// kick(reason?) }`. The methods work with `.` and `:` alike, and keep working
-/// after the event; acting on a player who has left does nothing.
-pub(crate) fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
-    let actions = lua
-        .app_data_ref::<mpsc::Sender<Action>>()
-        .ok_or_else(|| mlua::Error::runtime("the plugin API is not installed"))?
-        .clone();
-    let table = lua.create_table()?;
-    table.raw_set("name", player.name.as_str())?;
-    table.raw_set("uuid", player.uuid.as_str())?;
-
-    let (queue, uuid) = (actions.clone(), player.uuid.clone());
-    let send_message = lua.create_function(move |_, args: MultiValue| {
-        let message = match method_args(args).next() {
-            Some(Value::String(message)) => message.to_str()?.to_owned(),
-            _ => {
-                return Err(mlua::Error::runtime(
-                    "send_message expects a message string",
-                ));
-            }
-        };
-        if message.is_empty() {
-            return Err(mlua::Error::runtime("cannot send an empty message"));
-        }
-        request(
-            &queue,
-            Action::SendMessage {
-                player: uuid.clone(),
-                message,
-            },
-        )
-    })?;
-    table.raw_set("send_message", send_message)?;
-
-    let (queue, uuid) = (actions.clone(), player.uuid.clone());
-    let set_game_mode = lua.create_function(move |_, args: MultiValue| {
-        let mode = match method_args(args).next() {
-            Some(Value::String(mode)) => mode.to_str()?.to_ascii_lowercase(),
-            _ => {
-                return Err(mlua::Error::runtime(
-                    "set_game_mode expects a game mode name",
-                ));
-            }
-        };
-        if !GAME_MODE_VALUES.contains(&mode.as_str()) {
-            return Err(mlua::Error::runtime(format!(
-                "unknown game mode {mode:?}; expected survival, creative, adventure or spectator"
-            )));
-        }
-        request(
-            &queue,
-            Action::SetGameMode {
-                player: uuid.clone(),
-                mode,
-            },
-        )
-    })?;
-    table.raw_set("set_game_mode", set_game_mode)?;
-
-    let (queue, uuid) = (actions.clone(), player.uuid.clone());
-    let set_health = lua.create_function(move |_, args: MultiValue| {
-        let health = match method_args(args).next() {
-            Some(Value::Integer(health)) => health as f32,
-            Some(Value::Number(health)) if health.is_finite() => health as f32,
-            _ => return Err(mlua::Error::runtime("set_health expects a number")),
-        };
-        request(
-            &queue,
-            Action::SetHealth {
-                player: uuid.clone(),
-                health,
-            },
-        )
-    })?;
-    table.raw_set("set_health", set_health)?;
-
-    let (queue, uuid) = (actions.clone(), player.uuid.clone());
-    let damage = lua.create_function(move |_, args: MultiValue| {
-        let mut args = method_args(args);
-        let amount = match args.next() {
-            Some(Value::Integer(amount)) if amount > 0 => amount as f32,
-            Some(Value::Number(amount)) if amount.is_finite() && amount > 0.0 => amount as f32,
-            _ => return Err(mlua::Error::runtime("damage expects an amount above 0")),
-        };
-        let cause = match args.next() {
-            None | Some(Value::Nil) => "none".to_owned(),
-            Some(Value::String(cause)) => cause.to_str()?.to_owned(),
-            Some(other) => {
-                return Err(mlua::Error::runtime(format!(
-                    "damage expects a cause string, got a {}",
-                    other.type_name()
-                )));
-            }
-        };
-        if !DAMAGE_CAUSES.contains(&cause.as_str()) {
-            return Err(mlua::Error::runtime(format!(
-                "unknown damage cause {cause:?}; expected a vanilla cause such as fall, void or entityAttack"
-            )));
-        }
-        request(
-            &queue,
-            Action::Damage {
-                player: uuid.clone(),
-                amount,
-                cause,
-            },
-        )
-    })?;
-    table.raw_set("damage", damage)?;
-
-    let uuid = player.uuid.clone();
-    let kick = lua.create_function(move |_, args: MultiValue| {
-        let reason = match method_args(args).next() {
-            Some(Value::String(reason)) if !reason.as_bytes().is_empty() => {
-                reason.to_str()?.to_owned()
-            }
-            None | Some(Value::Nil | Value::String(_)) => DEFAULT_KICK_REASON.to_owned(),
-            Some(other) => {
-                return Err(mlua::Error::runtime(format!(
-                    "kick expects a reason string, got a {}",
-                    other.type_name()
-                )));
-            }
-        };
-        request(
-            &actions,
-            Action::Kick {
-                player: uuid.clone(),
-                reason,
-            },
-        )
-    })?;
-    table.raw_set("kick", kick)?;
-
-    table.set_readonly(true);
-    Ok(table)
+fn script_error(error: mlua::Error) -> PluginError {
+    PluginError::Script(error.to_string())
 }
 
-/// A method's arguments without `self`, so `player:kick()` works like
-/// `player.kick()`. A player method never takes a table otherwise.
-pub(crate) fn method_args(args: MultiValue) -> impl Iterator<Item = Value> {
+/// The arguments of a function that may be called as a method, without the
+/// table it was called on.
+fn without_self(args: MultiValue) -> impl Iterator<Item = Value> {
     let mut args = args.into_iter().peekable();
     if matches!(args.peek(), Some(Value::Table(_))) {
         args.next();
@@ -522,787 +613,537 @@ pub(crate) fn method_args(args: MultiValue) -> impl Iterator<Item = Value> {
     args
 }
 
-/// Queues `action` for the server.
-pub(crate) fn request(actions: &mpsc::Sender<Action>, action: Action) -> mlua::Result<()> {
-    match actions.try_send(action) {
-        // A closed channel means the server is shutting down.
-        Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
-        Err(TrySendError::Full(_)) => Err(mlua::Error::runtime(
-            "the server is not keeping up with plugin actions",
-        )),
+fn text_arg(value: Option<&Value>, message: &str) -> Result<String, String> {
+    match value {
+        Some(Value::String(text)) => text
+            .to_str()
+            .map(|text| text.to_owned())
+            .map_err(|_| message.to_owned()),
+        _ => Err(message.to_owned()),
     }
 }
 
-/// Adds the `server` table:
-/// - `server.on(event, handler)` registers an event handler;
-/// - `server.broadcast(message)` sends a chat message to everyone;
-/// - `server.player(uuid)` is the online player with that UUID, or `nil`;
-/// - `server.command(definition)` adds a slash command (see [`luau_commands`]).
-///
-/// Actions on one player are methods of player tables.
-fn install_server(
-    lua: &Lua,
-    actions: &mpsc::Sender<Action>,
-    roster: &Roster,
-    commands: &Registered,
-) -> mlua::Result<()> {
-    lua.set_named_registry_value(HANDLERS, lua.create_table()?)?;
-    // Player tables built for events queue their actions here.
-    lua.set_app_data(actions.clone());
-    let server = lua.create_table()?;
+fn optional_text(value: Option<&Value>, message: &str) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Nil) => Ok(None),
+        some => text_arg(some, message).map(Some),
+    }
+}
 
-    let on = lua.create_function(|lua, (event, handler): (String, Function)| {
-        if !Event::NAMES.contains(&event.as_str()) {
-            return Err(mlua::Error::runtime(format!(
-                "unknown event {event:?}; expected one of: {}",
-                Event::NAMES.join(", ")
-            )));
-        }
-        let handlers: Table = lua.named_registry_value(HANDLERS)?;
-        let list = match handlers.raw_get::<Option<Table>>(event.as_str())? {
-            Some(list) => list,
-            None => {
-                let list = lua.create_table()?;
-                handlers.raw_set(event, &list)?;
-                list
+fn number_arg(value: Option<&Value>, message: &str) -> Result<f64, String> {
+    match value {
+        Some(Value::Integer(int)) => Ok(*int as f64),
+        Some(Value::Number(number)) => Ok(*number),
+        _ => Err(message.to_owned()),
+    }
+}
+
+/// JSON from the server as Luau values: read-only tables, with players (an
+/// object with a `name` and a `uuid`) as player tables.
+fn json_to_lua(lua: &Lua, json: &Json) -> mlua::Result<Value> {
+    Ok(match json {
+        Json::Null => Value::Nil,
+        Json::Bool(value) => Value::Boolean(*value),
+        Json::Number(number) => match number.as_i64() {
+            Some(int) => Value::Integer(int),
+            None => Value::Number(number.as_f64().unwrap_or(f64::NAN)),
+        },
+        Json::String(text) => Value::String(lua.create_string(text)?),
+        Json::Array(items) => {
+            let table = lua.create_table()?;
+            for item in items {
+                table.raw_push(json_to_lua(lua, item)?)?;
             }
-        };
-        list.raw_push(handler)
-    })?;
-    server.set("on", on)?;
-
-    let queue = actions.clone();
-    let broadcast = lua.create_function(move |_, message: String| {
-        if message.is_empty() {
-            return Err(mlua::Error::runtime("cannot broadcast an empty message"));
+            table.set_readonly(true);
+            Value::Table(table)
         }
-        request(&queue, Action::Broadcast(message))
-    })?;
-    server.set("broadcast", broadcast)?;
-
-    let roster = roster.clone();
-    let player = lua.create_function(move |lua, uuid: String| {
-        // UUIDs are written in lower case; accept any case.
-        let found = roster.0.borrow().get(&uuid.to_ascii_lowercase()).cloned();
-        found.map(|player| player_table(lua, &player)).transpose()
-    })?;
-    server.set("player", player)?;
-    luau_commands::install(lua, &server, commands)?;
-
-    lua.globals().set("server", server)
-}
-
-/// Replaces `print` and adds a `log` table (`log.trace` … `log.error`) that
-/// forward to `output`, formatting arguments like Luau's `print`.
-fn install_output(lua: &Lua, plugin: &str, output: &Output) -> mlua::Result<()> {
-    let globals = lua.globals();
-    globals.set("print", output_function(lua, plugin, output, Level::INFO)?)?;
-
-    let log = lua.create_table()?;
-    for (name, level) in [
-        ("trace", Level::TRACE),
-        ("debug", Level::DEBUG),
-        ("info", Level::INFO),
-        ("warn", Level::WARN),
-        ("error", Level::ERROR),
-    ] {
-        log.set(name, output_function(lua, plugin, output, level)?)?;
-    }
-    globals.set("log", log)
-}
-
-fn output_function(
-    lua: &Lua,
-    plugin: &str,
-    output: &Output,
-    level: Level,
-) -> mlua::Result<Function> {
-    let plugin = plugin.to_owned();
-    let output = Arc::clone(output);
-    lua.create_function(move |_, args: MultiValue| {
-        let message = args
-            .iter()
-            .map(Value::to_string)
-            .collect::<mlua::Result<Vec<_>>>()?
-            .join("\t");
-        output(&plugin, level, &message);
-        Ok(())
+        Json::Object(map) => {
+            let table = lua.create_table()?;
+            for (key, value) in map {
+                table.raw_set(key.as_str(), json_to_lua(lua, value)?)?;
+            }
+            if wire::is_player(json) {
+                table.set_metatable(Some(lua.named_registry_value::<Table>(PLAYER)?))?;
+            }
+            table.set_readonly(true);
+            Value::Table(table)
+        }
     })
+}
+
+/// A command definition table as JSON for [`parse_command`], with each
+/// `run` function taken out into `handlers` under its subcommand path.
+fn definition_to_json(
+    value: &Value,
+    path: &mut Vec<String>,
+    handlers: &mut Vec<(String, Function)>,
+    in_subcommands: bool,
+) -> Result<Json, String> {
+    Ok(match value {
+        Value::Nil => Json::Null,
+        Value::Boolean(value) => Json::Bool(*value),
+        Value::Integer(int) => Json::from(*int),
+        Value::Number(number) => serde_json::Number::from_f64(*number)
+            .map(Json::Number)
+            .ok_or("numbers must be finite")?,
+        Value::String(text) => {
+            Json::String(text.to_str().map_err(|err| err.to_string())?.to_owned())
+        }
+        Value::Table(table) => {
+            let length = table.raw_len();
+            let is_list = length > 0
+                && table
+                    .pairs::<Value, Value>()
+                    .all(|pair| matches!(pair, Ok((Value::Integer(key), _)) if key >= 1 && key as usize <= length));
+            if is_list || (length == 0 && table.pairs::<Value, Value>().next().is_none()) {
+                let mut items = Vec::new();
+                for item in table.sequence_values::<Value>() {
+                    let item = item.map_err(|err| err.to_string())?;
+                    items.push(definition_to_json(&item, path, handlers, false)?);
+                }
+                Json::Array(items)
+            } else {
+                let mut map = serde_json::Map::new();
+                for pair in table.pairs::<Value, Value>() {
+                    let (key, value) = pair.map_err(|err| err.to_string())?;
+                    let Value::String(key) = key else {
+                        return Err("tables must have string keys or be lists".into());
+                    };
+                    let key = key.to_str().map_err(|err| err.to_string())?.to_owned();
+                    let json = if in_subcommands {
+                        // Each entry is a subcommand node, named by its key.
+                        path.push(key.clone());
+                        let node = definition_to_json(&value, path, handlers, false);
+                        path.pop();
+                        node?
+                    } else if key == "run" {
+                        match value {
+                            Value::Function(handler) => {
+                                handlers.push((path.join(" "), handler));
+                                Json::Bool(true)
+                            }
+                            other => definition_to_json(&other, path, handlers, false)?,
+                        }
+                    } else {
+                        definition_to_json(&value, path, handlers, key == "subcommands")?
+                    };
+                    map.insert(key, json);
+                }
+                Json::Object(map)
+            }
+        }
+        Value::Function(_) => return Err("functions are only allowed as run handlers".into()),
+        other => {
+            return Err(format!(
+                "a {} cannot be part of a command",
+                other.type_name()
+            ));
+        }
+    })
+}
+
+/// The event handlers receive (see [`wire::event`]), with `cancel()` and
+/// `isCancelled()` for cancellable events.
+fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::Result<Table> {
+    let json = wire::event(event);
+    let data = json.get("data").cloned().unwrap_or(Json::Null);
+    let payload = lua.create_table()?;
+    if let Json::Object(map) = &data {
+        for (key, value) in map {
+            payload.raw_set(key.as_str(), json_to_lua(lua, value)?)?;
+        }
+    }
+    if event.is_cancellable() {
+        let cancel = Rc::clone(cancelled);
+        payload.raw_set(
+            "cancel",
+            lua.create_function(move |_, _: MultiValue| {
+                cancel.set(true);
+                Ok(())
+            })?,
+        )?;
+        let cancel = Rc::clone(cancelled);
+        payload.raw_set(
+            "isCancelled",
+            lua.create_function(move |_, _: MultiValue| Ok(cancel.get()))?,
+        )?;
+    }
+    payload.set_readonly(true);
+    Ok(payload)
+}
+
+/// The `ctx` command handlers receive: `sender` (the player, or `nil` for the
+/// console), `console`, `command`, `path` (the subcommands typed), `args` by
+/// name, and `reply(message)` / `error(message)` to answer. A string the
+/// handler returns is replied too. Replies after the handler returned (or
+/// once it waits) reach a player as chat and the console as a log line.
+fn command_context(
+    lua: &Lua,
+    state: &State,
+    call: &CommandCall,
+    reply: &Rc<RefCell<CommandReply>>,
+    finished: &Rc<Cell<bool>>,
+) -> mlua::Result<Table> {
+    let json = wire::command_call(call);
+    let ctx = lua.create_table()?;
+    ctx.raw_set("sender", json_to_lua(lua, &json["sender"])?)?;
+    ctx.raw_set("console", call.sender == CommandSender::Console)?;
+    ctx.raw_set("command", call.command.as_str())?;
+    ctx.raw_set("path", json_to_lua(lua, &json["path"])?)?;
+    ctx.raw_set("args", json_to_lua(lua, &json["args"])?)?;
+    for (name, success) in [("reply", true), ("error", false)] {
+        let (reply, finished, state) = (Rc::clone(reply), Rc::clone(finished), State::clone(state));
+        let sender = call.sender.clone();
+        let respond = lua.create_function(move |_, args: MultiValue| {
+            let text = match without_self(args).next() {
+                Some(Value::String(text)) if !text.as_bytes().is_empty() => {
+                    text.to_str()?.to_owned()
+                }
+                _ => return Err(mlua::Error::runtime("expected a message string")),
+            };
+            if !finished.get() {
+                let mut reply = reply.borrow_mut();
+                if success {
+                    reply.push_ok(text);
+                } else {
+                    reply.push_error(text);
+                }
+                return Ok(());
+            }
+            state::lock(&state)
+                .late_reply(&sender, &text, success)
+                .map_err(mlua::Error::runtime)
+        })?;
+        ctx.raw_set(name, respond)?;
+    }
+    ctx.set_readonly(true);
+    Ok(ctx)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
 
     use super::*;
+    use crate::state::{PluginState, Shared};
+    use crate::{Action, ArgValue, Player};
 
-    type Lines = Arc<Mutex<Vec<(String, Level, String)>>>;
+    type Lines = Arc<Mutex<Vec<(Level, String)>>>;
 
-    const DEFAULT_LIMITS: Limits = Limits {
+    struct Setup {
+        state: State,
+        lines: Lines,
+        actions: mpsc::Receiver<Action>,
+    }
+
+    fn setup() -> Setup {
+        let lines: Lines = Arc::default();
+        let sink = Arc::clone(&lines);
+        let (actions, received) = mpsc::channel(16);
+        let shared = Shared::new(
+            actions,
+            Arc::new(move |_, level, message: &str| {
+                sink.lock().unwrap().push((level, message.to_owned()))
+            }),
+        );
+        let state = PluginState::new("test", shared);
+        state::lock(&state).release_output();
+        Setup {
+            state,
+            lines,
+            actions: received,
+        }
+    }
+
+    const LIMITS: Limits = Limits {
         memory: 16 * 1024 * 1024,
         execution: Duration::from_millis(250),
     };
 
-    fn engine_with_actions(limits: Limits) -> (LuauEngine, Lines, mpsc::Receiver<Action>) {
-        let lines = Lines::default();
-        let sink = Arc::clone(&lines);
-        let output: Output = Arc::new(move |plugin, level, message| {
-            sink.lock()
-                .unwrap()
-                .push((plugin.to_owned(), level, message.to_owned()));
-        });
-        let (actions, received) = mpsc::channel(16);
-        (LuauEngine::new(limits, output, actions), lines, received)
+    fn load(setup: &Setup, source: &str) -> Result<LuauPlugin, PluginError> {
+        LuauPlugin::new(
+            State::clone(&setup.state),
+            Path::new("."),
+            Path::new("main.luau"),
+            source,
+            LIMITS,
+        )
     }
 
-    fn engine(limits: Limits) -> (LuauEngine, Lines) {
-        let (engine, lines, _) = engine_with_actions(limits);
-        (engine, lines)
+    /// Loads `source` and runs it up to enabled, as the manager would.
+    fn enabled(setup: &Setup, source: &str) -> LuauPlugin {
+        let mut plugin = load(setup, source).unwrap();
+        state::lock(&setup.state).phase = Phase::Loading;
+        plugin.on_load().unwrap();
+        state::lock(&setup.state).phase = Phase::Enabled;
+        plugin.on_enable().unwrap();
+        plugin
     }
 
-    fn default_engine() -> (LuauEngine, Lines) {
-        engine(DEFAULT_LIMITS)
-    }
-
-    fn steve_joins() -> Event {
-        Event::PlayerJoin(crate::Player {
-            name: "Steve".into(),
-            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
-        })
-    }
-
-    fn messages(lines: &Lines) -> Vec<String> {
-        lines
+    fn messages(setup: &Setup) -> Vec<String> {
+        setup
+            .lines
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, _, m)| m.clone())
+            .map(|(_, line)| line.clone())
             .collect()
     }
 
-    #[test]
-    fn print_formats_arguments_like_luau() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script(
-                "hello",
-                "hello.luau",
-                r#"
-                    print("hi", 42, 1.5, true, nil)
-                    print(setmetatable({}, { __tostring = function() return "custom" end }))
-                "#,
-            )
-            .unwrap();
-        assert_eq!(
-            *lines.lock().unwrap(),
-            vec![
-                ("hello".into(), Level::INFO, "hi\t42\t1.5\ttrue\tnil".into()),
-                ("hello".into(), Level::INFO, "custom".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn log_functions_use_their_levels() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script(
-                "levels",
-                "levels.luau",
-                r#"log.warn("careful") log.error("broken", 1)"#,
-            )
-            .unwrap();
-        let levels: Vec<_> = lines
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, l, m)| (*l, m.clone()))
-            .collect();
-        assert_eq!(
-            levels,
-            vec![
-                (Level::WARN, "careful".into()),
-                (Level::ERROR, "broken\t1".into())
-            ]
-        );
-    }
-
-    #[test]
-    fn luau_syntax_and_type_annotations_are_supported() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script(
-                "typed",
-                "typed.luau",
-                "local count: number = 2\ncount += 1\nprint(`count is {count}`)",
-            )
-            .unwrap();
-        assert_eq!(messages(&lines), vec!["count is 3"]);
-    }
-
-    #[test]
-    fn sandbox_makes_libraries_read_only() {
-        let (mut engine, _) = default_engine();
-        let err = engine
-            .load_script("vandal", "vandal.luau", "string.upper = nil")
-            .unwrap_err();
-        assert!(err.to_string().contains("readonly"), "{err}");
-    }
-
-    #[test]
-    fn plugins_do_not_share_globals() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script("a", "a.luau", r#"shared = "from a""#)
-            .unwrap();
-        engine.load_script("b", "b.luau", "print(shared)").unwrap();
-        assert_eq!(messages(&lines), vec!["nil"]);
-    }
-
-    #[test]
-    fn runaway_scripts_are_stopped() {
-        let (mut engine, _) = default_engine();
-        let started = Instant::now();
-        let err = engine
-            .load_script("spin", "spin.luau", "while true do end")
-            .unwrap_err();
-        assert!(err.to_string().contains("execution time limit"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(engine.names().is_empty());
-    }
-
-    #[test]
-    fn memory_limit_is_enforced() {
-        let (mut engine, _) = engine(Limits {
-            memory: 4 * 1024 * 1024,
-            execution: Duration::from_secs(5),
-        });
-        let err = engine
-            .load_script(
-                "hog",
-                "hog.luau",
-                "local t = {} for i = 1, 1e7 do t[i] = string.rep('x', 64) .. i end",
-            )
-            .unwrap_err();
-        assert!(matches!(err, mlua::Error::MemoryError(_)), "{err}");
-    }
-
-    #[test]
-    fn failed_reload_keeps_the_running_version() {
-        let (mut engine, _) = default_engine();
-        assert!(
-            !engine
-                .load_script("hello", "hello.luau", "print('v1')")
-                .unwrap()
-        );
-        assert!(engine.load_script("hello", "hello.luau", "print(").is_err());
-        assert_eq!(engine.names(), vec!["hello"]);
-        assert!(
-            engine
-                .load_script("hello", "hello.luau", "print('v2')")
-                .unwrap()
-        );
-        assert!(engine.unload("hello"));
-        assert!(!engine.unload("hello"));
-    }
-
-    #[test]
-    fn join_handlers_get_the_player_and_can_broadcast() {
-        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
-        engine
-            .load_script(
-                "welcome",
-                "welcome.luau",
-                r#"
-                    server.on("player_join", function(event) local player = event.player
-                        print(player.name, player.uuid)
-                        server.broadcast(`Welcome, {player.name}!`)
-                    end)
-                "#,
-            )
-            .unwrap();
-        assert!(
-            actions.try_recv().is_err(),
-            "nothing happens until someone joins"
-        );
-
-        engine.dispatch(&steve_joins());
-        assert_eq!(
-            messages(&lines),
-            ["Steve\t174319cc-f69f-30d8-a279-6ace57f2011e"]
-        );
-        assert_eq!(
-            actions.try_recv().unwrap(),
-            Action::Broadcast("Welcome, Steve!".into())
-        );
-    }
-
-    #[test]
-    fn unknown_events_are_rejected() {
-        let (mut engine, _) = default_engine();
-        let err = engine
-            .load_script(
-                "typo",
-                "typo.luau",
-                r#"server.on("player_joined", function() end)"#,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown event"), "{err}");
-    }
-
-    #[test]
-    fn a_failing_handler_does_not_stop_the_others() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script(
-                "a",
-                "a.luau",
-                r#"
-                    server.on("player_join", function(event) local player = event.player player.name = "Alex" end)
-                    server.on("player_join", function(event) local player = event.player print("a saw", player.name) end)
-                "#,
-            )
-            .unwrap();
-        engine
-            .load_script(
-                "b",
-                "b.luau",
-                r#"server.on("player_join", function(event) local player = event.player print("b saw", player.name) end)"#,
-            )
-            .unwrap();
-        engine.dispatch(&steve_joins());
-        assert_eq!(messages(&lines), ["a saw\tSteve", "b saw\tSteve"]);
-    }
-
-    #[test]
-    fn runaway_handlers_are_stopped() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script(
-                "spin",
-                "spin.luau",
-                r#"
-                    server.on("player_join", function() while true do end end)
-                    server.on("player_join", function() print("still here") end)
-                "#,
-            )
-            .unwrap();
-        let started = Instant::now();
-        engine.dispatch(&steve_joins());
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(messages(&lines), ["still here"]);
-    }
-
-    #[test]
-    fn reloading_replaces_the_handlers() {
-        let (mut engine, lines) = default_engine();
-        let source = |version: &str| {
-            format!(r#"server.on("player_join", function() print("{version}") end)"#)
-        };
-        engine
-            .load_script("hello", "hello.luau", &source("v1"))
-            .unwrap();
-        engine
-            .load_script("hello", "hello.luau", &source("v2"))
-            .unwrap();
-        engine.dispatch(&steve_joins());
-        assert_eq!(messages(&lines), ["v2"]);
-    }
-
-    #[test]
-    fn broadcast_rejects_empty_messages_and_the_api_is_read_only() {
-        let (mut engine, _) = default_engine();
-        let err = engine
-            .load_script("empty", "empty.luau", r#"server.broadcast("")"#)
-            .unwrap_err();
-        assert!(err.to_string().contains("empty message"), "{err}");
-        let err = engine
-            .load_script("vandal", "vandal.luau", "server.broadcast = nil")
-            .unwrap_err();
-        assert!(err.to_string().contains("readonly"), "{err}");
-    }
-
-    fn steve() -> crate::Player {
-        crate::Player {
+    fn steve() -> Player {
+        Player {
             name: "Steve".into(),
             uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
         }
     }
 
+    /// Runs whatever is due at each tick up to `until`.
+    fn tick(setup: &Setup, plugin: &mut LuauPlugin, until: u64) {
+        let clock = Arc::clone(&state::lock(&setup.state).shared().clock);
+        for now in clock.load(std::sync::atomic::Ordering::Relaxed) + 1..=until {
+            clock.store(now, std::sync::atomic::Ordering::Relaxed);
+            let due = state::lock(&setup.state).tasks.take_due(now);
+            plugin.run_tasks(&due);
+        }
+    }
+
     #[test]
-    fn chat_can_be_cancelled_and_later_handlers_see_it() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script(
-                "filter",
-                "filter.luau",
-                r#"
-                    server.on("player_chat", function(event)
-                        if event.message:find("spam") then event.cancel() end
-                    end)
-                "#,
-            )
-            .unwrap();
-        engine
-            .load_script(
-                "logger",
-                "logger.luau",
-                r#"
-                    server.on("player_chat", function(event)
-                        print(event.player.name, event.message, event.is_cancelled())
-                    end)
-                "#,
-            )
-            .unwrap();
+    fn lifecycle_functions_run_in_order_with_the_api() {
+        let setup = setup();
+        let mut plugin = enabled(
+            &setup,
+            r#"
+                local Core = require("@bedrock-rs/core")
+                local Logger = Core.Logger
+                local greeting = "hello"
+                return {
+                    on_load = function() Logger.info(greeting, "load") end,
+                    on_enable = function() print("enable") end,
+                    on_disable = function() Logger.warn("disable", 1) end,
+                }
+            "#,
+        );
+        plugin.on_disable().unwrap();
+        assert_eq!(messages(&setup), ["hello load", "enable", "disable 1"]);
+    }
+
+    #[test]
+    fn the_top_level_cannot_use_the_api() {
+        let setup = setup();
+        let err = load(
+            &setup,
+            r#"require("@bedrock-rs/core").Logger.info("too early")"#,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("not available at the top level"), "{err}");
+        let err = load(&setup, r#"print("too early")"#)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("not available at the top level"), "{err}");
+        // A script need not return anything.
+        assert!(load(&setup, "local x = 1").is_ok());
+        let err = load(&setup, "return 5").err().unwrap().to_string();
+        assert!(err.contains("returns a table"), "{err}");
+    }
+
+    #[test]
+    fn commands_register_in_on_load_only_and_run() {
+        let setup = setup();
+        let mut plugin = enabled(
+            &setup,
+            r#"
+                local Server = require("@bedrock-rs/core").Server
+                return {
+                    on_load = function()
+                        Server.registerCommand({
+                            name = "warp",
+                            args = { { name = "name", type = "string" } },
+                            run = function(ctx) ctx.reply(`to {ctx.args.name}`) end,
+                            subcommands = {
+                                set = { run = function(ctx) return `set by {ctx.sender.name}` end },
+                                broken = { run = function() error("oops") end },
+                            },
+                        })
+                    end,
+                }
+            "#,
+        );
+        let commands = state::lock(&setup.state).commands.clone();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "warp");
+
+        let call = |path: &[&str], args: Vec<(&str, ArgValue)>| CommandCall {
+            plugin: "test".into(),
+            command: "warp".into(),
+            path: path.iter().map(|name| (*name).to_owned()).collect(),
+            args: args
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+            sender: CommandSender::Player(steve()),
+        };
+        let reply =
+            plugin.run_command(&call(&[], vec![("name", ArgValue::String("spawn".into()))]));
+        assert_eq!(reply, CommandReply::ok("to spawn"));
+        assert_eq!(
+            plugin.run_command(&call(&["set"], Vec::new())),
+            CommandReply::ok("set by Steve")
+        );
+        assert_eq!(
+            plugin.run_command(&call(&["broken"], Vec::new())),
+            CommandReply::error(HANDLER_FAILED)
+        );
+    }
+
+    #[test]
+    fn on_enable_cannot_register_commands() {
+        let setup = setup();
+        let mut plugin = load(
+            &setup,
+            r#"
+                local Server = require("@bedrock-rs/core").Server
+                return { on_enable = function() Server.registerCommand({ name = "x", run = print }) end }
+            "#,
+        )
+        .unwrap();
+        state::lock(&setup.state).phase = Phase::Enabled;
+        let err = plugin.on_enable().unwrap_err().to_string();
+        assert!(err.contains("only be registered in on_load"), "{err}");
+    }
+
+    #[test]
+    fn events_reach_handlers_which_can_cancel_and_act() {
+        let mut setup = setup();
+        let mut plugin = enabled(
+            &setup,
+            r#"
+                local Server = require("@bedrock-rs/core").Server
+                return {
+                    on_load = function()
+                        Server.on("player_chat", function(event)
+                            if event.message:find("badword") then event.cancel() end
+                        end)
+                        Server.on("player_join", function(event)
+                            event.player:sendMessage(`hi {event.player.name}`)
+                        end)
+                    end,
+                }
+            "#,
+        );
         let chat = |message: &str| Event::PlayerChat {
             player: steve(),
             message: message.into(),
         };
-        assert!(engine.dispatch(&chat("buy spam")));
-        assert!(!engine.dispatch(&chat("hello")));
+        assert!(plugin.dispatch(&chat("a badword")));
+        assert!(!plugin.dispatch(&chat("hello")));
+        assert!(!plugin.dispatch(&Event::PlayerJoin(steve())));
         assert_eq!(
-            messages(&lines),
-            ["Steve\tbuy spam\ttrue", "Steve\thello\tfalse"]
-        );
-    }
-
-    #[test]
-    fn quit_and_block_events_describe_what_happened() {
-        let (mut engine, lines) = default_engine();
-        engine
-            .load_script(
-                "watch",
-                "watch.luau",
-                r#"
-                    server.on("player_quit", function(event) local player = event.player print("quit", player.name) end)
-                    local function changed(event)
-                        local at = event.position
-                        print(event.player.name, event.block, at.x, at.y, at.z, event.cancel)
-                    end
-                    server.on("block_break", changed)
-                    server.on("block_place", changed)
-                "#,
-            )
-            .unwrap();
-        let change = |block: &str| crate::BlockChange {
-            player: steve(),
-            position: crate::Position {
-                x: 1,
-                y: -60,
-                z: -2,
-            },
-            block: block.into(),
-        };
-        assert!(!engine.dispatch(&Event::BlockBreak(change("minecraft:grass_block"))));
-        engine.dispatch(&Event::BlockPlace(change("minecraft:stone")));
-        engine.dispatch(&Event::PlayerQuit(steve()));
-        assert_eq!(
-            messages(&lines),
-            [
-                "Steve\tminecraft:grass_block\t1\t-60\t-2\tnil",
-                "Steve\tminecraft:stone\t1\t-60\t-2\tnil",
-                "quit\tSteve",
-            ]
-        );
-    }
-
-    #[test]
-    fn players_can_be_messaged_and_kicked_through_their_methods() {
-        let (mut engine, _, mut actions) = engine_with_actions(DEFAULT_LIMITS);
-        engine
-            .load_script(
-                "moderator",
-                "moderator.luau",
-                r#"
-                    server.on("player_join", function(event) local player = event.player
-                        player.send_message("Only you can see this")
-                        player:send_message("And this")
-                    end)
-                    server.on("player_chat", function(event)
-                        event.player.kick("Come back later")
-                        event.player:kick()
-                    end)
-                "#,
-            )
-            .unwrap();
-        engine.dispatch(&steve_joins());
-        engine.dispatch(&Event::PlayerChat {
-            player: steve(),
-            message: "hi".into(),
-        });
-        let uuid = steve().uuid;
-        let received: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
-        assert_eq!(
-            received,
-            [
-                Action::SendMessage {
-                    player: uuid.clone(),
-                    message: "Only you can see this".into()
-                },
-                Action::SendMessage {
-                    player: uuid.clone(),
-                    message: "And this".into()
-                },
-                Action::Kick {
-                    player: uuid.clone(),
-                    reason: "Come back later".into()
-                },
-                Action::Kick {
-                    player: uuid,
-                    reason: DEFAULT_KICK_REASON.into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn player_methods_check_their_arguments_and_players_are_read_only() {
-        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
-        engine
-            .load_script(
-                "careless",
-                "careless.luau",
-                r#"
-                    server.on("player_join", function(event) local player = event.player
-                        for _, attempt in {
-                            function() player.send_message() end,
-                            function() player.send_message("") end,
-                            function() player.send_message(42) end,
-                            function() player.kick(false) end,
-                            function() player.name = "Alex" end,
-                            function() player.kick = nil end,
-                        } do
-                            print(pcall(attempt))
-                        end
-                    end)
-                "#,
-            )
-            .unwrap();
-        engine.dispatch(&steve_joins());
-        let results = messages(&lines);
-        assert_eq!(results.len(), 6);
-        assert!(
-            results.iter().all(|line| line.starts_with("false")),
-            "{results:?}"
-        );
-        assert!(actions.try_recv().is_err(), "nothing was sent");
-    }
-
-    #[test]
-    fn online_players_can_be_looked_up_by_uuid() {
-        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
-        engine
-            .load_script(
-                "lookup",
-                "lookup.luau",
-                r#"
-                    local uuid = "174319CC-F69F-30D8-A279-6ACE57F2011E"
-                    local function show(when)
-                        local player = server.player(uuid)
-                        print(when, player and player.name)
-                    end
-                    show("before")
-                    server.on("player_join", function() show("join") end)
-                    server.on("player_quit", function() show("quit") end)
-                    server.on("block_break", function()
-                        show("later")
-                        local player = server.player(uuid)
-                        if player then player.send_message("found you") end
-                    end)
-                "#,
-            )
-            .unwrap();
-        let block_break = || {
-            Event::BlockBreak(crate::BlockChange {
-                player: steve(),
-                position: crate::Position { x: 0, y: 0, z: 0 },
-                block: "minecraft:dirt".into(),
-            })
-        };
-        engine.dispatch(&steve_joins());
-        engine.dispatch(&block_break());
-        engine.dispatch(&Event::PlayerQuit(steve()));
-        engine.dispatch(&block_break());
-        assert_eq!(
-            messages(&lines),
-            [
-                "before\tnil",
-                "join\tSteve",
-                "later\tSteve",
-                "quit\tSteve",
-                "later\tnil"
-            ]
-        );
-        assert_eq!(
-            actions.try_recv().unwrap(),
+            setup.actions.try_recv().unwrap(),
             Action::SendMessage {
                 player: steve().uuid,
-                message: "found you".into()
+                message: "hi Steve".into()
             }
-        );
-        assert!(actions.try_recv().is_err());
-
-        // A plugin loaded later sees who is already online.
-        engine.dispatch(&steve_joins());
-        engine
-            .load_script(
-                "late",
-                "late.luau",
-                r#"print(server.player("174319cc-f69f-30d8-a279-6ace57f2011e").name)"#,
-            )
-            .unwrap();
-        assert_eq!(messages(&lines).last().unwrap(), "Steve");
-    }
-
-    #[test]
-    fn damage_can_be_cancelled_and_health_changed() {
-        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
-        engine
-            .load_script(
-                "medic",
-                "medic.luau",
-                r#"
-                    server.on("player_damage", function(event)
-                        print(`{event.cause} {event.amount} of {event.health}`)
-                        if event.cause == "fall" then event.cancel() end
-                    end)
-                    server.on("player_respawn", function(player)
-                        player:set_health(10)
-                        player.damage(2.5, "magic")
-                        player.damage(1)
-                    end)
-                    server.on("player_death", function(event)
-                        print(`{event.cause}: {event.message}`)
-                        event.player.damage(1, "laser")
-                    end)
-                "#,
-            )
-            .unwrap();
-        let steve = crate::Player {
-            name: "Steve".into(),
-            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
-        };
-        let damage = |cause: &str| {
-            Event::PlayerDamage(crate::Damage {
-                player: steve.clone(),
-                cause: cause.into(),
-                amount: 4.0,
-                health: 20.0,
-            })
-        };
-        assert!(engine.dispatch(&damage("fall")));
-        assert!(!engine.dispatch(&damage("void")));
-
-        engine.dispatch(&Event::PlayerRespawn(steve.clone()));
-        let uuid = steve.uuid.clone();
-        assert_eq!(
-            actions.try_recv().unwrap(),
-            Action::SetHealth {
-                player: uuid.clone(),
-                health: 10.0
-            }
-        );
-        assert_eq!(
-            actions.try_recv().unwrap(),
-            Action::Damage {
-                player: uuid.clone(),
-                amount: 2.5,
-                cause: "magic".into()
-            }
-        );
-        assert_eq!(
-            actions.try_recv().unwrap(),
-            Action::Damage {
-                player: uuid,
-                amount: 1.0,
-                cause: "none".into()
-            },
-            "damage without a cause"
-        );
-
-        // Unknown causes are errors, so nothing is sent.
-        engine.dispatch(&Event::PlayerDeath {
-            player: steve.clone(),
-            cause: "void".into(),
-            message: "Steve fell out of the world".into(),
-        });
-        assert!(actions.try_recv().is_err());
-        assert_eq!(
-            messages(&lines),
-            [
-                "fall 4 of 20",
-                "void 4 of 20",
-                "void: Steve fell out of the world"
-            ]
         );
     }
 
     #[test]
-    fn joins_and_quits_can_replace_the_vanilla_message() {
-        let (mut engine, _, mut actions) = engine_with_actions(DEFAULT_LIMITS);
-        engine
-            .load_script(
-                "greeter",
-                "greeter.luau",
-                r#"
-                    server.on("player_join", function(event)
-                        event.cancel()
-                        server.broadcast(`+ {event.player.name}`)
-                    end)
-                    server.on("player_quit", function(event)
-                        if event.is_cancelled() then error("not cancelled yet") end
-                    end)
-                "#,
-            )
-            .unwrap();
-        assert!(
-            engine.dispatch(&steve_joins()),
-            "the vanilla message is cancelled"
-        );
-        assert_eq!(
-            actions.try_recv().unwrap(),
-            Action::Broadcast("+ Steve".into())
-        );
-        let quit = Event::PlayerQuit(crate::Player {
-            name: "Steve".into(),
-            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
-        });
-        assert!(!engine.dispatch(&quit), "the vanilla message stays");
-    }
-
-    #[test]
-    fn output_while_loading_waits_for_the_load_to_be_told() {
-        let (mut engine, lines, _) = engine_with_actions(DEFAULT_LIMITS);
-        let (result, held) = engine.load(
-            "hello",
-            Path::new("."),
-            Path::new("hello.luau"),
+    fn the_scheduler_runs_timeouts_intervals_and_waits() {
+        let setup = setup();
+        let mut plugin = enabled(
+            &setup,
             r#"
-                print("loading")
-                server.on("player_join", function() print("joined") end)
+                local Core = require("@bedrock-rs/core")
+                local Logger, Server = Core.Logger, Core.Server
+                local interval
+                return {
+                    on_enable = function()
+                        local world = Server.getWorld()
+                        world:run(function() Logger.info("next tick") end)
+                        world:runTimeout(function() Logger.info("after 5") end, 5)
+                        interval = world:runInterval(function() Logger.info("every 3") end, 3)
+                        Logger.info("waiting")
+                        world:waitTicks(4)
+                        Logger.info("waited 4")
+                        world:clearRun(interval)
+                    end,
+                }
             "#,
         );
-        result.unwrap();
-        assert!(
-            messages(&lines).is_empty(),
-            "held until the load is reported"
+        assert_eq!(messages(&setup), ["waiting"], "on_enable is waiting");
+        tick(&setup, &mut plugin, 10);
+        assert_eq!(
+            messages(&setup),
+            ["waiting", "next tick", "every 3", "waited 4", "after 5"]
         );
-        drop(held);
-        assert_eq!(messages(&lines), ["loading"]);
+    }
 
-        // Afterwards the plugin prints as it goes.
-        engine.dispatch(&steve_joins());
-        assert_eq!(messages(&lines), ["loading", "joined"]);
-
-        // A script that fails still has its output shown, after the error.
-        let (result, held) = engine.load(
-            "broken",
-            Path::new("."),
-            Path::new("broken.luau"),
-            r#"print("almost") error("no")"#,
+    #[test]
+    fn failures_in_handlers_and_tasks_are_logged_not_fatal() {
+        let setup = setup();
+        let mut plugin = enabled(
+            &setup,
+            r#"
+                local Core = require("@bedrock-rs/core")
+                local Logger, Server = Core.Logger, Core.Server
+                return {
+                    on_load = function()
+                        Server.on("player_join", function() error("first") end)
+                        Server.on("player_join", function() Logger.info("second") end)
+                    end,
+                    on_enable = function()
+                        Server.getWorld():run(function() error("task") end)
+                    end,
+                }
+            "#,
         );
-        assert!(result.is_err());
-        drop(held);
-        assert_eq!(messages(&lines).last().unwrap(), "almost");
+        plugin.dispatch(&Event::PlayerJoin(steve()));
+        tick(&setup, &mut plugin, 2);
+        assert_eq!(messages(&setup), ["second"]);
+    }
+
+    #[test]
+    fn runaway_scripts_are_stopped() {
+        let setup = setup();
+        let err = load(&setup, "while true do end").err().unwrap().to_string();
+        assert!(err.contains("execution time limit"), "{err}");
+        let mut plugin = load(
+            &setup,
+            "return { on_load = function() while true do end end }",
+        )
+        .unwrap();
+        state::lock(&setup.state).phase = Phase::Loading;
+        let err = plugin.on_load().unwrap_err().to_string();
+        assert!(err.contains("execution time limit"), "{err}");
+    }
+
+    #[test]
+    fn the_api_is_read_only_and_players_have_methods() {
+        let setup = setup();
+        let mut plugin = enabled(
+            &setup,
+            r#"
+                local Core = require("@bedrock-rs/core")
+                local Server = Core.Server
+                return {
+                    on_load = function()
+                        Server.on("player_join", function(event)
+                            local ok = pcall(function() Server.broadcast = nil end)
+                            assert(not ok, "Server is read-only")
+                            local ok2, err = pcall(function() event.player.sendMessage("x") end)
+                            assert(not ok2 and tostring(err):find("is a method"), tostring(err))
+                            Core.Player.kick(event.player)
+                        end)
+                    end,
+                }
+            "#,
+        );
+        plugin.dispatch(&Event::PlayerJoin(steve()));
+        assert!(messages(&setup).is_empty(), "{:?}", messages(&setup));
     }
 }

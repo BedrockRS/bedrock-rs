@@ -125,7 +125,7 @@ impl Builtin {
                 let mut names = server.players.names();
                 names.sort_by_key(|name| name.to_lowercase());
                 CommandReply::ok(match names.len() {
-                    0 => "Nobody is online.".to_owned(),
+                    0 => "Nobody is online".to_owned(),
                     1 => format!("1 player is online: {}", names[0]),
                     count => format!("{count} players are online: {}", names.join(", ")),
                 })
@@ -156,7 +156,7 @@ impl Builtin {
                     amount: f32::MAX,
                 };
                 if !server.logins.send(uuid, kill) {
-                    return CommandReply::error(format!("{name} is not online."));
+                    return CommandReply::error(format!("{name} is not online"));
                 }
                 CommandReply::ok(format!("Killed {name}"))
             }
@@ -164,27 +164,42 @@ impl Builtin {
                 let Some((uuid, name)) = target(matched) else {
                     return missing_player();
                 };
-                if !server.ops.add(uuid, &name) {
-                    return CommandReply::error(format!("{name} is already an operator."));
+                // Permissions go by what the player's login named them by.
+                let Some(ids) = server.logins.ids(uuid) else {
+                    return missing_player();
+                };
+                match server.permissions.op(&ids, &name) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return CommandReply::error(format!("{name} is already an operator"));
+                    }
+                    Err(err) => return CommandReply::error(format!("Couldn't op {name}: {err}")),
                 }
-                server.logins.send(uuid, Control::SetOperator(true));
+                server.logins.send(
+                    uuid,
+                    Control::SetPermission(crate::permissions::Permission::Operator),
+                );
                 tracing::info!("{} made {name} an operator", sender.name());
-                CommandReply::ok(format!("Made {name} an operator."))
+                CommandReply::ok(format!("Made {name} an operator"))
             }
             Self::Deop => {
                 let Some((uuid, name)) = target(matched) else {
                     return missing_player();
                 };
-                if !server.ops.remove(uuid) {
-                    return CommandReply::error(format!("{name} is not an operator."));
+                let Some(ids) = server.logins.ids(uuid) else {
+                    return missing_player();
+                };
+                if !server.permissions.deop(&ids) {
+                    return CommandReply::error(format!("{name} is not an operator"));
                 }
-                server.logins.send(uuid, Control::SetOperator(false));
+                let now = server.permissions.of(&ids);
+                server.logins.send(uuid, Control::SetPermission(now));
                 tracing::info!("{} took away {name}'s operator status", sender.name());
-                CommandReply::ok(format!("{name} is no longer an operator."))
+                CommandReply::ok(format!("{name} is no longer an operator"))
             }
             Self::Stop => {
                 server.request_stop();
-                CommandReply::ok("Stopping the server.")
+                CommandReply::ok("Stopping the server")
             }
         }
     }
@@ -212,7 +227,7 @@ fn help(server: &Server, sender: &Sender, matched: &Matched) -> CommandReply {
             .find(&name)
             .filter(|command| command.visible_to(sender))
         else {
-            return CommandReply::error(format!("Unknown command: /{name}."));
+            return CommandReply::error(format!("Unknown command: /{name}"));
         };
         let spec = &command.spec;
         let mut reply = CommandReply::ok(format!("/{}: {}", spec.name, spec.description));
@@ -234,7 +249,7 @@ fn help(server: &Server, sender: &Sender, matched: &Matched) -> CommandReply {
             ));
         }
     }
-    reply.push_ok("Type /help <command> to see how to use one.");
+    reply.push_ok("Type /help <command> to see how to use one");
     reply
 }
 
@@ -248,7 +263,7 @@ fn game_mode(server: &Server, sender: &Sender, matched: &Matched) -> CommandRepl
     };
     let Some(mode) = mode else {
         return CommandReply::error(
-            "Unknown game mode. Use survival, creative, adventure, spectator, default, or 0, 1 or 2.",
+            "Unknown game mode. Use survival, creative, adventure, spectator, default, or 0, 1 or 2",
         );
     };
     let (uuid, name) = match (target(matched), sender) {
@@ -259,13 +274,13 @@ fn game_mode(server: &Server, sender: &Sender, matched: &Matched) -> CommandRepl
         }
     };
     if !server.logins.send(uuid, Control::SetGameMode(mode)) {
-        return CommandReply::error(format!("{name} is not online."));
+        return CommandReply::error(format!("{name} is not online"));
     }
     let own = matches!(sender, Sender::Player(player) if player.uuid == uuid);
     if own {
-        CommandReply::ok(format!("Set your game mode to {}.", mode.name()))
+        CommandReply::ok(format!("Set your game mode to {}", mode.name()))
     } else {
-        CommandReply::ok(format!("Set {name}'s game mode to {}.", mode.name()))
+        CommandReply::ok(format!("Set {name}'s game mode to {}", mode.name()))
     }
 }
 
@@ -281,7 +296,7 @@ fn game_rule(server: &Server, sender: &Sender, matched: &Matched) -> CommandRepl
         return CommandReply::ok(listed.join(", "));
     };
     let Some(rule) = Rule::from_name(name) else {
-        return CommandReply::error(format!("Game rule {name} is not supported yet."));
+        return CommandReply::error(format!("Game rule {name} is not supported yet"));
     };
     let Some(ArgValue::Bool(value)) = matched.arg("value") else {
         return CommandReply::ok(format!("{} = {}", rule.name(), values.get(rule)));
@@ -311,5 +326,5 @@ fn target(matched: &Matched) -> Option<(Uuid, String)> {
 }
 
 fn missing_player() -> CommandReply {
-    CommandReply::error("Name a player who is online.")
+    CommandReply::error("Name a player who is online")
 }

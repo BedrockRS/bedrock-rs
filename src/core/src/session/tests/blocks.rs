@@ -502,6 +502,71 @@ fn doors_place_both_halves_and_open_unless_sneaking() {
 }
 
 #[test]
+fn visitors_only_look_around() {
+    use bedrockrs_protocol::packets::ability;
+
+    use crate::permissions::Permission;
+
+    let mut session = in_game_session();
+    session.set_game_mode(GameMode::Survival);
+    session.inventory = Inventory::with_hotbar(&["minecraft:wooden_door", "minecraft:stone"]);
+    let grass = BlockPos { x: 2, y: -61, z: 0 };
+    let reply = session
+        .handle(&use_on_block(&session, 0, grass, 1, 1.0))
+        .unwrap();
+    let Some(SessionEvent::PlacedBlock {
+        pos: door_at,
+        block,
+        other_half: Some((upper_at, upper, _)),
+        ..
+    }) = reply.events.first().cloned()
+    else {
+        panic!("expected a door, got {:?}", reply.events);
+    };
+    session.world.set_block(door_at, block);
+    session.world.set_block(upper_at, upper);
+
+    // Their client is told they may not build, mine or use doors.
+    let reply = session.permission_changed(Permission::Visitor);
+    assert_eq!(ids(&reply), [id::UPDATE_ABILITIES, id::TEXT]);
+    let abilities = session.own_abilities().0;
+    assert_eq!(abilities.player_permissions, 0);
+    let values = abilities.layers[0].values;
+    for denied in [ability::BUILD, ability::MINE, ability::DOORS_AND_SWITCHES] {
+        assert_eq!(values & denied, 0, "{denied:#x}");
+    }
+
+    // And the server refuses it anyway.
+    let done = break_action(player_action::PREDICT_DESTROY_BLOCK, grass);
+    let reply = session
+        .handle(&breaking_input(spawn_eyes(), 0.0, vec![done]))
+        .unwrap();
+    assert!(!reply.events.contains(&SessionEvent::BrokeBlock(grass)));
+    let reply = session
+        .handle(&use_on_block(&session, 1, door_at, 4, 0.5))
+        .unwrap();
+    assert!(
+        !reply.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Toggled { .. } | SessionEvent::PlacedBlock { .. }
+        )),
+        "{:?}",
+        reply.events
+    );
+
+    // Members may again.
+    session.permission_changed(Permission::Member);
+    assert_ne!(
+        session.own_abilities().0.layers[0].values & ability::BUILD,
+        0
+    );
+    let reply = session
+        .handle(&breaking_input(spawn_eyes(), 0.0, vec![done]))
+        .unwrap();
+    assert!(reply.events.contains(&SessionEvent::BrokeBlock(grass)));
+}
+
+#[test]
 fn ladders_go_on_full_blocks_only_and_grass_is_placed_into() {
     let mut session = in_game_session();
     session.inventory = Inventory::with_hotbar(&["minecraft:ladder", "minecraft:stone"]);

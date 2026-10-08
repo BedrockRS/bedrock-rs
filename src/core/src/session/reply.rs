@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::damage::DamageCause;
 use crate::entities::{ItemStack, PickedUp};
 use crate::game_mode::GameMode;
+use crate::permissions::PlayerIds;
 use crate::players::{Movement, Profile, View};
 use crate::storage::SavedInventory;
 
@@ -33,8 +34,9 @@ pub enum SessionEvent {
     /// The Login's multiplayer token needs verifying; the result goes to
     /// [`Session::authenticated`](super::Session::authenticated).
     Authenticate(String),
-    /// The player's verified identity: they hold this UUID from now on.
-    LoggedIn(Uuid),
+    /// The player's verified identity: they hold this UUID from now on, and
+    /// their permission goes by these IDs.
+    LoggedIn { uuid: Uuid, ids: PlayerIds },
     /// The player finished spawning and is in the world.
     Joined {
         profile: Profile,

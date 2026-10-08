@@ -4,23 +4,26 @@
 # Python bytecode from the data scripts
 __pycache__/
 
-# Server runtime files: created when the server runs, never committed.
-# Plugins and the start scripts in server/ are tracked.
-/server/server.properties
-/server/bedrockrs.toml
-/server/ops.json
-/server/keys/
-/server/worlds/*
-!/server/worlds/.gitkeep
-*.pem
+# server/ is where the server runs during development. The server creates
+# everything it needs in the folder it runs in (server.properties,
+# permissions.json, keys/, plugins/, worlds/), so only the start scripts and
+# the README are tracked.
+/server/*
+!/server/start.bat
+!/server/start.sh
+!/server/README.md
 
 # The same files, from running the server in the repository root by mistake.
 /server.properties
 /bedrockrs.toml
+/permissions.json
 /ops.json
 /keys/
 /worlds/
 /plugins/
+
+# Private keys, wherever they end up.
+*.pem
 
 # Editors and OS
 .vscode/

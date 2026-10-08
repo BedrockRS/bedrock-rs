@@ -5,7 +5,6 @@ members = ["src/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# Floor set by rustpython-vm 0.5 (the highest MSRV among our dependencies).
 rust-version = "1.93"
 publish = false
 
@@ -63,12 +62,11 @@ thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# Plugin engines (JS and Python are optional features of bedrockrs_plugins)
-deno_ast = { version = "0.53.3", features = ["transpiling"] }
-deno_core = "0.412.0"
+# Plugin engines, both embedded, so plugins run from source with nothing to install:
+# Luau, and JavaScript on QuickJS. rquickjs's `loader` resolves `import`s.
 mlua = { version = "0.12.1", features = ["luau"] }
+rquickjs = { version = "0.14.0", features = ["loader"] }
 notify = "8.2.0"
-rustpython-vm = { version = "0.5.0", default-features = false, features = ["compiler"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

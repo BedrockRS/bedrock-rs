@@ -20,7 +20,7 @@ pub mod game_rules;
 pub mod inventory;
 pub mod items;
 pub mod logins;
-pub mod ops;
+pub mod permissions;
 pub mod placement;
 pub mod players;
 pub mod server;

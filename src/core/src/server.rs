@@ -23,7 +23,7 @@ use crate::game_mode::GameMode;
 use crate::game_rules::GameRules;
 use crate::items::items;
 use crate::logins::{Control, Logins};
-use crate::ops::Operators;
+use crate::permissions::Permissions;
 use crate::placement;
 use crate::players::Players;
 use crate::storage::SavedPlayer;
@@ -51,8 +51,8 @@ pub struct Server {
     pub falling: FallingBlocks,
     /// Every slash command, built-in and from plugins.
     pub commands: Commands,
-    /// Players who may run operator commands.
-    pub ops: Operators,
+    /// Who is an operator, member or visitor: `permissions.json`.
+    pub permissions: Permissions,
     /// The game mode of players who have not played here before.
     pub default_game_mode: GameMode,
     /// The world's game rules.
@@ -81,7 +81,7 @@ impl Server {
             items: ItemEntities::new(),
             falling: FallingBlocks::new(),
             commands: Commands::new(),
-            ops: Operators::in_memory(),
+            permissions: Permissions::in_memory(),
             default_game_mode: GameMode::Creative,
             game_rules: GameRules::in_memory(),
             tick: AtomicU64::new(0),
@@ -92,9 +92,9 @@ impl Server {
         }
     }
 
-    /// Keeps operators in `ops` rather than in memory.
-    pub fn with_operators(mut self, ops: Operators) -> Self {
-        self.ops = ops;
+    /// Keeps permissions in `permissions` rather than in memory.
+    pub fn with_permissions(mut self, permissions: Permissions) -> Self {
+        self.permissions = permissions;
         self
     }
 
@@ -165,6 +165,8 @@ impl Server {
     /// Advances the world by one tick; called by the game loop.
     pub fn tick(&self, tick: u64) {
         self.tick.store(tick, Ordering::Relaxed);
+        // Plugins' scheduled tasks run on their own thread, by this tick.
+        self.plugins.tick(tick);
         self.check_blocks();
         let (falling, landed) = self.falling.tick(&self.world, tick);
         for (entity_id, landed) in landed {
@@ -772,6 +774,66 @@ mod tests {
         (membership, queue)
     }
 
+    #[tokio::test]
+    async fn op_and_deop_keep_permissions_by_playfab_id() {
+        use crate::commands::Sender;
+        use crate::permissions::{PERMISSIONS_FILE, Permission, Permissions, PlayerIds};
+
+        let directory = std::env::temp_dir().join(format!("bedrockrs-op-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(PERMISSIONS_FILE);
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        )
+        .with_permissions(Permissions::open(&path).unwrap());
+        let (_steve, _) = join_at(&server, "Steve", ChunkPos::new(0, 0));
+        let (_alex, _) = join_at(&server, "Alex", ChunkPos::new(0, 0));
+        let (steve, _) = server.players.find("Steve").unwrap();
+        let (alex, _) = server.players.find("Alex").unwrap();
+        let steve_ids = PlayerIds {
+            pfid: Some("4A1B2C3D5E6F7A8B".into()),
+            xuid: Some("2535400000000000".into()),
+        };
+        let (controls, mut received) = mpsc::channel(4);
+        let _steve_login = server.logins.claim(steve, steve_ids.clone(), controls);
+        let (controls, _) = mpsc::channel(4);
+        // Alex's login carried no PlayFab ID (an offline login).
+        let _alex_login = server.logins.claim(alex, PlayerIds::default(), controls);
+
+        let run = |line: &'static str| server.run_command(&Sender::Console, line);
+        let reply = run("op Steve").await;
+        assert!(reply.succeeded(), "{reply:?}");
+        assert_eq!(
+            received.try_recv().unwrap(),
+            Control::SetPermission(Permission::Operator)
+        );
+        assert_eq!(server.permissions.of(&steve_ids), Permission::Operator);
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!([{ "permission": "operator", "pfid": "4A1B2C3D5E6F7A8B" }])
+        );
+        assert!(!run("op Steve").await.succeeded(), "already an operator");
+
+        let reply = run("deop Steve").await;
+        assert!(reply.succeeded(), "{reply:?}");
+        assert_eq!(
+            received.try_recv().unwrap(),
+            Control::SetPermission(Permission::Member)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "[]");
+        assert!(!run("deop Steve").await.succeeded(), "not an operator");
+
+        let reply = run("op Alex").await;
+        assert!(!reply.succeeded());
+        assert!(reply.lines[0].text.contains("no PlayFab ID"), "{reply:?}");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[test]
     fn broken_blocks_reach_players_who_have_the_chunk() {
         let server = Server::new(
@@ -1313,7 +1375,10 @@ mod tests {
         assert!(ids(&mut steve_queue).is_empty());
 
         let (kick, mut kicks) = mpsc::channel(1);
-        let _claim = server.logins.claim(steve_uuid, kick);
+        let _claim =
+            server
+                .logins
+                .claim(steve_uuid, crate::permissions::PlayerIds::default(), kick);
         server.apply(Action::Kick {
             player: steve_uuid.to_string(),
             reason: "Bye".into(),
@@ -1343,7 +1408,11 @@ mod tests {
             Authenticator::offline(),
         );
         let (controls, mut received) = mpsc::channel(4);
-        let _claim = server.logins.claim(Uuid::new_v4(), controls);
+        let _claim = server.logins.claim(
+            Uuid::new_v4(),
+            crate::permissions::PlayerIds::default(),
+            controls,
+        );
         let warp = bedrockrs_plugins::PluginCommand {
             plugin: "warps".into(),
             spec: bedrockrs_plugins::CommandSpec {

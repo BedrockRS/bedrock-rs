@@ -2,7 +2,8 @@
 //!
 //! A signed-in client's Login carries a multiplayer token from the Minecraft
 //! authorization service: a JWT signed with RS256 whose claims hold the
-//! player's XUID (`xid`), gamertag (`xname`) and public key (`cpk`). The
+//! player's XUID (`xid`), PlayFab ID (`mid`), gamertag (`xname`) and public
+//! key (`cpk`). The
 //! [`Authenticator`] checks the signature against the service's published keys
 //! and the token's issuer, audience and lifetime, as gophertunnel does. Only a
 //! verified token's identity is used: the XUID-derived UUID becomes the
@@ -385,9 +386,11 @@ pub(crate) mod tests {
             "nbf": now,
             "exp": now + 3600,
             "xid": xuid,
+            "mid": format!("PF{xuid}"),
             "xname": name,
             "cpk": cpk,
             "ipt": "PlayFab",
+            "tid": "20CA2",
         })
     }
 
@@ -397,6 +400,7 @@ pub(crate) mod tests {
         let token = issuer.token("2535400000000000", "Steve", &json!("MHYw"));
         let identity = issuer.authenticator().verify(&token).await.unwrap();
         assert_eq!(identity.display_name.as_deref(), Some("Steve"));
+        assert_eq!(identity.pfid.as_deref(), Some("PF2535400000000000"));
         assert_eq!(
             identity.identity.unwrap().to_string(),
             "174319cc-f69f-30d8-a279-6ace57f2011e"

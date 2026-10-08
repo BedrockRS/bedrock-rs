@@ -34,12 +34,6 @@ cd bedrock-rs
 cargo build
 ```
 
-The optional JavaScript and Python plugin engines are behind features:
-
-```bash
-cargo build --features js,python
-```
-
 ### Run
 
 Run the server from the `server/` folder, which holds its configuration, worlds, plugins and keys:
@@ -57,9 +51,11 @@ Or use `server/start.bat` / `server/start.sh`, which do the same with a release 
 |---|---|
 | `src/protocol` | Packet definitions, encoding, batching, NBT. No networking or game logic. |
 | `src/net` | NetherNet signaling and WebRTC. Moves bytes; knows nothing about packets. |
-| `src/plugins` | The plugin engines and the API exposed to scripts. |
+| `src/plugins` | The plugin engines (Luau and JavaScript) and the API they share. |
 | `src/core` | The game: tick loop, world, players, sessions, storage, and the binary. |
 | `server/` | Runtime files only. Never put source code here. |
+| `packages/bedrock-rs-core` | The types of the JavaScript API (`@bedrock-rs/core`) for plugin authors' editors. Keep them in step with `src/plugins/src/javascript.rs`, and the two engines in step with each other. |
+| `examples/plugins` | The same plugin in Luau and in JavaScript. |
 | `docs/` | Design notes. Update `ARCHITECTURE.md` when a design decision changes. |
 | `tools/` | Scripts that generate `src/core/data`. |
 
@@ -93,7 +89,7 @@ For networking or protocol changes, testing with a real Bedrock client is strong
 * World generation and vanilla world (LevelDB) support
 * Blocks, items, inventories and containers
 * Entities, health, damage and survival gameplay
-* The plugin API, and the JavaScript and Python engines
+* The plugin API, in both engines
 * Configuration and console commands
 * Performance improvements
 * Tests and documentation
