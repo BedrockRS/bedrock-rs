@@ -22,7 +22,7 @@ labels: bug
 
 ## Console output
 
-<!-- Turn on `system_noise` in bedrockrs.toml for more detail. For crashes, run with RUST_BACKTRACE=1. -->
+<!-- Set `log-level=debug` in server.properties for more detail. For crashes, run with RUST_BACKTRACE=1. -->
 
 ```text
 

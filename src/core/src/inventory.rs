@@ -20,9 +20,6 @@ use bedrockrs_protocol::packets::{
     UI_WINDOW, container,
 };
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-
 use crate::entities::ItemStack;
 use crate::items::{ItemNbt, SHIELD, armor_slot, intern_nbt, items};
 use crate::storage::{SavedInventory, SavedStack};
@@ -429,17 +426,7 @@ impl Inventory {
                     continue;
                 };
                 let count = stack.count.clamp(1, item.max_stack);
-                let nbt = match stack.nbt.as_deref().map(|nbt| STANDARD.decode(nbt)) {
-                    None => None,
-                    Some(Ok(nbt)) => Some(intern_nbt(&nbt)),
-                    Some(Err(err)) => {
-                        tracing::warn!(
-                            "Ignored the unreadable NBT of a saved {}: {err}",
-                            stack.item
-                        );
-                        None
-                    }
-                };
+                let nbt = stack.nbt.as_deref().map(intern_nbt);
                 placed.push((index, (item.network_id, count, stack.meta, nbt)));
             }
             placed
@@ -480,7 +467,7 @@ impl Inventory {
                         item: items().get(stack.item)?.name.clone(),
                         count: stack.count,
                         meta: stack.metadata,
-                        nbt: stack.nbt.map(|nbt| STANDARD.encode(nbt)),
+                        nbt: stack.nbt.map(<[u8]>::to_vec),
                     })
                 })
                 .collect()

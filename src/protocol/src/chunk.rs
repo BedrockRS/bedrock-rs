@@ -14,10 +14,62 @@ pub const SUB_CHUNK_VERSION: u8 = 9;
 /// Header of a biome storage that repeats the previous sub-chunk's biomes (`0x7F << 1 | 1`).
 const SAME_AS_PREVIOUS: u8 = 0xFF;
 
-const VALUES: usize = 16 * 16 * 16;
+/// Values in a storage: 16×16×16.
+pub const VALUES: usize = 16 * 16 * 16;
 
 /// Bits per packed index the format supports; indices never span two words.
-const BIT_SIZES: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 8, 16];
+pub const BIT_SIZES: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 8, 16];
+
+/// Smallest supported index width that can address a palette of
+/// `palette_len` entries (at least one).
+pub fn index_bits(palette_len: usize) -> u32 {
+    let needed = usize::BITS - palette_len.saturating_sub(1).leading_zeros();
+    *BIT_SIZES
+        .iter()
+        .find(|bits| **bits >= needed)
+        .expect("16 bits address any palette")
+}
+
+/// Words that hold 4096 indices of `bits` bits, as many as fit in each word
+/// (the rest of a word is padding, for 3, 5 and 6 bits). None for 0 bits.
+pub fn packed_words(bits: u32) -> usize {
+    if bits == 0 {
+        0
+    } else {
+        VALUES.div_ceil(32 / bits as usize)
+    }
+}
+
+/// Packs 4096 indices of `bits` bits into little-endian-ordered words, the
+/// first index in the lowest bits of the first word.
+pub fn pack_indices(indices: &[u16], bits: u32) -> Vec<u32> {
+    let mut words = vec![0u32; packed_words(bits)];
+    if bits == 0 {
+        return words;
+    }
+    let per_word = 32 / bits as usize;
+    for (position, index) in indices.iter().enumerate() {
+        let shift = (position % per_word) as u32 * bits;
+        words[position / per_word] |= u32::from(*index) << shift;
+    }
+    words
+}
+
+/// The 4096 indices of `bits` bits packed in `words`, which must be
+/// [`packed_words`] long.
+pub fn unpack_indices(words: &[u32], bits: u32) -> Vec<u16> {
+    if bits == 0 {
+        return vec![0; VALUES];
+    }
+    let per_word = 32 / bits as usize;
+    let mask = (1u32 << bits) - 1;
+    (0..VALUES)
+        .map(|position| {
+            let shift = (position % per_word) as u32 * bits;
+            ((words[position / per_word] >> shift) & mask) as u16
+        })
+        .collect()
+}
 
 /// 4096 values (block network IDs or biome IDs) stored as indices into a palette.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,11 +105,7 @@ impl PalettedStorage {
 
     /// Smallest supported index width that can address the whole palette.
     fn bits_per_index(&self) -> u32 {
-        let needed = usize::BITS - (self.palette.len() - 1).leading_zeros();
-        *BIT_SIZES
-            .iter()
-            .find(|bits| **bits >= needed)
-            .expect("16 bits address any palette")
+        index_bits(self.palette.len())
     }
 
     /// Network encoding: a header with the index width and a network flag,
@@ -67,13 +115,7 @@ impl PalettedStorage {
         let bits = self.bits_per_index();
         writer.u8(((bits as u8) << 1) | 1);
         if bits > 0 {
-            let per_word = 32 / bits as usize;
-            let mut words = vec![0u32; VALUES.div_ceil(per_word)];
-            for (position, palette_index) in self.indices.iter().enumerate() {
-                let shift = (position % per_word) as u32 * bits;
-                words[position / per_word] |= u32::from(*palette_index) << shift;
-            }
-            for word in words {
+            for word in pack_indices(&self.indices, bits) {
                 writer.u32_le(word);
             }
             writer.var_i32(self.palette.len() as i32);
@@ -138,6 +180,23 @@ pub fn level_chunk_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indices_pack_and_unpack_at_every_width() {
+        for bits in BIT_SIZES {
+            let largest = if bits == 0 { 0 } else { (1u32 << bits) - 1 };
+            let indices: Vec<u16> = (0..VALUES as u32)
+                .map(|position| (position.wrapping_mul(2_654_435_761) % (largest + 1)) as u16)
+                .collect();
+            let words = pack_indices(&indices, bits);
+            assert_eq!(words.len(), packed_words(bits), "{bits} bits");
+            assert_eq!(unpack_indices(&words, bits), indices, "{bits} bits");
+        }
+        // 3 bits: ten to a word, the last two bits padding.
+        assert_eq!(packed_words(3), 410);
+        assert_eq!((index_bits(1), index_bits(2), index_bits(5)), (0, 1, 3));
+        assert_eq!((index_bits(33), index_bits(257)), (6, 16));
+    }
 
     fn network(storage: &PalettedStorage) -> Vec<u8> {
         let mut writer = Writer::new();

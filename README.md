@@ -56,7 +56,7 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 - [x] Every block and block-placing item can be placed: doors, beds and tall flowers as two blocks, signs, seeds, redstone and the like
 - [x] Support: ladders, torches, plants and the like need something to hold them, and pop off without it, a block a tick; vines and lichen face by face, scaffolding by stability, reaching out and climbing as in vanilla
 - [x] Mojang's JSON-defined vanilla blocks (wool and concrete slabs and stairs, red shrub, shelf mushroom)
-- [x] World persistence (compressed chunk files, versioned format)
+- [x] World persistence in vanilla's LevelDB format: vanilla worlds and `.mcworld` folders open as they are
 - [x] Player persistence (position, rotation, flying state, inventory, game mode)
 - [x] Per-player game modes: survival, creative, adventure and spectator
 
@@ -105,9 +105,10 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 - [x] Operators (`/op`, `/deop`, `ops.json`)
 - [ ] Movement validation (speed, teleport and breaking-time checks)
 - [ ] Advertised public addresses for NAT'd deployments
-- [ ] Vanilla world import (LevelDB)
+- [x] Vanilla world import (LevelDB)
+- [x] `level.dat`, so vanilla opens BedrockRS worlds (spawn and game rules kept there, as vanilla does)
 - [ ] Target selectors beyond `@s` (`@a`, `@p`, …)
-- [ ] More `bedrockrs.toml` settings (server name, max players, …)
+- [ ] More `server.properties` settings (server name, max players, …)
 - [ ] Protocol 2216+ (Bedrock 26.60)
 
 ## 📁 Project structure
@@ -120,7 +121,7 @@ bedrock-rs/
 │   ├── plugins/          # bedrockrs_plugins: sandboxed, hot-reloading plugin engine
 │   └── protocol/         # bedrockrs_protocol: packet codec, batching and NBT
 ├── server/               # where the server runs
-│   ├── bedrockrs.toml    # configuration (created on first run)
+│   ├── server.properties # configuration, vanilla's format (created on first run)
 │   ├── ops.json          # operators (created by the first /op)
 │   ├── plugins/          # plugins, one folder each
 │   ├── worlds/           # saved worlds
@@ -163,16 +164,17 @@ To make yourself an operator, join the server and type `op <your name>` in the c
 
 ## ⚙️ Configuration
 
-`server/bedrockrs.toml` is created with every setting at its default on first run:
+`server/server.properties` is created with every setting at its default on first run. It is vanilla's format, so a Bedrock Dedicated Server `server.properties` works as it is; properties BedrockRS does not use yet are ignored.
 
-```toml
-[logs]
-level = "info"                  # error, warn, info, debug or trace
-chat = true                     # show chat in the console
-
-[players]
-default_game_mode = "creative"  # for players joining for the first time
+```properties
+level-name=Bedrock level   # the world folder in worlds/
+level-type=FLAT            # only FLAT so far
+gamemode=creative          # for players joining for the first time
+log-level=info             # BedrockRS only: error, warn, info, debug or trace
+log-chat=true              # BedrockRS only: show chat in the console
 ```
+
+Worlds are saved in vanilla's layout (`worlds/<level-name>/` with `level.dat`, `levelname.txt` and `db/`, a LevelDB database), so a vanilla world folder or an unzipped `.mcworld` copied into `server/worlds/` and named in `level-name` opens as it is, and a BedrockRS world zipped as a `.mcworld` opens in vanilla. Its name comes from its own `levelname.txt`; its spawn and game rules from its `level.dat`.
 
 Network settings can be overridden with environment variables:
 
@@ -183,7 +185,6 @@ Network settings can be overridden with environment variables:
 | `BEDROCKRS_MEDIA_IPS` | every IPv4 interface | Local addresses for WebRTC traffic |
 | `BEDROCKRS_ADVERTISE_IPS` | none | Public addresses offered to clients |
 | `BEDROCKRS_ICE_LITE` | `true` | `false` switches to full ICE |
-| `BEDROCKRS_WORLD_DIR` | `worlds/world` | Where the world is saved |
 | `BEDROCKRS_AUTHENTICATION` | `true` | `false` disables sign-in checks (offline testing only) |
 
 ## 🧩 Plugins

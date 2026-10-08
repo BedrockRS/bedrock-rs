@@ -417,7 +417,7 @@ fn start_game(
         server_editor_connection_policy: 0,
         allow_anonymous_block_drops_in_editor_worlds: false,
         level_id: String::new(),
-        world_name: "BedrockRS".into(),
+        world_name: world.name().to_owned(),
         template_content_identity: String::new(),
         trial: false,
         player_movement_settings: PlayerMovementSettings {

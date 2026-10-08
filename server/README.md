@@ -4,10 +4,10 @@ The folder BedrockRS runs in. Everything the server reads or writes at runtime l
 
 | Path | What it is | Tracked in git |
 |---|---|---|
-| `bedrockrs.toml` | Server configuration, created with defaults on first run | No |
+| `server.properties` | Server configuration in vanilla's format, created with defaults on first run | No |
 | `ops.json` | Operators, by UUID; changed with `/op` and `/deop` | No |
 | `plugins/` | Plugins, one folder each with a `plugin.json` | Yes |
-| `worlds/` | Saved worlds; the default world is `worlds/world` | No |
+| `worlds/` | Saved worlds in vanilla's layout; `level-name` picks one (default `worlds/Bedrock level`). Vanilla worlds and unzipped `.mcworld` folders can be copied in. | No |
 | `keys/identity.pem` | The server's identity key, created on first run. Keep it private. | No |
 | `start.bat` / `start.sh` | Build and start the server here | Yes |
 

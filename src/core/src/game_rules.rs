@@ -1,18 +1,21 @@
-//! Vanilla game rules, saved with the world and changed with `/gamerule`.
+//! Vanilla game rules, saved in the world's `level.dat` as vanilla keeps
+//! them, and changed with `/gamerule`.
 //!
 //! Only the rules the server acts on are here; vanilla's others follow as
-//! what they govern is built.
+//! what they govern is built. They stay in `level.dat` as they were.
 
 use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bedrockrs_protocol::packets::{GameRule, GameRuleValue};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-/// Where a world keeps its game rules, inside its directory.
-pub const GAME_RULES_FILE: &str = "game_rules.json";
+use crate::storage::LevelFile;
+
+/// Where worlds kept their game rules before `level.dat`, inside their
+/// folder. Read once, into a `level.dat` made for a world that had one.
+pub const OLD_GAME_RULES_FILE: &str = "game_rules.json";
 
 /// A true-or-false game rule, by its vanilla name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +58,8 @@ impl Rule {
     }
 }
 
-/// The value of every rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The value of every rule. (`Deserialize` reads an old `game_rules.json`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Values {
     /// Whether broken blocks drop their item, and blocks that lose their
@@ -84,6 +87,14 @@ impl Default for Values {
 }
 
 impl Values {
+    /// Every rule with its vanilla name, as `level.dat` holds them.
+    pub fn named(&self) -> Vec<(&'static str, bool)> {
+        Rule::ALL
+            .into_iter()
+            .map(|rule| (rule.name(), self.get(rule)))
+            .collect()
+    }
+
     pub fn get(&self, rule: Rule) -> bool {
         match rule {
             Rule::DoTileDrops => self.dotiledrops,
@@ -119,23 +130,11 @@ impl Values {
     }
 }
 
-/// Why the game rules could not be read.
-#[derive(Debug, thiserror::Error)]
-pub enum GameRulesError {
-    #[error("failed to read {}: {source}", .path.display())]
-    Read { path: PathBuf, source: io::Error },
-    #[error("invalid {}: {source}", .path.display())]
-    Invalid {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-}
-
-/// A world's game rules, saved to its directory whenever one changes.
+/// A world's game rules, saved to its `level.dat` whenever one changes.
 #[derive(Debug, Default)]
 pub struct GameRules {
     /// `None` keeps them in memory only, as in tests.
-    path: Option<PathBuf>,
+    level: Option<Arc<LevelFile>>,
     values: Mutex<Values>,
 }
 
@@ -144,22 +143,43 @@ impl GameRules {
         Self::default()
     }
 
-    /// The rules saved in the world directory `world`; the defaults if none
-    /// are saved yet.
-    pub fn open(world: &Path) -> Result<Self, GameRulesError> {
-        let path = world.join(GAME_RULES_FILE);
-        let values = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|source| GameRulesError::Invalid {
-                path: path.clone(),
-                source,
-            })?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Values::default(),
-            Err(source) => return Err(GameRulesError::Read { path, source }),
-        };
-        Ok(Self {
-            path: Some(path),
+    /// The rules in `level`, the `level.dat` of the world in `world`: the
+    /// defaults for any it does not have. A `level.dat` made as the world
+    /// opened takes the rules of the world's old `game_rules.json`, if any.
+    pub fn of_level(level: Arc<LevelFile>, world: &Path) -> Self {
+        let mut values = Values::default();
+        if level.created() {
+            let old = world.join(OLD_GAME_RULES_FILE);
+            if let Ok(text) = fs::read_to_string(&old) {
+                match serde_json::from_str::<Values>(&text) {
+                    Ok(saved) => {
+                        let moved = level.update(|level| {
+                            for (rule, value) in saved.named() {
+                                level.set_game_rule(rule, value);
+                            }
+                        });
+                        match moved {
+                            Ok(()) => tracing::info!(
+                                "Moved the game rules from {} into level.dat; {OLD_GAME_RULES_FILE} is no longer read",
+                                old.display()
+                            ),
+                            Err(err) => tracing::error!("Couldn't save the game rules: {err}"),
+                        }
+                    }
+                    Err(err) => tracing::warn!("Ignored {}: {err}", old.display()),
+                }
+            }
+        }
+        let saved = level.get();
+        for rule in Rule::ALL {
+            if let Some(value) = saved.game_rule(rule.name()) {
+                *values.slot(rule) = value;
+            }
+        }
+        Self {
+            level: Some(level),
             values: Mutex::new(values),
-        })
+        }
     }
 
     pub fn values(&self) -> Values {
@@ -173,11 +193,10 @@ impl GameRules {
             return None;
         }
         *values.slot(rule) = value;
-        if let Some(path) = &self.path {
-            let text = serde_json::to_string_pretty(&*values).expect("game rules serialize");
-            if let Err(err) = fs::write(path, text + "\n") {
-                tracing::error!("Couldn't save the game rules to {}: {err}", path.display());
-            }
+        if let Some(level) = &self.level
+            && let Err(err) = level.update(|level| level.set_game_rule(rule.name(), value))
+        {
+            tracing::error!("Couldn't save the game rules: {err}");
         }
         Some(*values)
     }
@@ -189,26 +208,63 @@ impl GameRules {
 
 #[cfg(test)]
 mod tests {
+    use bedrockrs_protocol::types::BlockPos;
+
     use super::*;
+    use crate::storage::tests::temporary_world;
+    use crate::storage::{LevelDat, NewWorld};
+
+    fn level(world: &Path) -> Arc<LevelFile> {
+        let file = LevelFile::open(world, || {
+            LevelDat::new_world(&NewWorld {
+                name: "Rules",
+                spawn: BlockPos::default(),
+                game_type: 1,
+                game_rules: &Values::default().named(),
+            })
+        })
+        .unwrap();
+        Arc::new(file)
+    }
 
     #[test]
-    fn rules_are_saved_with_the_world() {
-        let world =
-            std::env::temp_dir().join(format!("bedrockrs-game-rules-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&world);
+    fn rules_are_saved_in_level_dat() {
+        let world = temporary_world("game-rules");
         fs::create_dir_all(&world).unwrap();
 
-        let rules = GameRules::open(&world).unwrap();
+        let rules = GameRules::of_level(level(&world), &world);
         assert_eq!(rules.values(), Values::default());
         assert!(rules.set(Rule::KeepInventory, true).is_some());
         assert!(rules.set(Rule::KeepInventory, true).is_none(), "unchanged");
-        assert!(GameRules::open(&world).unwrap().values().keepinventory);
+        drop(rules);
+        let rules = GameRules::of_level(level(&world), &world);
+        assert!(rules.values().keepinventory);
+        // Where vanilla keeps it.
+        let saved = LevelFile::open(&world, || unreachable!()).unwrap().get();
+        assert_eq!(saved.game_rule("keepinventory"), Some(true));
+        fs::remove_dir_all(&world).unwrap();
+    }
 
-        // Rules missing from the file keep their defaults.
-        fs::write(world.join(GAME_RULES_FILE), r#"{"falldamage": false}"#).unwrap();
-        let values = GameRules::open(&world).unwrap().values();
+    #[test]
+    fn an_old_rules_file_moves_into_a_new_level_dat() {
+        let world = temporary_world("game-rules-move");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(world.join(OLD_GAME_RULES_FILE), r#"{"falldamage": false}"#).unwrap();
+        let values = GameRules::of_level(level(&world), &world).values();
         assert!(!values.falldamage);
-        assert!(values.naturalregeneration);
+        assert!(values.naturalregeneration, "the rest keep their defaults");
+
+        // Once level.dat exists, the old file is not read again.
+        fs::write(
+            world.join(OLD_GAME_RULES_FILE),
+            r#"{"pvp": false, "keepinventory": true}"#,
+        )
+        .unwrap();
+        assert!(
+            !GameRules::of_level(level(&world), &world)
+                .values()
+                .keepinventory
+        );
         fs::remove_dir_all(&world).unwrap();
     }
 

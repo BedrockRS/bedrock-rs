@@ -3,14 +3,13 @@
 //! Every column starts as the same generated superflat column, shared as one
 //! encoded payload. Changing a block gives that column its own storage, which
 //! is kept, re-encoded whenever it is sent after another change, and marked
-//! for saving. A world opened on a directory loads saved columns the first
-//! time they are needed and saves changed ones with [`World::save`]; a world
-//! from [`World::new`] lives only in memory.
+//! for saving. A world opened on a folder (see [`crate::storage`]) loads a
+//! saved column the first time its chunk is needed, and saves changed ones
+//! with [`World::save`]; a world from [`World::new`] lives only in memory.
 
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bedrockrs_protocol::block::{BlockState, StateValue};
 use bedrockrs_protocol::chunk::{self, PalettedStorage, SubChunk};
@@ -20,10 +19,12 @@ use bedrockrs_protocol::types::{BlockPos, ChunkPos};
 use uuid::Uuid;
 
 use crate::blocks::palette;
+use crate::game_mode::GameMode;
+use crate::game_rules;
 use crate::items::items;
 use crate::storage::{
-    BLOCKS, BinStorage, SavedPlayer, StoredColumn, StoredSubChunk, WorldStorage, raw_block,
-    raw_network_id,
+    BLOCKS, LevelDat, LevelFile, NewWorld, SavedPlayer, StoreError, StoredColumn, StoredSubChunk,
+    WorldProvider, WorldStorage, display_name, raw_block, raw_network_id,
 };
 
 /// Overworld dimension ID.
@@ -33,9 +34,11 @@ pub const MIN_Y: i32 = -64;
 /// Highest block of the overworld.
 pub const MAX_Y: i32 = 319;
 /// Sub-chunks in the overworld's y = -64..=319.
-const SUB_CHUNKS: usize = 24;
+pub(crate) const SUB_CHUNKS: usize = 24;
 /// Sub-chunk index of the lowest sub-chunk (y = -64 is sub-chunk -4).
-const LOWEST_SUB_CHUNK: i8 = (MIN_Y >> 4) as i8;
+pub(crate) const LOWEST_SUB_CHUNK: i8 = (MIN_Y >> 4) as i8;
+/// The name of a world with no name of its own: vanilla's default.
+pub const DEFAULT_NAME: &str = "Bedrock level";
 /// Biome ID of plains.
 const PLAINS: u32 = 1;
 
@@ -50,11 +53,17 @@ struct Column {
     dirty: bool,
 }
 
-/// Columns held in memory, and the saved ones not loaded yet.
+/// Columns held in memory, and the chunks known to have none saved.
 #[derive(Debug, Default)]
 struct State {
     columns: HashMap<ChunkPos, Column>,
-    on_disk: HashSet<ChunkPos>,
+    /// Chunks looked up in storage and not found (or unreadable): they are
+    /// generated, and not looked up again.
+    generated: HashSet<ChunkPos>,
+    /// Chunks whose saved column could not be read. Never saved over, so
+    /// what is there (a vanilla chunk in a format the server cannot read
+    /// yet) is not lost to a flat one.
+    unreadable: HashSet<ChunkPos>,
 }
 
 /// An endless superflat overworld with vanilla's default layers (bedrock, two
@@ -67,12 +76,16 @@ pub struct World {
     generated_payload: Vec<u8>,
     state: Mutex<State>,
     /// Where changed columns and players are saved, if anywhere.
-    storage: Option<Box<dyn WorldStorage>>,
+    storage: Option<Box<dyn WorldProvider>>,
+    /// The world's display name.
+    name: String,
+    /// Its `level.dat`, for a world opened on a folder.
+    level: Option<Arc<LevelFile>>,
+    /// Where players spawn.
+    spawn: BlockPos,
     /// The name and states of every block the world can hold, by network ID,
     /// for storing blocks by name.
     known: HashMap<u32, BlockState>,
-    /// Height of the top (grass) layer.
-    surface_y: i32,
 }
 
 impl World {
@@ -112,34 +125,91 @@ impl World {
             .map(|state| (state.network_id(), state))
             .collect();
 
+        let surface_y = MIN_Y + layers.len() as i32 - 1;
         Self {
             air,
             generated,
             generated_payload,
             state: Mutex::new(State::default()),
             storage: None,
+            name: DEFAULT_NAME.to_owned(),
+            level: None,
+            // Standing on the grass block at (0, 0), the corner of chunks
+            // (0, 0), (-1, 0), (0, -1) and (-1, -1).
+            spawn: BlockPos {
+                x: 0,
+                y: surface_y + 1,
+                z: 0,
+            },
             known,
-            surface_y: MIN_Y + layers.len() as i32 - 1,
         }
     }
 
-    /// The world saved in `directory` in BedrockRS's own format, created if it
-    /// does not exist yet.
-    pub fn open(directory: &Path) -> io::Result<Self> {
-        Self::with_storage(Box::new(BinStorage::open(directory)?))
+    /// The world in the folder `directory`, in vanilla's layout, created if
+    /// it does not exist yet. Its name is the one in its `levelname.txt`;
+    /// a new world is given `name`. `default_game_mode` goes in its
+    /// `level.dat` as the world's.
+    ///
+    /// Players spawn where `level.dat` says; if vanilla has not chosen a
+    /// spot yet, on the highest block at (0, 0).
+    pub fn open(
+        directory: &Path,
+        name: &str,
+        default_game_mode: GameMode,
+    ) -> Result<Self, StoreError> {
+        let storage = WorldStorage::open(directory)?;
+        let name = display_name(directory, name)?;
+        let mut world = Self::with_storage(Box::new(storage), name);
+        let rules = game_rules::Values::default().named();
+        let level = LevelFile::open(directory, || {
+            LevelDat::new_world(&NewWorld {
+                name: &world.name,
+                spawn: world.spawn,
+                game_type: default_game_mode.id(),
+                game_rules: &rules,
+            })
+        })?;
+        if !level.created() {
+            level.update(|level| level.opened(default_game_mode.id()))?;
+        }
+        world.spawn = match level.get().spawn() {
+            Some(spawn) => spawn,
+            None => world.highest_ground(0, 0),
+        };
+        world.level = Some(Arc::new(level));
+        Ok(world)
     }
 
-    /// The world kept in `storage`.
-    pub fn with_storage(storage: Box<dyn WorldStorage>) -> io::Result<Self> {
-        let saved = storage.saved_chunks()?;
-        let mut world = Self::new();
-        world.storage = Some(storage);
-        world
-            .state
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .on_disk = saved;
-        Ok(world)
+    /// The world kept in `storage`, called `name`.
+    pub fn with_storage(storage: Box<dyn WorldProvider>, name: String) -> Self {
+        Self {
+            storage: Some(storage),
+            name,
+            ..Self::new()
+        }
+    }
+
+    /// The world's display name, as players see it.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The world's `level.dat`, if it was opened on a folder.
+    pub fn level(&self) -> Option<&Arc<LevelFile>> {
+        self.level.as_ref()
+    }
+
+    /// Where a player stands on the highest block of the column at (`x`,
+    /// `z`): above its top, or at the bottom of the world if it has none.
+    fn highest_ground(&self, x: i32, z: i32) -> BlockPos {
+        let top = (MIN_Y..=MAX_Y)
+            .rev()
+            .find(|&y| self.block(BlockPos { x, y, z }) != self.air);
+        BlockPos {
+            x,
+            y: top.map_or(MIN_Y, |y| (y + 1).min(MAX_Y)),
+            z,
+        }
     }
 
     /// Where the player with this UUID was when they last left, if they have
@@ -167,32 +237,25 @@ impl World {
     }
 
     /// Saves where the player with this UUID is; a no-op for in-memory worlds.
-    pub fn save_player(&self, uuid: Uuid, player: &SavedPlayer) -> io::Result<()> {
+    pub fn save_player(&self, uuid: Uuid, player: &SavedPlayer) -> Result<(), StoreError> {
         match &self.storage {
             Some(storage) => storage.save_player(uuid, player),
             None => Ok(()),
         }
     }
 
-    /// How many chunks have saved changes on disk, loaded or not.
-    pub fn saved_chunks(&self) -> usize {
-        let state = self.state();
-        state.on_disk.len()
-            + state
-                .columns
-                .values()
-                .filter(|column| !column.dirty)
-                .count()
+    /// Makes everything saved so far durable, as the server stops.
+    pub fn flush(&self) -> Result<(), StoreError> {
+        match &self.storage {
+            Some(storage) => storage.flush(),
+            None => Ok(()),
+        }
     }
 
-    /// Where new players spawn: standing on the grass block at (0, 0), the
-    /// corner of chunks (0, 0), (-1, 0), (0, -1) and (-1, -1).
+    /// Where new players spawn: for a new world, standing on the grass block
+    /// at (0, 0); for one opened on a folder, as its `level.dat` says.
     pub fn spawn(&self) -> BlockPos {
-        BlockPos {
-            x: 0,
-            y: self.surface_y + 1,
-            z: 0,
-        }
+        self.spawn
     }
 
     /// The network ID of air.
@@ -314,21 +377,26 @@ impl World {
 
     /// Writes every column changed since the last save. Returns how many were
     /// saved; a column that fails to save stays marked and is tried next time.
-    pub fn save(&self) -> io::Result<usize> {
+    pub fn save(&self) -> Result<usize, StoreError> {
         let Some(storage) = &self.storage else {
             return Ok(0);
         };
         // Copy the changed columns out, so players are not kept waiting on disk.
-        let changed: Vec<(ChunkPos, StoredColumn)> = self
-            .state()
-            .columns
+        let mut state = self.state();
+        let State {
+            columns,
+            unreadable,
+            ..
+        } = &mut *state;
+        let changed: Vec<(ChunkPos, StoredColumn)> = columns
             .iter_mut()
-            .filter(|(_, column)| column.dirty)
+            .filter(|(chunk, column)| column.dirty && !unreadable.contains(chunk))
             .map(|(chunk, column)| {
                 column.dirty = false;
                 (*chunk, self.stored(column))
             })
             .collect();
+        drop(state);
 
         let mut saved = 0;
         let mut first_error = None;
@@ -350,24 +418,30 @@ impl World {
     }
 
     /// Brings a saved column into memory the first time its chunk is used. A
-    /// file that cannot be read is logged, and the chunk is generated instead.
+    /// chunk with none saved is generated; one that cannot be read is
+    /// logged, and generated too.
     fn load(&self, state: &mut State, chunk: ChunkPos) {
-        if !state.on_disk.remove(&chunk) {
-            return;
-        }
         let Some(storage) = &self.storage else {
             return;
         };
+        if state.columns.contains_key(&chunk) || state.generated.contains(&chunk) {
+            return;
+        }
         let loaded = storage
             .load_chunk(chunk)
             .map_err(|err| err.to_string())
-            .and_then(|stored| self.column_from(stored));
+            .and_then(|stored| stored.map(|stored| self.column_from(stored)).transpose());
         match loaded {
-            Ok(column) => {
+            Ok(Some(column)) => {
                 state.columns.insert(chunk, column);
             }
+            Ok(None) => {
+                state.generated.insert(chunk);
+            }
             Err(err) => {
-                tracing::warn!(chunk = ?(chunk.x, chunk.z), %err, "ignoring a saved chunk that cannot be read");
+                tracing::warn!(chunk = ?(chunk.x, chunk.z), %err, "ignoring a saved chunk that cannot be read; changes to it will not be saved");
+                state.generated.insert(chunk);
+                state.unreadable.insert(chunk);
             }
         }
     }
@@ -596,10 +670,11 @@ mod tests {
     }
 
     fn temporary_world(name: &str) -> PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("bedrockrs-world-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        directory
+        crate::storage::tests::temporary_world(&format!("world-{name}"))
+    }
+
+    fn open(directory: &Path) -> World {
+        World::open(directory, DEFAULT_NAME, GameMode::Creative).unwrap()
     }
 
     #[test]
@@ -615,12 +690,12 @@ mod tests {
             palette: vec![BlockState::new("minecraft:air"), old_bars.clone()],
             indices,
         });
-        BinStorage::open(&directory)
+        WorldStorage::open(&directory)
             .unwrap()
             .save_chunk(ChunkPos::new(0, 0), &column)
             .unwrap();
 
-        let world = World::open(&directory).unwrap();
+        let world = open(&directory);
         let corner = BlockPos {
             x: 0,
             y: MIN_Y,
@@ -630,6 +705,7 @@ mod tests {
         assert_eq!(loaded.name, "minecraft:iron_bars");
         assert!(palette().is_valid(loaded));
         assert_ne!(world.block(corner), old_bars.network_id());
+        drop(world);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -648,17 +724,17 @@ mod tests {
             z: 20,
         };
 
-        let world = World::open(&directory).unwrap();
+        let world = open(&directory);
         assert!(world.set_block(hole, world.air()));
         assert!(world.set_block(tower, stone));
         let before = world.chunk(1, 1).payload;
         assert_eq!(world.save().unwrap(), 2);
         assert_eq!(world.save().unwrap(), 0, "nothing changed since");
+        world.flush().unwrap();
         drop(world);
 
-        // A fresh server on the same directory sees the same world.
-        let world = World::open(&directory).unwrap();
-        assert_eq!(world.saved_chunks(), 2);
+        // A fresh server on the same folder sees the same world.
+        let world = open(&directory);
         assert_eq!(world.block(hole), world.air());
         assert_eq!(world.block(tower), stone);
         assert_eq!(world.chunk(1, 1).payload, before);
@@ -672,6 +748,88 @@ mod tests {
             BlockState::new("minecraft:grass_block").network_id()
         );
         assert_eq!(world.save().unwrap(), 0);
+        drop(world);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn worlds_are_vanilla_folders_named_by_their_levelname_file() {
+        let directory = temporary_world("folder");
+        let world = open(&directory);
+        assert_eq!(world.name(), DEFAULT_NAME);
+        assert!(directory.join("db").is_dir());
+        assert!(directory.join("levelname.txt").is_file());
+        drop(world);
+
+        std::fs::write(directory.join("levelname.txt"), "Imported Island").unwrap();
+        assert_eq!(open(&directory).name(), "Imported Island");
+        assert_eq!(World::new().name(), DEFAULT_NAME);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Writes a world to open in vanilla, as a check that it can: at spawn, a
+    /// gold pillar from the grass up to y = 40 (through seven sub-chunks)
+    /// and a line of diamond blocks along z = 0 across four chunks. Give it
+    /// an empty folder:
+    /// `BEDROCKRS_EXPORT_WORLD=<folder> cargo test -p bedrockrs_core world_for_vanilla -- --ignored`.
+    #[test]
+    #[ignore = "writes a world into BEDROCKRS_EXPORT_WORLD, to open in vanilla"]
+    fn a_world_for_vanilla() {
+        let Some(path) = std::env::var_os("BEDROCKRS_EXPORT_WORLD") else {
+            panic!("set BEDROCKRS_EXPORT_WORLD to an empty folder");
+        };
+        let world = World::open(Path::new(&path), "BedrockRS check", GameMode::Creative).unwrap();
+        let gold = BlockState::new("minecraft:gold_block").network_id();
+        let diamond = BlockState::new("minecraft:diamond_block").network_id();
+        for y in -60..=40 {
+            world.set_block(BlockPos { x: 3, y, z: 3 }, gold);
+        }
+        for x in -24..24 {
+            world.set_block(BlockPos { x, y: -60, z: 0 }, diamond);
+        }
+        println!("saved {} chunks", world.save().unwrap());
+        world.flush().unwrap();
+    }
+
+    #[test]
+    fn worlds_have_a_level_dat_and_spawn_where_it_says() {
+        use bedrockrs_protocol::nbt::Tag;
+
+        let directory = temporary_world("level-dat");
+        let world = open(&directory);
+        let level = world.level().unwrap().get();
+        assert_eq!(level.spawn(), Some(world.spawn()));
+        assert_eq!(world.spawn(), BlockPos { x: 0, y: -60, z: 0 });
+        assert_eq!(
+            level.0.get("LevelName"),
+            Some(&Tag::String(DEFAULT_NAME.into()))
+        );
+        // A tower at (0, 0), saved.
+        let stone = BlockState::new("minecraft:stone").network_id();
+        assert!(world.set_block(BlockPos { x: 0, y: 30, z: 0 }, stone));
+        world.save().unwrap();
+        // A spawn vanilla chose is where players spawn.
+        world
+            .level()
+            .unwrap()
+            .update(|level| {
+                level.0.set("SpawnX", Tag::Int(5));
+                level.0.set("SpawnY", Tag::Int(-50));
+                level.0.set("SpawnZ", Tag::Int(7));
+            })
+            .unwrap();
+        drop(world);
+        assert_eq!(open(&directory).spawn(), BlockPos { x: 5, y: -50, z: 7 });
+
+        // One vanilla has not chosen yet: on top of what is at (0, 0).
+        let world = open(&directory);
+        world
+            .level()
+            .unwrap()
+            .update(|level| level.0.set("SpawnY", Tag::Int(32767)))
+            .unwrap();
+        drop(world);
+        assert_eq!(open(&directory).spawn(), BlockPos { x: 0, y: 31, z: 0 });
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -691,19 +849,26 @@ mod tests {
             game_mode: Some("survival".into()),
             health: None,
         };
-        let world = World::open(&directory).unwrap();
+        let world = open(&directory);
         assert_eq!(world.load_player(uuid), None);
         world.save_player(uuid, &there).unwrap();
         drop(world);
 
-        let world = World::open(&directory).unwrap();
-        assert_eq!(world.load_player(uuid), Some(there.clone()));
+        let world = open(&directory);
+        let loaded = world.load_player(uuid).unwrap();
+        assert!((loaded.y - there.y).abs() < 1e-4);
+        assert_eq!(
+            (loaded.x, loaded.z, loaded.yaw),
+            (there.x, there.z, there.yaw)
+        );
+        assert!(loaded.flying);
         let lost = SavedPlayer {
             y: -1000.0,
             ..there.clone()
         };
         world.save_player(uuid, &lost).unwrap();
         assert_eq!(world.load_player(uuid), None, "back to the spawn");
+        drop(world);
         std::fs::remove_dir_all(&directory).unwrap();
 
         // An in-memory world remembers nobody.
@@ -715,16 +880,17 @@ mod tests {
     #[test]
     fn chunks_are_stored_by_block_name() {
         let directory = temporary_world("names");
-        let world = World::open(&directory).unwrap();
+        let world = open(&directory);
         let unknown = 123_456;
         world.set_block(BlockPos { x: 0, y: -61, z: 0 }, world.air());
         world.set_block(BlockPos { x: 1, y: -60, z: 0 }, unknown);
         world.save().unwrap();
+        drop(world);
 
         // What the storage backend holds: names and states, with a raw
         // placeholder for the block the world has no name for.
-        let storage = BinStorage::open(&directory).unwrap();
-        let stored = storage.load_chunk(ChunkPos::new(0, 0)).unwrap();
+        let storage = WorldStorage::open(&directory).unwrap();
+        let stored = storage.load_chunk(ChunkPos::new(0, 0)).unwrap().unwrap();
         let names: Vec<&str> = stored[0]
             .as_ref()
             .unwrap()
@@ -741,9 +907,10 @@ mod tests {
             assert!(names.contains(&name), "{names:?}");
         }
         assert!(names.contains(&crate::storage::RAW_BLOCK));
+        drop(storage);
 
         // Reloaded, every block is the same, the unknown one included.
-        let world = World::open(&directory).unwrap();
+        let world = open(&directory);
         assert_eq!(world.block(BlockPos { x: 1, y: -60, z: 0 }), unknown);
         assert_eq!(world.block(BlockPos { x: 0, y: -61, z: 0 }), world.air());
         assert_eq!(
@@ -752,24 +919,43 @@ mod tests {
                 .with("infiniburn_bit", StateValue::Byte(0))
                 .network_id()
         );
+        drop(world);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    #[test]
-    fn an_unreadable_chunk_file_falls_back_to_generation() {
-        let directory = temporary_world("damaged");
-        let world = World::open(&directory).unwrap();
-        world.set_block(BlockPos { x: 0, y: -61, z: 0 }, world.air());
-        world.save().unwrap();
-        drop(world);
-        std::fs::write(directory.join("chunks").join("c.0.0.bin"), b"garbage").unwrap();
+    /// A storage whose chunks cannot be read, as a vanilla world in a format
+    /// the server does not know yet.
+    #[derive(Debug, Default)]
+    struct Unreadable {
+        saved: Mutex<Vec<ChunkPos>>,
+    }
 
-        let world = World::open(&directory).unwrap();
+    impl WorldProvider for Unreadable {
+        fn load_chunk(&self, _: ChunkPos) -> Result<Option<StoredColumn>, StoreError> {
+            Err(StoreError::Malformed("terrain from before Bedrock 1.0"))
+        }
+        fn save_chunk(&self, chunk: ChunkPos, _: &StoredColumn) -> Result<(), StoreError> {
+            self.saved.lock().unwrap().push(chunk);
+            Ok(())
+        }
+        fn load_player(&self, _: Uuid) -> Result<Option<SavedPlayer>, StoreError> {
+            Ok(None)
+        }
+        fn save_player(&self, _: Uuid, _: &SavedPlayer) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_unreadable_chunk_is_generated_and_never_saved_over() {
+        let world = World::with_storage(Box::<Unreadable>::default(), "Old".into());
+        let ground = BlockPos { x: 0, y: -61, z: 0 };
         assert_eq!(
-            world.block(BlockPos { x: 0, y: -61, z: 0 }),
+            world.block(ground),
             BlockState::new("minecraft:grass_block").network_id()
         );
-        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(world.set_block(ground, world.air()));
+        assert_eq!(world.save().unwrap(), 0, "the saved chunk is kept as it is");
     }
 
     #[test]

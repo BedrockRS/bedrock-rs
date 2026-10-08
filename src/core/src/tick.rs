@@ -74,7 +74,7 @@ fn run(server: &Server, stop: &AtomicBool) {
         }
     }
     // Keep the changes since the last periodic save.
-    server.save();
+    server.save_and_flush();
 }
 
 #[cfg(test)]

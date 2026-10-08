@@ -8,13 +8,14 @@
 //! - `BEDROCKRS_ADVERTISE_IPS`: comma-separated public addresses to offer clients
 //! - `BEDROCKRS_ICE_LITE`: `false` switches from ICE-lite to full ICE (default `true`)
 //!
-//! `BEDROCKRS_WORLD_DIR` sets where the world is saved (default `worlds/world`), and
 //! `BEDROCKRS_AUTHENTICATION=false` turns off checking players' sign-in (offline
 //! testing only: anyone can then join as anyone).
 //!
-//! What the console shows is set in `bedrockrs.toml` (see [`config`]), created
-//! with defaults on first run. `RUST_LOG`, when set, overrides it; chat is
-//! logged under the `chat` target. `NO_COLOR` turns colours off.
+//! Settings are in `server.properties` (see [`config`]), vanilla's file, created
+//! with defaults on first run: `level-name` is the world folder in `worlds/`, in
+//! vanilla's layout (see [`storage`]), and `log-level` and `log-chat` what the
+//! console shows. `RUST_LOG`, when set, overrides those; chat is logged under the
+//! `chat` target. `NO_COLOR` turns colours off.
 //!
 //! Commands typed into the console run with every permission, with or without
 //! their `/`: `op <player>` makes the first operator, and `stop` stops the
@@ -22,10 +23,11 @@
 //! commands are typed at a `> ` prompt below the log, with history.
 //!
 //! [`config`]: bedrockrs_core::config
+//! [`storage`]: bedrockrs_core::storage
 
 use std::io::{BufRead as _, IsTerminal as _};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +35,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bedrockrs_core::auth::Authenticator;
 use bedrockrs_core::commands::Sender;
-use bedrockrs_core::config::{CONFIG_FILE, Config};
+use bedrockrs_core::config::{LevelType, OLD_CONFIG_FILE, PROPERTIES_FILE, ServerProperties};
 use bedrockrs_core::console::{ConsoleFormat, ConsoleOutput, Prompt, PromptInput};
 use bedrockrs_core::game_rules::GameRules;
 use bedrockrs_core::ops::{OPS_FILE, Operators};
@@ -53,13 +55,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let loaded = Config::load_or_create(Path::new(CONFIG_FILE))?;
+    let loaded = ServerProperties::load_or_create(Path::new(PROPERTIES_FILE))?;
+    let properties = loaded.properties;
     // `RUST_LOG`, when set, replaces the filter the configuration asks for.
     let filter = match std::env::var("RUST_LOG") {
         Ok(directives) if !directives.trim().is_empty() => {
             EnvFilter::try_new(&directives).context("invalid RUST_LOG")?
         }
-        _ => EnvFilter::new(loaded.config.logs.filter()),
+        _ => EnvFilter::new(properties.logs.filter()),
     };
     // Colours only for a terminal, and never with NO_COLOR set (no-color.org).
     let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
@@ -70,7 +73,15 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(output.clone())
         .init();
     if loaded.created {
-        tracing::info!("Created {CONFIG_FILE} with the default settings");
+        tracing::info!("Created {PROPERTIES_FILE} with the default settings");
+    }
+    if Path::new(OLD_CONFIG_FILE).exists() {
+        tracing::warn!(
+            "{OLD_CONFIG_FILE} is no longer read: settings are in {PROPERTIES_FILE} (log-level, log-chat and gamemode)"
+        );
+    }
+    if !properties.ignored.is_empty() {
+        tracing::debug!(properties = ?properties.ignored, "ignoring properties BedrockRS does not use yet");
     }
 
     tracing::info!(
@@ -83,30 +94,22 @@ async fn main() -> anyhow::Result<()> {
         tps = bedrockrs_core::TICKS_PER_SECOND,
         "versions"
     );
-    if loaded.config.logs.uses_system_noise() {
-        tracing::warn!(
-            "system_noise in {CONFIG_FILE} is replaced by level: use level = \"debug\" instead"
-        );
-    }
 
     let (actions, plugin_actions) = mpsc::channel(PLUGIN_ACTION_QUEUE);
     let plugins = PluginHost::start(PluginConfig::default(), actions)
         .context("failed to start the plugin host")?;
     tracing::debug!(loaded = ?plugins.loaded(), "plugins ready");
-    let world_directory = env_value::<PathBuf>("BEDROCKRS_WORLD_DIR")?
-        .unwrap_or_else(|| PathBuf::from("worlds/world"));
-    let world = World::open(&world_directory)
-        .with_context(|| format!("Failed to open the world in {}", world_directory.display()))?;
-    let world_name = world_directory.file_name().map_or_else(
-        || world_directory.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    tracing::info!("Opened world: {world_name}");
-    tracing::debug!(
-        directory = %world_directory.display(),
-        saved_chunks = world.saved_chunks(),
-        "world"
-    );
+    let world_directory = properties.world_directory();
+    // Only flat worlds are generated so far; the properties allow no other.
+    let LevelType::Flat = properties.level_type;
+    let world = World::open(
+        &world_directory,
+        &properties.level_name,
+        properties.default_game_mode,
+    )
+    .with_context(|| format!("Failed to open the world in {}", world_directory.display()))?;
+    tracing::info!("Opened world: {}", world.name());
+    tracing::debug!(directory = %world_directory.display(), "world");
     let authenticator = if env_value::<bool>("BEDROCKRS_AUTHENTICATION")?.unwrap_or(true) {
         Authenticator::online().context("Failed to set up player authentication")?
     } else {
@@ -116,11 +119,14 @@ async fn main() -> anyhow::Result<()> {
         Authenticator::offline()
     };
     let ops = Operators::open(Path::new(OPS_FILE))?;
-    let game_rules = GameRules::open(&world_directory)?;
+    let game_rules = match world.level() {
+        Some(level) => GameRules::of_level(Arc::clone(level), &world_directory),
+        None => GameRules::in_memory(),
+    };
     let server = Arc::new(
         Server::new(world, plugins.dispatcher(), authenticator)
             .with_operators(ops)
-            .with_default_game_mode(loaded.config.players.default_game_mode)
+            .with_default_game_mode(properties.default_game_mode)
             .with_game_rules(game_rules),
     );
     tokio::spawn(server::apply_plugin_actions(
@@ -135,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         name: "BedrockRS".into(),
         protocol: bedrockrs_protocol::PROTOCOL_VERSION,
         version: bedrockrs_protocol::GAME_VERSION.into(),
-        level: "Bedrock level".into(),
+        level: server.world.name().to_owned(),
         players: 0,
         max_players: 20,
         game_type: 0,

@@ -454,7 +454,7 @@ bedrock-rs/
 ├── docs/ARCHITECTURE.md    # this document
 ├── tools/                  # Python scripts that generate src/core/data/*.json
 ├── server/                 # the folder the server runs in
-│   ├── bedrockrs.toml      # runtime: configuration (created on first run, git-ignored)
+│   ├── server.properties   # runtime: configuration, vanilla's format (created on first run, git-ignored)
 │   ├── keys/               # runtime: identity.pem (auto-generated, git-ignored)
 │   ├── plugins/            # hot-reloaded *.luau / *.ts / *.js / *.py
 │   └── worlds/             # runtime: saved worlds (git-ignored)
@@ -829,10 +829,10 @@ DTLS, SCTP, and multi-segment messages both ways.
     only for the request.
   - PlayerAuthInput can carry a request (a tool's durability while mining); it is read
     and answered like the others, and the block actions after it are no longer lost.
-  - Saved in `players/<uuid>.json` under `inventory` (`main`, `armor`, `offhand`, each a
-    list of `{slot, item, count, meta}` by item name). An item on the cursor is saved
-    into the first free slot. Unknown items and bad slots are skipped with a warning;
-    counts are capped at the item's largest stack. Files from before inventories start
+  - Saved with the player as vanilla's `Inventory`, `Armor` and `Offhand` (see
+    Persistence), items by name with their NBT. An item on the cursor is saved into the
+    first free slot. Unknown items and bad slots are skipped with a warning; counts are
+    capped at the item's largest stack. A player saved without an inventory starts
     empty.
   - The session owns the inventory; each accepted change sends a snapshot to the
     player's `Players` entry, so the periodic saves include it.
@@ -1123,53 +1123,111 @@ DTLS, SCTP, and multi-segment messages both ways.
     themselves, which Mojang's docs say the client expects.
   - AddPlayer carries the current sneaking state.
 
-- **Persistence (implemented):** the world talks to storage only through the
-  `storage::WorldStorage` trait. It lists saved chunks, loads and saves a chunk column,
-  and loads and saves a player. `World::with_storage` takes any backend. `World::open(dir)`
-  uses `BinStorage`, BedrockRS's own format; the binary reads the directory from
-  `BEDROCKRS_WORLD_DIR` (default `worlds/world`, which is git-ignored). `World::new` stays in
-  memory, for tests.
-  - **Blocks cross the trait by name**, as a palette of block states (name and states)
-    plus 4096 indices per sub-chunk, the way vanilla worlds store them. So a LevelDB
-    backend needs no knowledge of network IDs.
-  - The world maps its network IDs (state hashes) back to names through a table of every
-    block it can hold: air, the superflat layers and every block item's state.
-  - A block with no known name is stored as a raw placeholder,
-    `bedrockrs:raw_network_id` with its ID as a state, so nothing is lost.
-  - `BinStorage` writes one file per changed column, `chunks/c.<x>.<z>.bin`: the magic
-    `MVCH`, a version byte, then zlib data. Format **version 2**, written now, stores per
-    sub-chunk a palette of names and states and u16 indices; `storage.rs` documents the
-    layout.
-  - **Version 1** files (u32 hashes per block) still load, as raw placeholders, and are
-    rewritten as version 2 the next time their chunk changes.
-  - Writes go to a `.tmp` file that is renamed over the old one, so a crash never leaves
-    half a chunk. There are no new dependencies: `flate2` was already in use, and SQLite
-    (C) or `sled` (pre-1.0, dormant) were not needed for per-chunk blobs.
-  - Opening lists the saved chunks without reading them. A saved chunk is loaded the
-    first time it is read, changed or sent. A file that cannot be read is logged, and the
-    chunk is generated instead.
+- **Persistence (implemented), in vanilla's format (2026-10-08):** a world is a folder in
+  vanilla's layout, `worlds/<level-name>/`, so a Bedrock Dedicated Server world or an
+  unzipped `.mcworld` opens as it is, and vanilla opens worlds BedrockRS made. It holds
+  `levelname.txt`, the name players see (`storage::display_name`; written with
+  `level-name` for a new world), `level.dat` (see below), and `db/`, a LevelDB database. The world talks to storage only through the `storage::WorldProvider`
+  trait: `load_chunk` (`None` for a chunk never saved), `save_chunk`, `load_player`,
+  `save_player`, and `flush`. `World::open(dir, name, default_game_mode)` uses `storage::WorldStorage`, the
+  LevelDB backend; `World::with_storage` takes any; `World::new` stays in memory, for
+  tests.
+  - **Database:** `bedrock-leveldb` 0.3 (pure Rust, `Send + Sync`, so sessions and the
+    game loop share it). It reads the zlib and raw-deflate table blocks Bedrock writes
+    (compression IDs 2 and 4) and writes zlib (2), which Bedrock reads; snappy and its
+    async helpers are left out. `rusty-leveldb` was the alternative: mature, but its
+    handle is not `Send`, so it would have needed a thread of its own. Writes go to the
+    log; `flush` (when the server stops) writes them into tables. Flushing with nothing
+    written is an error to the crate, so `WorldStorage` only flushes after a write.
+  - **Keys** (`storage::keys`): a chunk record is x and z (`i32` LE), the dimension
+    (`i32` LE, left out for the overworld), a tag byte, and for sub-chunks (`0x2F`)
+    their vertical index (`i8`, -4 to 19). Tags: `0x2B` Data3D, `0x2C` Version, `0x2D`
+    Data2D, `0x2F` sub-chunk, `0x30` LegacyTerrain, `0x31` block entities, `0x32`
+    entities, `0x36` FinalizedState, `0x76` the pre-1.16.100 version. A test checks the
+    layout against `bedrock-leveldb`'s own key helpers. Players are
+    `player_server_<uuid>` (hyphenated, lower case).
+  - **Chunks** (`storage::chunk_format`): sub-chunk format 9: version, layer count,
+    vertical index, then per layer a header (index width << 1, low bit 0 on disk), the
+    packed `u32` LE words, the palette size (`i32`, left out for width 0) and a
+    little-endian NBT `{name, states, version}` per palette entry. Versions 8 and 1 are
+    read too; older ones (numeric IDs) are errors. Only layer 0 is kept, so waterlogged
+    blocks of a vanilla world load dry. Blocks cross the trait by name and states, as
+    before; states from older releases are upgraded to the palette's as they load.
+  - Saving a column writes one batch: every sub-chunk (an all-air one's record is
+    deleted), and, for a chunk new to the database, as Dragonfly writes them, Version
+    42, FinalizedState 2 and Data3D with an empty height map (vanilla works it out) and
+    plains. A chunk the database already had keeps its own version, state and biomes
+    (and its entities and block entities, which are not read).
+  - A chunk is looked up the first time it is read, changed or sent; one with no
+    version record (current or legacy) is generated, and remembered as such. One that
+    cannot be read (pre-1.0 `LegacyTerrain`, an old sub-chunk format, damage) is logged
+    and generated, and **never saved over**, so the vanilla chunk is not lost to a flat
+    one.
   - Changes mark a column dirty. The tick loop saves dirty columns every 100 ticks (5 s),
-    and once more when it stops (Ctrl+C). Columns are copied out under the lock and
+    and once more, with a flush, when it stops. Columns are copied out under the lock and
     written after it is released, and a failed write stays dirty for the next save.
-    Killing the process loses at most 5 s of changes.
-  - **Players:** `players/<uuid>.json` holds the feet position, pitch, yaw, head yaw and
-    whether the player was flying (`flying` defaults to false, so older files still
-    load).
+  - **Players** (`storage::player_format`) are vanilla's player NBT: `Pos` at eye level
+    (1.62 above the feet: a vanilla 1.21 world's `~local_player` standing at y = 86 had
+    87.62), `Rotation` (yaw, pitch), `abilities.flying`, `PlayerGameMode` (0, 1, 2, 6;
+    vanilla's 5, "default", is the server's default), `Attributes`
+    (`minecraft:health`'s `Current`), and `Inventory` (with `Slot`), `Armor` (five, as
+    vanilla now writes, the fifth always empty for players) and `Offhand`, as item stacks
+    `{Name, Count, Damage, WasPickedUp, tag}`. The head yaw is not saved (vanilla has one
+    yaw). What BedrockRS does not track is left out, and ignored when read.
   - A player is saved when their session ends, however it ends; everyone online is also
-    saved on every world save (5 s) and at shutdown.
-  - At login the session loads the file, so StartGame, the first chunks and the entity
-    others see all start there. A file that cannot be read, or a position outside the
-    world's height, is ignored and the player starts at the spawn.
+    saved on every world save (5 s) and at shutdown. At login the session loads the
+    record, so StartGame, the first chunks and the entity others see all start there.
+    One that cannot be read, or a position outside the world's height, is ignored and
+    the player starts at the spawn.
+  - **Checked against a real world (2026-10-08):** a vanilla 1.21 world (14,172 keys)
+    read with no errors: 1,352 overworld chunks, 4,307 sub-chunks, 244 kinds of block,
+    and its `~local_player` decoded. A changed chunk saved into it read back. An ignored
+    test does this for any world: `BEDROCKRS_VANILLA_WORLD=<copy of a world> cargo test
+    -p bedrockrs_core vanilla_world -- --ignored --nocapture`. Not checked yet: vanilla
+    opening a database BedrockRS wrote to.
+  - **`level.dat` (2026-10-08)** (`storage::LevelDat`, `storage::LevelFile`): an 8-byte
+    header (storage version 10, `i32` LE; the payload's length, `i32` LE), then a
+    little-endian NBT compound. A world without one gets one as it opens, written at
+    once: every field a vanilla 1.26.52 superflat world has (the key set and types were
+    compared with one, Mistvale, and match exactly), with the server's values for the
+    name, `Generator` 2 and the layers it generates as vanilla describes them
+    (`FlatWorldLayers`: bedrock, two dirt and grass, plains, `encoding_version` 6 and
+    `"world_version":"version.post_1_18"`, which with `WorldVersion` 1 starts the layers
+    at y = -64; vanilla 1.26.52's own flat worlds read so), spawn, noon, peaceful, the
+    default game mode, game rules, the server's version (`lastOpenedWithVersion`,
+    `NetworkVersion` 2193) and 1.26.50 as the oldest client
+    (`MinimumCompatibleClientVersion`, the release whose palette the server uses).
+    Vanilla's defaults for the rest. A world that has one keeps every field; opening it
+    only updates `LastPlayed`, `GameType` (`gamemode` from `server.properties`, as BDS
+    does) and the version it was opened with, if older. Writes go to a temporary file,
+    renamed over `level.dat` after the old one is copied to `level.dat_old` (only if it
+    reads: a damaged one never replaces a good backup); a damaged `level.dat` is read
+    from `level.dat_old`, as vanilla does, and with neither, opening fails rather than
+    making a new one over it.
+  - **Spawn** is `SpawnX`/`SpawnY`/`SpawnZ` (where the feet go). Vanilla writes `SpawnY`
+    32767 until it has chosen one; then players stand on the highest block at (0, 0), so
+    an imported world does not spawn them inside its terrain. A new world's is (0, -60,
+    0).
+  - Not checked yet: vanilla opening a world BedrockRS made. An ignored test writes one,
+    with a gold pillar at (3, 3) from the grass to y = 40 and diamond blocks along
+    z = 0 for x = -24 to 23: `BEDROCKRS_EXPORT_WORLD=<empty folder> cargo test -p
+    bedrockrs_core world_for_vanilla -- --ignored`; zip the folder's contents as a
+    `.mcworld` to import it.
+  - **Not yet:** vanilla's `player_<id>` records that map a signed-in player to their
+    `player_server_` record, so players of an imported BDS world start afresh; the
+    Nether and the End; biomes, entities and block entities.
+  - Worlds saved by earlier BedrockRS versions (`chunks/*.bin`, `players/*.json`) are no
+    longer read.
   - **Flying:** the session follows StartFlying and StopFlying (input bits 42 and 43) and
     answers each with UpdateAbilities, as Mojang's docs say the client expects. The
     abilities sent at spawn and in those answers include the Flying value while the
     player flies, so a player who left in the air stays in the air.
-- **Storage format and vanilla worlds (decided 2026-09-26):** keep the `.bin` format for
-  the MVP. The trait and the name-based palettes are in place; a LevelDB backend for
-  vanilla worlds comes later. The reasoning is in §7.
+- **Storage format and vanilla worlds (decided 2026-09-26, replaced 2026-10-08):** the MVP
+  kept its own `.bin` format, behind a trait with name-based palettes. It is now replaced
+  by vanilla's LevelDB layout outright (see Persistence), so owners can drop in worlds.
 - **Game modes (implemented)** in `game_mode`: survival, creative, adventure and
-  spectator, per player. A player's mode is saved with them (by name, in the player
-  file) and new players get `[players] default_game_mode`. The mode decides:
+  spectator, per player. A player's mode is saved with them (vanilla's
+  `PlayerGameMode`) and new players get `gamemode` from `server.properties`. The mode decides:
   - abilities (UpdateAbilities), as vanilla grants them: only creative and spectator
     may fly, spectators always fly and pass through blocks;
   - breaking: creative breaks on the first hit (StartBreak, CreativeDestroyBlock);
@@ -1214,8 +1272,10 @@ DTLS, SCTP, and multi-segment messages both ways.
     Dragonfly does, and streams the chunks there. A player who left while dead
     comes back at the spawn.
 - **Game rules (implemented)** in `game_rules`: `falldamage`, `keepinventory`,
-  `naturalregeneration`, `showcoordinates` and `showdeathmessages`, saved as
-  `game_rules.json` in the world directory (defaults as vanilla, except
+  `naturalregeneration`, `showcoordinates` and `showdeathmessages`, saved in the
+  world's `level.dat`, where vanilla keeps them, so vanilla sees them and a vanilla
+  world's own apply (2026-10-08; a `game_rules.json` from before is read once, into the
+  `level.dat` made for its world). Defaults as vanilla, except
   `showcoordinates`, which the server has always turned on). They go to clients in
   StartGame and, after `/gamerule`, in GameRulesChanged.
 - **Session loop:** packets, the player's tick and server controls all produce
@@ -1413,32 +1473,37 @@ DTLS, SCTP, and multi-segment messages both ways.
 - **Profiles:** the dev profile optimizes dependencies (opt-level 2), because pure-Rust
   crypto, compression and the Luau VM are very slow unoptimized. Release builds use
   thin LTO with line-table debug info.
-- **Configuration (implemented)** in `bedrockrs_core::config`: `bedrockrs.toml` in the
-  working directory, written with every setting at its default and comments the
-  first time the server starts (git-ignored). Missing settings keep their defaults;
-  unknown keys and wrong types stop startup with the line at fault.
+- **Configuration (implemented)** in `bedrockrs_core::config`: `server.properties` in the
+  working directory (2026-10-08; it replaced `bedrockrs.toml`, which now only earns a
+  warning), written with every property at its default and comments, in vanilla's style,
+  the first time the server starts (git-ignored). It is vanilla's file, so a Bedrock
+  Dedicated Server one works as it is: properties BedrockRS does not use are ignored
+  (listed at debug). Missing properties keep their defaults; a bad value stops startup
+  with the line at fault. The format is Java's `.properties` (`=`, `:` or a space
+  between key and value, `#` and `!` comments, backslash continuations and escapes, the
+  last of a repeated key winning), read by a small parser of our own rather than the
+  `java-properties` crate, which would have added `regex`, `lazy_static` and
+  `encoding_rs`.
 
-  ```toml
-  [logs]
-  level = "info"  # error, warn, info, debug or trace: our crates and plugins at it,
-                  # libraries a step quieter (warn up to info, then info, then debug)
-  chat = true     # the `chat` target at info, or off
-
-  [players]
-  default_game_mode = "creative"  # for players joining for the first time
+  ```properties
+  level-name=Bedrock level  # the world folder: worlds/<level-name> (one folder, no path)
+  level-type=FLAT           # FLAT only; DEFAULT and LEGACY stop startup, not supported yet
+  gamemode=creative         # for players joining for the first time (names or 0, 1, 2)
+  log-level=info            # BedrockRS only: error, warn, info, debug or trace: our crates
+                            # and plugins at it, libraries a step quieter
+  log-chat=true             # BedrockRS only: the `chat` target at info, or off
   ```
 
-  `[logs]` becomes the log filter, e.g. `warn,bedrockrs=info,plugin=info,chat=info`
+  The log settings become the log filter, e.g. `warn,bedrockrs=info,plugin=info,chat=info`
   (targets match by prefix, so `bedrockrs` covers every crate). `RUST_LOG`, when set,
-  replaces it. `system_noise = true`, from before `level`, still means `debug`, with a
-  warning to switch.
+  replaces it.
 - **Console lines (2026-10-07):** info, warnings and errors are plain sentences that
   stand on their own ("Opened world: world", "Listening on 0.0.0.0:19132", "Steve
   joined the game"). Structured fields only show on DEBUG and TRACE lines. The
   server's own lines are tagged `[BedrockRS]` in Minecraft's gold, the plugin system's
   `[Plugins]`; plugin output (`[hello]`), chat and libraries keep their own tags, in
-  cyan. Routine activity and the details behind a line go to debug. Network settings and the world directory are still environment
-  variables.
+  cyan. Routine activity and the details behind a line go to debug. Network settings are still
+  environment variables.
 
 ## 5. Approved decisions (2026-09-25)
 
@@ -1499,6 +1564,8 @@ Each step starts only after explicit confirmation.
 | 25 | Block states and placement (Priority 2, part A): the 1.26.50 block palette; placed states checked and upgraded (items, saved chunks); facing, axis, torch, slab, stairs (with corners) and sign rules; fence, pane, bar and wall connections, updated around every change; rollback for every refused placement; clients' own swings (punching) shown to others | Stairs, torches, iron bars, fences, panes and logs place facing the right way and connect; nothing leaves a dead spot; punching swings the arm | 🧪 live test (2026-09-27): rotations, connections, rollback and swings worked, and old dead spots were repaired; slabs stacked a block too high and would not merge (double slabs added); ready for another test |
 | 26 | Per-player game modes (saved; abilities, breaking, placing, drops and visibility follow them) and slash commands: AvailableCommands, CommandRequest and CommandOutput; command trees with subcommands, typed arguments and permissions shared by built-in and plugin commands; `server.command` for Luau plugins; operators in `ops.json`; console commands; `help`, `list`, `version`, `gamemode`, `op`, `deop`, `stop` | Players switch game modes with `/gamemode`, and a plugin's subcommands autocomplete and run | 🟡 2026-10-07: tested end to end with the console and the sample plugin; not yet with a live client |
 | 27 | Health and death: the `minecraft:health` component and vanilla's damage causes; fall damage, the void and peaceful regeneration; the death screen, death messages, drops and respawning; game rules (`falldamage`, `keepinventory`, `naturalregeneration`, `showcoordinates`, `showdeathmessages`) with `/gamerule`, and `/kill`; `player_damage` (cancellable), `player_death` and `player_respawn` events and `player.set_health` / `player.damage` for plugins. The session loop now delivers every reply in one place | Survival players get hurt, die and respawn | 🟡 2026-10-07: tested in the session and from the console; not yet with a live client |
+| 28 | Vanilla storage and `server.properties`: worlds in vanilla's layout (`worlds/<level-name>/db`, LevelDB through `bedrock-leveldb`, and `levelname.txt` for the name); vanilla's chunk keys and sub-chunk format 9, players as vanilla NBT under `player_server_<uuid>`; little-endian NBT reading and writing; `server.properties` (`level-name`, `level-type` FLAT only, `gamemode`, `log-level`, `log-chat`) replacing `bedrockrs.toml`; the `.bin` and `.json` storage removed | A fresh start writes `server.properties` and a vanilla world folder; changes and players survive a restart; a vanilla world copied into `worlds/` opens under its own name with its terrain | 🧪 a real vanilla 1.21 world read in full and took a change (2026-10-08); joining, saving and reopening untested live; vanilla opening a world BedrockRS wrote is untested |
+| 29 | `level.dat`: written for new worlds with every field of a vanilla 1.26.52 superflat world (post-1.18 flat layers, spawn, game rules, versions), kept and updated for existing ones, with `level.dat_old`; game rules moved into it from `game_rules.json`; spawn read from it (or the highest block at (0, 0)) | Vanilla opens a world BedrockRS made, with its builds; `/gamerule` changes show in vanilla; an imported world's spawn and rules apply | 🧪 key set and types match vanilla's exactly; vanilla opening one untested (a `.mcworld` was made for it) |
 
 Later steps are proposed but not yet scheduled:
 - `player.give` and item events for plugins; then block interactions and containers,
@@ -1557,17 +1624,19 @@ Later steps are proposed but not yet scheduled:
   natively is the better end state, so owners can drop in a world, but most of the cost
   is not the database:
   - A pure-Rust LevelDB (`rusty-leveldb`, with a custom compressor) or C bindings to
-    Mojang's fork. Both are workable.
-  - Little-endian NBT *decoding*; BedrockRS only encodes network NBT today.
+    Mojang's fork. Both are workable. (Done 2026-10-08 with `bedrock-leveldb`.)
+  - Little-endian NBT *decoding*; BedrockRS only encodes network NBT today. (Done
+    2026-10-08: `nbt::Compound::read_le` and `write_le`. Java's NBT crates, such as
+    `fastnbt`, are big-endian and cannot read it.)
   - Upgrading old block states: older worlds use renamed or merged blocks (`stone` with
     `stone_type`, and so on), which need Mojang's upgrade tables.
   - Block entities, entities, biomes, and the level.dat and player records, or keeping
     them intact when writing.
 
   Palettes store names and states, and BedrockRS's network IDs are hashes of exactly
-  those, so blocks themselves map cleanly. The plan is to move the `.bin` format to name
-  palettes first (it has a version byte), then add LevelDB as a second backend: first
-  read-only import, then native read and write.
+  those, so blocks themselves map cleanly. The plan was to move the `.bin` format to name
+  palettes first, then add LevelDB as a second backend. On 2026-10-08 LevelDB replaced
+  the `.bin` format outright, reading and writing (see Persistence).
 - **Saved chunks store block names (resolved 2026-09-26).** Version 1 stored state
   hashes, which change when Mojang renames a block or changes its states. Version 2
   stores names and states. A rename across versions will still need an upgrade table,

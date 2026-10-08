@@ -60,6 +60,12 @@ impl GameMode {
         }
     }
 
+    /// The mode with wire number `id` (as saved players hold it too), if
+    /// it is one: vanilla's 5, "default", is not.
+    pub fn from_id(id: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.id() == id)
+    }
+
     /// The mode a number stands for in vanilla `/gamemode`: 0, 1 or 2.
     pub fn from_number(number: i64) -> Option<Self> {
         match number {

@@ -6,6 +6,7 @@ __pycache__/
 
 # Server runtime files: created when the server runs, never committed.
 # Plugins and the start scripts in server/ are tracked.
+/server/server.properties
 /server/bedrockrs.toml
 /server/ops.json
 /server/keys/
@@ -14,6 +15,7 @@ __pycache__/
 *.pem
 
 # The same files, from running the server in the repository root by mistake.
+/server.properties
 /bedrockrs.toml
 /ops.json
 /keys/

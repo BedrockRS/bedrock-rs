@@ -192,6 +192,16 @@ impl Server {
         }
     }
 
+    /// Saves everything, as [`Server::save`], and makes it durable: the world's
+    /// database writes what it holds in its log out to its tables. For when
+    /// the server stops.
+    pub fn save_and_flush(&self) {
+        self.save();
+        if let Err(err) = self.world.flush() {
+            tracing::error!("Couldn't finish saving the world: {err}");
+        }
+    }
+
     /// Saves where a player is, logging a failure.
     pub fn save_player(&self, uuid: Uuid, player: &SavedPlayer) {
         if let Err(err) = self.world.save_player(uuid, player) {
