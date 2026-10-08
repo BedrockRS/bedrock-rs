@@ -7,6 +7,8 @@
 //! name: [`solid`] blocks have faces fences and walls connect to, and
 //! [`full_cube`]s have every face sturdy enough to hang things on.
 
+use std::collections::{HashMap, VecDeque};
+
 use bedrockrs_protocol::block::{BlockState, StateValue};
 use bedrockrs_protocol::types::BlockPos;
 
@@ -383,6 +385,8 @@ pub fn replaceable(state: &BlockState) -> bool {
             | "seagrass"
             | "vine"
             | "glow_lichen"
+            | "sculk_vein"
+            | "resin_clump"
             | "nether_sprouts"
             | "crimson_roots"
             | "warped_roots"
@@ -518,9 +522,227 @@ pub fn drops_item(state: &BlockState) -> bool {
     partner(state, BlockPos::default()).is_none_or(|(_, drops)| drops)
 }
 
+/// The faces of `multi_face_direction_bits` (glow lichen, sculk vein, resin
+/// clump), as `(bit, face)`: down 1, up 2, south 4, west 8, north 16, east
+/// 32. Each face is the side of the block it lies on.
+pub(crate) const MULTI_FACES: [(i32, u8); 6] = [(1, 0), (2, 1), (4, 3), (8, 4), (16, 2), (32, 5)];
+
+/// The faces of `vine_direction_bits`, as `(bit, face)`: south 1, west 2,
+/// north 4, east 8.
+pub(crate) const VINE_FACES: [(i32, u8); 4] = [(1, 3), (2, 4), (4, 2), (8, 5)];
+
+/// For a block made of faces (vines, glow lichen and the like): its state
+/// key, the faces it has and those of them something holds. A face of glow
+/// lichen needs a sturdy face behind it; a vine's side, a sturdy face or the
+/// same side of a vine above it, as vines hang down walls.
+fn held_faces(
+    state: &BlockState,
+    pos: BlockPos,
+    blocks: &impl Blocks,
+) -> Option<(&'static str, i32, i32)> {
+    let sturdy_at = |face: u8| {
+        blocks
+            .at(side(pos, face))
+            .is_some_and(|block| sturdy(&block, opposite_face(face)))
+    };
+    let (key, faces): (&'static str, &[(i32, u8)]) =
+        if let Some(bits) = int(state, "vine_direction_bits") {
+            let above = blocks
+                .at(side(pos, UP))
+                .filter(|above| above.name == state.name)
+                .and_then(|above| int(&above, "vine_direction_bits"))
+                .unwrap_or(0);
+            let held = VINE_FACES
+                .iter()
+                .filter(|(bit, face)| bits & bit != 0 && (above & bit != 0 || sturdy_at(*face)))
+                .fold(0, |held, (bit, _)| held | bit);
+            return Some(("vine_direction_bits", bits, held));
+        } else if int(state, "multi_face_direction_bits").is_some() {
+            ("multi_face_direction_bits", &MULTI_FACES)
+        } else {
+            return None;
+        };
+    let bits = int(state, key)?;
+    let held = faces
+        .iter()
+        .filter(|(bit, face)| bits & bit != 0 && sturdy_at(*face))
+        .fold(0, |held, (bit, _)| held | bit);
+    Some((key, bits, held))
+}
+
+/// The most scaffolding a search for the ground looks through, so a huge
+/// structure costs a bounded amount; past it, the neighbours' stabilities
+/// are trusted instead.
+const SCAFFOLDING_SEARCH: usize = 4096;
+
+/// How far scaffolding at `pos` is from a column standing on the ground,
+/// as vanilla's `stability` (its distance): the fewest sideways steps
+/// through scaffolding to scaffolding standing on a sturdy floor, going
+/// down columns for free. 7 is too far.
+///
+/// Vanilla works this out from the neighbours' stored stabilities, so when
+/// a column goes, what hung from it counts up a step a tick before falling;
+/// a search through the structure finds at once that nothing holds it, so
+/// it falls block by block outwards from where it was cut (found live on
+/// 2026-10-08, when a bridge stood until a whole layer fell at once).
+pub fn scaffolding_stability(pos: BlockPos, blocks: &impl Blocks) -> i32 {
+    let is_scaffolding = |pos: BlockPos| {
+        blocks
+            .at(pos)
+            .is_some_and(|block| short(&block.name) == "scaffolding")
+    };
+    // Steps down cost nothing and sideways one, so the queue keeps the
+    // nearest first: down steps go to its front.
+    let mut best: HashMap<BlockPos, i32> = HashMap::from([(pos, 0)]);
+    let mut queue = VecDeque::from([(pos, 0)]);
+    while let Some((at, steps)) = queue.pop_front() {
+        if best.get(&at).is_some_and(|known| *known < steps) {
+            continue;
+        }
+        if best.len() > SCAFFOLDING_SEARCH {
+            return local_stability(pos, blocks);
+        }
+        let below = side(at, DOWN);
+        if is_scaffolding(below) {
+            if best.get(&below).is_none_or(|known| *known > steps) {
+                best.insert(below, steps);
+                queue.push_front((below, steps));
+            }
+        } else if blocks.at(below).is_some_and(|block| sturdy(&block, UP)) {
+            return steps;
+        }
+        if steps + 1 >= 7 {
+            continue;
+        }
+        for face in 2..6 {
+            let beside = side(at, face);
+            if is_scaffolding(beside) && best.get(&beside).is_none_or(|known| *known > steps + 1) {
+                best.insert(beside, steps + 1);
+                queue.push_back((beside, steps + 1));
+            }
+        }
+    }
+    7
+}
+
+/// Vanilla's stability from the neighbours' stored ones: that of the
+/// scaffolding under it, 0 on a sturdy floor, or one more than the nearest
+/// beside it.
+fn local_stability(pos: BlockPos, blocks: &impl Blocks) -> i32 {
+    let stored = |block: &BlockState| {
+        (short(&block.name) == "scaffolding").then(|| int(block, "stability").unwrap_or(7))
+    };
+    let mut stability = 7;
+    if let Some(below) = blocks.at(side(pos, DOWN)) {
+        match stored(&below) {
+            Some(below) => stability = below,
+            None if sturdy(&below, UP) => return 0,
+            None => {}
+        }
+    }
+    for face in 2..6 {
+        if let Some(beside) = blocks.at(side(pos, face)).as_ref().and_then(stored) {
+            stability = stability.min(beside + 1);
+        }
+    }
+    stability.min(7)
+}
+
+/// Blocks that fall when nothing is under them: sand, gravel, concrete
+/// powder, anvils, the dragon egg.
+pub fn falls(name: &str) -> bool {
+    let name = short(name);
+    matches!(
+        name,
+        "sand"
+            | "red_sand"
+            | "gravel"
+            | "suspicious_sand"
+            | "suspicious_gravel"
+            | "anvil"
+            | "chipped_anvil"
+            | "damaged_anvil"
+            | "dragon_egg"
+    ) || name.ends_with("_concrete_powder")
+}
+
+/// Whether a falling block passes through `state`: air, liquids, fire and
+/// what blocks simply replace.
+pub fn falls_through(state: &BlockState) -> bool {
+    replaceable(state)
+}
+
+/// What becomes of a block when its neighbours change.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Settled {
+    /// It stays, as this state: itself, a vine or lichen without the faces
+    /// nothing holds any more, or scaffolding with its new stability.
+    Stays(BlockState),
+    /// Nothing holds it: it breaks, dropping its item.
+    Pops,
+    /// It falls as a falling block: sand over air, or scaffolding placed
+    /// too far out (vanilla drops it if it was steady before, and lets it
+    /// fall if it was already too far).
+    Falls,
+}
+
+/// What the block `state` at `pos` becomes once its neighbours changed.
+pub fn settled(state: &BlockState, pos: BlockPos, blocks: &impl Blocks) -> Settled {
+    if let Some((key, bits, held)) = held_faces(state, pos, blocks) {
+        if held == 0 {
+            return Settled::Pops;
+        }
+        let mut settled = state.clone();
+        if held != bits
+            && let Some((_, value)) = settled.states.iter_mut().find(|(name, _)| name == key)
+        {
+            *value = StateValue::Int(held);
+        }
+        return Settled::Stays(settled);
+    }
+    if short(&state.name) == "scaffolding" {
+        let stability = scaffolding_stability(pos, blocks);
+        if stability >= 7 {
+            return if int(state, "stability") == Some(7) {
+                Settled::Falls
+            } else {
+                Settled::Pops
+            };
+        }
+        let mut settled = state.clone();
+        if let Some((_, value)) = settled
+            .states
+            .iter_mut()
+            .find(|(name, _)| name == "stability")
+        {
+            *value = StateValue::Int(stability);
+        }
+        return Settled::Stays(settled);
+    }
+    if falls(&state.name)
+        && blocks
+            .at(side(pos, DOWN))
+            .is_some_and(|below| falls_through(&below))
+    {
+        return Settled::Falls;
+    }
+    if supported(state, pos, blocks) {
+        Settled::Stays(state.clone())
+    } else {
+        Settled::Pops
+    }
+}
+
 /// Whether the block `state` at `pos` has what it needs around it.
 pub fn supported(state: &BlockState, pos: BlockPos, blocks: &impl Blocks) -> bool {
     let name = short(&state.name);
+    // Every face of a vine or lichen is held, and it has one.
+    if let Some((_, bits, held)) = held_faces(state, pos, blocks) {
+        return bits != 0 && held == bits;
+    }
+    if name == "scaffolding" {
+        return scaffolding_stability(pos, blocks) < 7;
+    }
     let at = |face: u8| blocks.at(side(pos, face));
     let below = || at(DOWN);
     let above = || at(UP);
@@ -635,6 +857,9 @@ pub fn supported(state: &BlockState, pos: BlockPos, blocks: &impl Blocks) -> boo
         "spore_blossom" | "hanging_roots" | "pale_hanging_moss"
     ) {
         return above().is_some_and(|block| block.name == state.name || sturdy(&block, DOWN));
+    }
+    if name == "kelp" {
+        return below().is_some_and(|block| block.name == state.name || sturdy(&block, UP));
     }
     if name == "twisting_vines" {
         return below().is_some_and(|block| block.name == state.name || sturdy(&block, UP));

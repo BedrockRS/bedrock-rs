@@ -14,7 +14,7 @@ use bedrockrs_protocol::types::{BlockPos, Vec3};
 
 use crate::blocks::palette;
 use crate::support::{self, full_cube, solid};
-use crate::world::World;
+use crate::world::{MAX_Y, MIN_Y, World};
 
 /// How the player placed the block.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -217,6 +217,27 @@ fn vine_bit(direction: Direction) -> i32 {
     }
 }
 
+/// The faces of a vine or lichen placed at `target` with face `bit`: those
+/// of the same block already there and the new one, which it must not
+/// have yet.
+fn merged_face(
+    bit: i32,
+    key: &str,
+    name: &str,
+    target: BlockPos,
+    world: &World,
+) -> Result<StateValue, Refusal> {
+    let had = world
+        .block_state(target)
+        .filter(|block| block.name == name)
+        .and_then(|block| support::int(block, key))
+        .unwrap_or(0);
+    if had & bit != 0 {
+        return Err(Refusal::WrongFace);
+    }
+    Ok(StateValue::Int(had | bit))
+}
+
 /// The state a block item places at `target`, as the player placed it; it
 /// is checked against the states the client knows.
 pub fn placed_state(
@@ -289,14 +310,22 @@ pub fn placed_state(
                     face => face_name(face).to_owned(),
                 })
             }
+            // A face against the clicked block, added to those of the same
+            // block already there.
             "multi_face_direction_bits" => {
-                StateValue::Int(multi_face_bit(opposite_face(placing.face)))
+                let bit = multi_face_bit(opposite_face(placing.face));
+                merged_face(bit, key, &name, target, world)?
             }
+            // Vines only go on walls.
             "vine_direction_bits" => match wall_face {
-                Some(facing) => StateValue::Int(vine_bit(facing.opposite())),
-                None if placing.face == 0 => StateValue::Int(0),
+                Some(facing) => {
+                    merged_face(vine_bit(facing.opposite()), key, &name, target, world)?
+                }
                 None => return Err(Refusal::WrongFace),
             },
+            "stability" if short == "scaffolding" => {
+                StateValue::Int(support::scaffolding_stability(target, world))
+            }
             "coral_direction" => StateValue::Int(match wall_face {
                 Some(Direction::West) => 0,
                 Some(Direction::East) => 1,
@@ -516,6 +545,46 @@ pub fn slab_merge(
     };
     let state = palette().upgrade(&BlockState::new(double))?;
     Some((at, state, world.block(at)))
+}
+
+/// Where scaffolding goes when the player places more onto the scaffolding
+/// at `start`, clicking face `face` of the block at `start` if `on_start`,
+/// or of a block whose face `start` is against (the ground it stands on):
+/// a side of the scaffolding itself reaches out of that side; anything else,
+/// its top or the ground under it, stacks on top of the column (found live
+/// on 2026-10-08; reaching out along the look on the top was Java's way).
+/// Sneaking, it goes out of the clicked face whichever it is. It goes in the
+/// first spot past the scaffolding already there, up to 7 sideways, if that
+/// is replaceable.
+pub fn scaffolding_extension(
+    start: BlockPos,
+    face: u8,
+    on_start: bool,
+    sneaking: bool,
+    world: &World,
+) -> Option<BlockPos> {
+    let side_clicked = on_start && (2..6).contains(&face);
+    let direction = if sneaking || side_clicked {
+        face
+    } else {
+        support::UP
+    };
+    let mut pos = side(start, direction);
+    let mut sideways = 0;
+    while sideways < 7 {
+        if !(MIN_Y..=MAX_Y).contains(&pos.y) {
+            return None;
+        }
+        let state = world.block_state(pos)?;
+        if state.name != "minecraft:scaffolding" {
+            return support::replaceable(state).then_some(pos);
+        }
+        pos = side(pos, direction);
+        if direction >= 2 {
+            sideways += 1;
+        }
+    }
+    None
 }
 
 /// The blocks around `pos` whose connections or shape depend on it, with
@@ -1252,6 +1321,39 @@ mod tests {
         let vine = placed_state(&item("minecraft:vine"), GROUND, &against_north, &world).unwrap();
         // Facing north, so fixed to the block south of it.
         assert_eq!(get(&vine, "vine_direction_bits"), &StateValue::Int(1));
+        let on_ceiling = Placing {
+            face: 0,
+            ..against_north
+        };
+        assert_eq!(
+            placed_state(&item("minecraft:vine"), GROUND, &on_ceiling, &world),
+            Err(Refusal::WrongFace),
+            "vines only go on walls"
+        );
+        // Lichen placed where lichen is adds a face, but not one it has.
+        let floor =
+            placed_state(&item("minecraft:glow_lichen"), GROUND, &on_top(0.0), &world).unwrap();
+        assert_eq!(
+            get(&floor, "multi_face_direction_bits"),
+            &StateValue::Int(1)
+        );
+        world.set_block(GROUND, floor.network_id());
+        let both = placed_state(
+            &item("minecraft:glow_lichen"),
+            GROUND,
+            &against_north,
+            &world,
+        )
+        .unwrap();
+        assert_eq!(
+            get(&both, "multi_face_direction_bits"),
+            &StateValue::Int(1 | 4)
+        );
+        assert_eq!(
+            placed_state(&item("minecraft:glow_lichen"), GROUND, &on_top(0.0), &world),
+            Err(Refusal::WrongFace)
+        );
+        world.set_block(GROUND, world.air());
         let lantern = placed_state(
             &item("minecraft:lantern"),
             GROUND,

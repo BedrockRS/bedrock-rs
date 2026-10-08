@@ -11,6 +11,8 @@ use crate::types::{Vec3, uuid_bytes};
 /// Entity metadata keys, as numbered on the wire.
 pub mod metadata_key {
     pub const FLAGS: u32 = 0;
+    /// An int: for a falling block, the network ID of its block.
+    pub const VARIANT: u32 = 2;
     pub const NAME: u32 = 4;
     pub const SCALE: u32 = 38;
     pub const WIDTH: u32 = 53;
@@ -252,6 +254,7 @@ impl Encode for SetActorData {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
     Byte(u8),
+    Int(i32),
     Float(f32),
     String(String),
     Long(i64),
@@ -261,6 +264,7 @@ impl MetadataValue {
     fn type_id(&self) -> u8 {
         match self {
             Self::Byte(_) => 0,
+            Self::Int(_) => 2,
             Self::Float(_) => 3,
             Self::String(_) => 4,
             Self::Long(_) => 7,
@@ -285,6 +289,7 @@ impl EntityMetadata {
             writer.u8(value.type_id());
             match value {
                 MetadataValue::Byte(byte) => writer.u8(*byte),
+                MetadataValue::Int(int) => writer.var_i32(*int),
                 MetadataValue::Float(float) => writer.f32_le(*float),
                 MetadataValue::String(text) => writer.string(text),
                 MetadataValue::Long(long) => writer.var_i64(*long),

@@ -603,3 +603,49 @@ fn players_cannot_place_what_would_trap_them_but_can_what_misses_them() {
         reply.events
     );
 }
+
+#[test]
+fn clicking_scaffolding_with_scaffolding_climbs_the_column() {
+    let mut session = in_game_session();
+    session.inventory = Inventory::with_hotbar(&["minecraft:scaffolding"]);
+    let scaffolding = crate::blocks::palette()
+        .upgrade(&BlockState::new("minecraft:scaffolding"))
+        .unwrap();
+    let column = [
+        BlockPos { x: 2, y: -60, z: 0 },
+        BlockPos { x: 2, y: -59, z: 0 },
+    ];
+    for pos in column {
+        session.world.set_block(pos, scaffolding.network_id());
+    }
+    // Clicking the ground where the column stands puts it on top, and the
+    // client hears what is really where it clicked.
+    let ground = BlockPos { x: 2, y: -61, z: 0 };
+    let reply = session
+        .handle(&use_on_block(&session, 0, ground, 1, 1.0))
+        .unwrap();
+    let Some(SessionEvent::PlacedBlock { pos, block, .. }) = reply.events.first() else {
+        panic!("expected scaffolding, got {:?}", reply.events);
+    };
+    assert_eq!(*pos, BlockPos { x: 2, y: -58, z: 0 });
+    let placed = session.world.state_of(*block).unwrap();
+    assert_eq!(placed.name, "minecraft:scaffolding");
+    assert_eq!(crate::support::int(placed, "stability"), Some(0));
+    assert!(!reply.packets.is_empty());
+
+    // Its top stacks too; a side reaches out of that side.
+    let reply = session
+        .handle(&use_on_block(&session, 0, column[1], 1, 1.0))
+        .unwrap();
+    assert!(matches!(
+        reply.events.first(),
+        Some(SessionEvent::PlacedBlock { pos, .. }) if *pos == BlockPos { x: 2, y: -58, z: 0 }
+    ));
+    let reply = session
+        .handle(&use_on_block(&session, 0, column[0], 5, 0.5))
+        .unwrap();
+    assert!(matches!(
+        reply.events.first(),
+        Some(SessionEvent::PlacedBlock { pos, .. }) if *pos == BlockPos { x: 3, y: -60, z: 0 }
+    ));
+}

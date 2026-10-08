@@ -81,6 +81,27 @@ fn passable(state: &BlockState) -> bool {
 
 /// Plants and growths with no collision.
 fn is_soft(name: &str) -> bool {
+    // Whole blocks named like plants: grass blocks, mushroom blocks, nether
+    // stems, mangrove roots, flower pots (found 2026-10-08: grass blocks
+    // had no collision, so falling sand fell through the ground).
+    let solid_namesake = matches!(
+        name,
+        "grass_block"
+            | "grass_path"
+            | "mushroom_stem"
+            | "brown_mushroom_block"
+            | "red_mushroom_block"
+            | "mangrove_roots"
+            | "muddy_mangrove_roots"
+            | "dirt_with_roots"
+            | "flower_pot"
+            | "flowering_azalea"
+            | "chorus_flower"
+    ) || name.ends_with("_leaves")
+        || name.ends_with("_leaves_flowered");
+    if solid_namesake {
+        return false;
+    }
     name.ends_with("_sapling")
         || name.contains("flower")
         || name.contains("tulip")
@@ -89,7 +110,7 @@ fn is_soft(name: &str) -> bool {
         || name.contains("mushroom")
         || name.contains("fungus")
         || name.contains("roots")
-        || name.ends_with("_stem")
+        || matches!(name, "melon_stem" | "pumpkin_stem")
         || matches!(
             name,
             "dandelion"
@@ -333,6 +354,10 @@ pub fn body_inside(
     pos: BlockPos,
     state: &BlockState,
 ) -> bool {
+    // Bodies climb through scaffolding, so it goes in around them.
+    if short(&state.name) == "scaffolding" {
+        return false;
+    }
     let body_min = [feet.x - half_width, feet.y, feet.z - half_width];
     let body_max = [feet.x + half_width, feet.y + height, feet.z + half_width];
     let origin = [pos.x as f32, pos.y as f32, pos.z as f32];
@@ -366,6 +391,18 @@ mod tests {
             z: feet.1,
         };
         body_inside(feet, 0.3, 1.8, AT, state)
+    }
+
+    #[test]
+    fn scaffolding_goes_in_around_a_body() {
+        let feet = Vec3 {
+            x: 0.5,
+            y: 0.0,
+            z: 0.5,
+        };
+        let at = BlockPos { x: 0, y: 0, z: 0 };
+        assert!(body_inside(feet, 0.3, 1.8, at, &state("stone")));
+        assert!(!body_inside(feet, 0.3, 1.8, at, &state("scaffolding")));
     }
 
     #[test]

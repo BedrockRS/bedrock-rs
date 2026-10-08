@@ -54,7 +54,7 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 - [x] Block breaking and placing, with reach and overlap checks
 - [x] Full 1.26.50 block palette with placement rules (facing, slabs, stairs, connections, tall walls)
 - [x] Every block and block-placing item can be placed: doors, beds and tall flowers as two blocks, signs, seeds, redstone and the like
-- [x] Support: ladders, torches, plants and the like need something to hold them, and pop off without it
+- [x] Support: ladders, torches, plants and the like need something to hold them, and pop off without it, a block a tick; vines and lichen face by face, scaffolding by stability, reaching out and climbing as in vanilla
 - [x] Mojang's JSON-defined vanilla blocks (wool and concrete slabs and stairs, red shrub, shelf mushroom)
 - [x] World persistence (compressed chunk files, versioned format)
 - [x] Player persistence (position, rotation, flying state, inventory, game mode)
@@ -69,6 +69,7 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 - [x] The inventory screen's crafting grid holds items (no crafting yet)
 - [x] Server-owned player inventories (main, armour, offhand, cursor)
 - [x] Item drops, item entities and held items shown to others
+- [x] Falling blocks: sand, gravel, concrete powder, anvils and scaffolding fall and land
 - [ ] Inventory protocol verified with a live client
 - [ ] Containers (chests, furnaces, …)
 

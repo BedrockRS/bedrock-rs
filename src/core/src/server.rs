@@ -1,8 +1,8 @@
 //! State every session shares, and what plugins ask of it.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bedrockrs_plugins::{Action, Dispatcher};
 use bedrockrs_protocol::block::BlockState;
@@ -18,6 +18,7 @@ use crate::blocks::palette;
 use crate::commands::Commands;
 use crate::damage::DamageCause;
 use crate::entities::{self, ItemEntities, ItemStack, PickedUp};
+use crate::falling::{FallingBlocks, Landed};
 use crate::game_mode::GameMode;
 use crate::game_rules::GameRules;
 use crate::items::items;
@@ -26,7 +27,7 @@ use crate::ops::Operators;
 use crate::placement;
 use crate::players::Players;
 use crate::storage::SavedPlayer;
-use crate::support;
+use crate::support::{self, Settled};
 use crate::world::World;
 
 /// Ticks between saves of changed chunks: every 5 seconds.
@@ -46,6 +47,8 @@ pub struct Server {
     pub logins: Logins,
     /// Items lying in the world.
     pub items: ItemEntities,
+    /// Blocks falling as entities.
+    pub falling: FallingBlocks,
     /// Every slash command, built-in and from plugins.
     pub commands: Commands,
     /// Players who may run operator commands.
@@ -60,6 +63,11 @@ pub struct Server {
     stop: Notify,
     /// Set once the server disconnects everyone to stop.
     closing: AtomicBool,
+    /// Blocks to check next tick, as their neighbours changed.
+    checks: Mutex<HashSet<BlockPos>>,
+    /// Blocks found last tick to be about to fall, with the held falling
+    /// block shown inside each: they fall this tick if they still should.
+    about_to_fall: Mutex<HashMap<BlockPos, u64>>,
 }
 
 impl Server {
@@ -71,6 +79,7 @@ impl Server {
             authenticator,
             logins: Logins::new(),
             items: ItemEntities::new(),
+            falling: FallingBlocks::new(),
             commands: Commands::new(),
             ops: Operators::in_memory(),
             default_game_mode: GameMode::Creative,
@@ -78,6 +87,8 @@ impl Server {
             tick: AtomicU64::new(0),
             stop: Notify::new(),
             closing: AtomicBool::new(false),
+            checks: Mutex::new(HashSet::new()),
+            about_to_fall: Mutex::new(HashMap::new()),
         }
     }
 
@@ -154,8 +165,14 @@ impl Server {
     /// Advances the world by one tick; called by the game loop.
     pub fn tick(&self, tick: u64) {
         self.tick.store(tick, Ordering::Relaxed);
-        let items = self.items.tick(&self.world, tick);
-        self.players.tick(tick, &items);
+        self.check_blocks();
+        let (falling, landed) = self.falling.tick(&self.world, tick);
+        for (entity_id, landed) in landed {
+            self.land(entity_id, landed);
+        }
+        let mut entities = self.items.tick(&self.world, tick);
+        entities.extend(falling);
+        self.players.tick(tick, &entities);
         if tick.is_multiple_of(SAVE_INTERVAL) {
             self.save();
         }
@@ -253,15 +270,17 @@ impl Server {
     }
 
     /// After the blocks at `changed` changed: their neighbours' connections
-    /// and shapes follow, and neighbours left without support (a torch whose
-    /// wall is gone, the top of a door whose bottom broke) pop off, dropping
-    /// their item, and so on outwards.
+    /// and shapes follow at once, and the neighbours are checked next tick,
+    /// when those left without support (a torch whose wall is gone, the top
+    /// of a door whose bottom broke) pop off.
     fn settle(&self, changed: &[BlockPos]) {
         let mut queue: VecDeque<BlockPos> = changed.iter().copied().collect();
-        // A long ladder or tall cactus pops block by block; a bound keeps a
-        // mistake in the rules from running away.
+        // A bound keeps a mistake in the shape rules from running away.
         let mut budget = 4096;
         while let Some(pos) = queue.pop_front() {
+            // It too: sand placed over air falls.
+            self.checks()
+                .extend(std::iter::once(pos).chain((0..6).map(|face| placement::side(pos, face))));
             // A neighbour whose shape changed changes what its own neighbours
             // should be in turn: a wall gaining a connection makes the wall
             // under it taller (found live on 2026-10-08).
@@ -273,29 +292,153 @@ impl Server {
                 budget -= 1;
                 queue.push_back(changed);
             }
-            for face in 0..6 {
-                let neighbour = placement::side(pos, face);
-                let Some(state) = self.world.block_state(neighbour).cloned() else {
-                    continue;
-                };
-                if state.name == "minecraft:air"
-                    || support::supported(&state, neighbour, &*self.world)
-                {
-                    continue;
+        }
+    }
+
+    /// Checks the blocks whose neighbours changed since last tick. Those no
+    /// longer supported pop off, dropping their item if `dotiledrops` is on;
+    /// vines and lichen lose the faces nothing holds; scaffolding works out
+    /// how far it is from a column. Their own neighbours are checked the tick
+    /// after, so a column of cactus or carpet falls one block a tick, from
+    /// the bottom up, as in vanilla.
+    pub fn check_blocks(&self) {
+        let due = std::mem::take(&mut *self.checks());
+        let mut ready = std::mem::take(
+            &mut *self
+                .about_to_fall
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        // Everything is judged as the world stood at the start of the tick,
+        // so a block never falls in the same tick as the block under it.
+        let outcomes: Vec<(BlockPos, BlockState, Settled)> = due
+            .into_iter()
+            .filter_map(|pos| {
+                let state = self.world.block_state(pos)?.clone();
+                if state.name == "minecraft:air" {
+                    return None;
                 }
-                if budget == 0 {
-                    tracing::warn!(?neighbour, "stopped popping unsupported blocks");
-                    return;
-                }
-                budget -= 1;
-                if self.remove_block(neighbour).is_some() {
-                    if support::drops_item(&state) {
-                        self.drop_block(neighbour, &state);
+                let settled = support::settled(&state, pos, &*self.world);
+                (settled != Settled::Stays(state.clone())).then_some((pos, state, settled))
+            })
+            .collect();
+        for (pos, state, settled) in outcomes {
+            if self.world.block(pos) != state.network_id() {
+                continue;
+            }
+            match settled {
+                Settled::Stays(settled) => {
+                    let block = settled.network_id();
+                    if self.world.replace_exact(pos, state.network_id(), block) {
+                        self.players
+                            .send_to_viewers(ChunkPos::of_block(pos), &block_update(pos, block));
+                        self.settle(&[pos]);
                     }
-                    queue.push_back(neighbour);
                 }
+                Settled::Pops => self.pop(pos, &state),
+                // A block stays a whole tick before it falls, with its
+                // falling block already shown inside it, so clients have
+                // drawn the entity by the time the block goes (see
+                // `falling`).
+                Settled::Falls => match ready.remove(&pos) {
+                    Some(entity_id) => self.start_falling(pos, &state, entity_id),
+                    None => self.hold_falling(pos, &state),
+                },
             }
         }
+        // Held falling blocks whose block no longer falls, or is gone.
+        for entity_id in ready.into_values() {
+            self.falling.cancel(entity_id);
+            self.players.hide_entity(entity_id);
+        }
+    }
+
+    /// Shows a falling block inside the block `state` at `pos`, which falls
+    /// next tick if it still should.
+    fn hold_falling(&self, pos: BlockPos, state: &BlockState) {
+        let entity_id = self.players.allocate_entity_id();
+        let shown = self.falling.hold(entity_id, state.clone(), pos);
+        self.players
+            .show_entity(ChunkPos::of_block(pos), entity_id, &shown);
+        self.about_to_fall
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(pos, entity_id);
+        self.checks().insert(pos);
+    }
+
+    /// Empties the block `state` at `pos` and lets its held falling block
+    /// `entity_id` go.
+    fn start_falling(&self, pos: BlockPos, state: &BlockState, entity_id: u64) {
+        let air = self.world.air();
+        if !self.world.replace_exact(pos, state.network_id(), air) {
+            self.falling.cancel(entity_id);
+            self.players.hide_entity(entity_id);
+            return;
+        }
+        tracing::debug!(?pos, entity_id, block = %state.name, "a block starts falling");
+        let chunk = ChunkPos::of_block(pos);
+        self.players.send_to_viewers(chunk, &block_update(pos, air));
+        self.falling.release(entity_id);
+        self.settle(&[pos]);
+    }
+
+    /// A falling block that stopped: back in as a block, heard landing, or
+    /// broken into its item if `dotiledrops` is on.
+    fn land(&self, entity_id: u64, landed: Landed) {
+        // The entity goes before its block comes, or the client pushes it
+        // out of the block for a frame.
+        self.players.hide_entity(entity_id);
+        tracing::debug!(entity_id, ?landed, "a falling block landed");
+        match landed {
+            Landed::Block {
+                pos,
+                state,
+                replacing,
+            } => {
+                let block = state.network_id();
+                if self.world.replace_exact(pos, replacing, block) {
+                    let chunk = ChunkPos::of_block(pos);
+                    self.players
+                        .send_to_viewers(chunk, &block_update(pos, block));
+                    let sound = LevelSoundEvent {
+                        sound: LevelSoundEvent::PLACE.into(),
+                        position: centre(pos),
+                        data: block as i32,
+                    };
+                    self.players
+                        .send_to_viewers(chunk, &Bytes::from(sound.encode()));
+                    self.settle(&[pos]);
+                } else {
+                    self.drop_block(pos, &state);
+                }
+            }
+            Landed::Item { pos, state } => self.drop_block(pos, &state),
+        }
+    }
+
+    /// Breaks the unsupported block `state` at `pos`, with its other half,
+    /// dropping its item once.
+    fn pop(&self, pos: BlockPos, state: &BlockState) {
+        if self.remove_block(pos).is_none() {
+            return;
+        }
+        let mut changed = vec![pos];
+        if let Some((other_pos, _)) = support::partner(state, pos)
+            && self
+                .world
+                .block_state(other_pos)
+                .is_some_and(|other| other.name == state.name)
+            && self.remove_block(other_pos).is_some()
+        {
+            changed.push(other_pos);
+        }
+        self.drop_block(pos, state);
+        self.settle(&changed);
+    }
+
+    fn checks(&self) -> MutexGuard<'_, HashSet<BlockPos>> {
+        self.checks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Opens or closes the door, trapdoor or fence gate at `pos` for a player
@@ -694,8 +837,10 @@ mod tests {
         assert!(server.place_block(wall, stone));
         assert!(server.place_block(ladder_at, ladder));
 
-        // Even a creative break pops the ladder, as an item.
+        // Even a creative break pops the ladder, as an item, next tick.
         server.break_block(wall, GameMode::Creative);
+        assert_eq!(server.world.block(ladder_at), ladder);
+        server.check_blocks();
         assert_eq!(server.world.block(ladder_at), server.world.air());
         assert_eq!(server.items.count(), 1);
 
@@ -704,8 +849,266 @@ mod tests {
         assert!(server.place_block(wall, stone));
         assert!(server.place_block(ladder_at, ladder));
         server.break_block(wall, GameMode::Survival);
+        server.check_blocks();
         assert_eq!(server.world.block(ladder_at), server.world.air());
         assert_eq!(server.items.count(), 1, "nothing new");
+    }
+
+    #[test]
+    fn stacks_fall_one_block_a_tick_from_the_bottom() {
+        let server = test_server();
+        let sand = state("sand", &[]).network_id();
+        let cactus = state("cactus", &[]).network_id();
+        let ground = BlockPos { x: 3, y: -61, z: 3 };
+        assert!(server.place_block_over(ground, sand, server.world.block(ground)));
+        let column: Vec<BlockPos> = (-60..=-57).map(|y| BlockPos { x: 3, y, z: 3 }).collect();
+        for pos in &column {
+            assert!(server.place_block(*pos, cactus));
+        }
+        server.check_blocks();
+        assert!(column.iter().all(|pos| server.world.block(*pos) == cactus));
+
+        server.break_block(ground, GameMode::Creative);
+        for (fallen, _) in column.iter().enumerate() {
+            server.check_blocks();
+            for (i, pos) in column.iter().enumerate() {
+                let expected = if i <= fallen {
+                    server.world.air()
+                } else {
+                    cactus
+                };
+                assert_eq!(
+                    server.world.block(*pos),
+                    expected,
+                    "tick {fallen}, block {i}"
+                );
+            }
+        }
+        assert_eq!(server.items.count(), 4);
+    }
+
+    #[test]
+    fn scaffolding_reaches_six_out_and_falls_without_its_column() {
+        let server = test_server();
+        let scaffolding = |pos: BlockPos| {
+            let stability = support::scaffolding_stability(pos, &*server.world);
+            state("scaffolding", &[("stability", StateValue::Int(stability))])
+        };
+        let at = |x: i32, y: i32| BlockPos { x, y, z: 3 };
+        // A column two high, and a bridge out from its top.
+        for pos in [at(0, -60), at(0, -59)] {
+            assert!(server.place_block(pos, scaffolding(pos).network_id()));
+        }
+        for x in 1..=6 {
+            let pos = at(x, -59);
+            assert!(support::supported(&scaffolding(pos), pos, &*server.world));
+            assert!(server.place_block(pos, scaffolding(pos).network_id()));
+        }
+        assert_eq!(
+            support::scaffolding_stability(at(7, -59), &*server.world),
+            7
+        );
+        assert!(!support::supported(
+            &scaffolding(at(7, -59)),
+            at(7, -59),
+            &*server.world
+        ));
+        server.check_blocks();
+
+        // Without the column, it falls a block a tick: up the column, then
+        // out along the bridge.
+        server.break_block(at(0, -60), GameMode::Survival);
+        let order = [
+            at(0, -59),
+            at(1, -59),
+            at(2, -59),
+            at(3, -59),
+            at(4, -59),
+            at(5, -59),
+            at(6, -59),
+        ];
+        for (tick, gone) in order.iter().enumerate() {
+            server.check_blocks();
+            for (i, pos) in order.iter().enumerate() {
+                assert_eq!(
+                    server.world.block(*pos) == server.world.air(),
+                    i <= tick,
+                    "tick {tick}: {pos:?}, expecting {gone:?} gone"
+                );
+            }
+        }
+        assert_eq!(server.items.count(), 8, "every one dropped");
+        assert_eq!(server.falling.count(), 0, "none fell");
+    }
+
+    #[test]
+    fn scaffolding_reached_too_far_out_falls_and_lands() {
+        let server = test_server();
+        let at = |x: i32, y: i32| BlockPos { x, y, z: 3 };
+        let scaffolding = |pos: BlockPos| {
+            let stability = support::scaffolding_stability(pos, &*server.world);
+            state("scaffolding", &[("stability", StateValue::Int(stability))])
+        };
+        for pos in [at(0, -60), at(0, -59)] {
+            assert!(server.place_block(pos, scaffolding(pos).network_id()));
+        }
+        // Clicking the east side of the column's top reaches out east, one
+        // more each time, past what stands.
+        let east = 5;
+        for x in 1..=7 {
+            let pos =
+                placement::scaffolding_extension(at(0, -59), east, true, false, &server.world)
+                    .unwrap();
+            assert_eq!(pos, at(x, -59));
+            assert!(server.place_block(pos, scaffolding(pos).network_id()));
+        }
+        assert_eq!(
+            placement::scaffolding_extension(at(0, -59), east, true, false, &server.world),
+            None,
+            "no further than 7 out"
+        );
+        // Clicking its top, or the ground it stands on, stacks on the column.
+        assert_eq!(
+            placement::scaffolding_extension(at(0, -59), support::UP, true, false, &server.world),
+            Some(at(0, -58))
+        );
+        assert_eq!(
+            placement::scaffolding_extension(at(0, -60), support::UP, false, false, &server.world),
+            Some(at(0, -58))
+        );
+
+        // The seventh was too far out from the start, so after a tick in
+        // place it falls, and lands on the ground below as scaffolding again.
+        server.check_blocks();
+        assert_ne!(server.world.block(at(7, -59)), server.world.air());
+        server.check_blocks();
+        assert_eq!(server.world.block(at(7, -59)), server.world.air());
+        assert_eq!(server.falling.count(), 1);
+        for tick in 1..40 {
+            server.tick(tick);
+        }
+        assert_eq!(server.falling.count(), 0);
+        let landed = server.world.block_state(at(7, -60)).unwrap();
+        assert_eq!(landed.name, "minecraft:scaffolding");
+        assert_eq!(support::int(landed, "stability"), Some(0));
+        assert_eq!(server.items.count(), 0);
+    }
+
+    #[test]
+    fn sand_over_air_falls() {
+        let server = test_server();
+        let sand = state("sand", &[]).network_id();
+        let high = BlockPos { x: 3, y: -50, z: 3 };
+        assert!(server.place_block(high, sand));
+        // A whole tick in place first.
+        server.check_blocks();
+        assert_eq!(server.world.block(high), sand);
+        server.check_blocks();
+        assert_eq!(server.world.block(high), server.world.air());
+        for tick in 1..60 {
+            server.tick(tick);
+        }
+        assert_eq!(server.world.block(BlockPos { x: 3, y: -60, z: 3 }), sand);
+    }
+
+    #[test]
+    fn a_held_falling_block_goes_if_its_block_is_held_up_after_all() {
+        let server = test_server();
+        let (_viewer, mut viewer) = join_at(&server, "Viewer", ChunkPos::new(0, 0));
+        let sand = state("sand", &[]).network_id();
+        let high = BlockPos { x: 3, y: -50, z: 3 };
+        assert!(server.place_block(high, sand));
+        server.check_blocks();
+        assert_eq!(server.falling.count(), 1);
+        // Something goes in under it before it falls.
+        let stone = state("stone", &[]).network_id();
+        assert!(server.place_block(placement::side(high, support::DOWN), stone));
+        while viewer.try_recv().is_ok() {}
+        server.check_blocks();
+        assert_eq!(server.world.block(high), sand);
+        assert_eq!(server.falling.count(), 0);
+        assert_eq!(ids(&mut viewer), [id::REMOVE_ACTOR]);
+    }
+
+    #[test]
+    fn a_falling_block_is_shown_before_its_block_goes() {
+        let server = test_server();
+        let (_viewer, mut viewer) = join_at(&server, "Viewer", ChunkPos::new(0, 0));
+        let sand = state("sand", &[]).network_id();
+        let high = BlockPos { x: 3, y: -50, z: 3 };
+        assert!(server.place_block(high, sand));
+        while viewer.try_recv().is_ok() {}
+
+        // A tick with the falling block held inside the block, so clients
+        // have drawn it; the block stays.
+        server.check_blocks();
+        assert_eq!(ids(&mut viewer), [id::ADD_ACTOR, id::MOVE_ACTOR_ABSOLUTE]);
+        assert_eq!(server.world.block(high), sand);
+        // Next tick the block goes, the falling block is let go, and it
+        // moves its first bit down.
+        server.tick(1);
+        assert_eq!(server.world.block(high), server.world.air());
+        assert_eq!(
+            ids(&mut viewer),
+            [
+                id::UPDATE_BLOCK,
+                id::MOVE_ACTOR_ABSOLUTE,
+                id::SET_ACTOR_MOTION
+            ]
+        );
+        // The tick only moves it: the viewer has it already.
+        server.tick(2);
+        let sent = ids(&mut viewer);
+        assert!(!sent.contains(&id::ADD_ACTOR), "{sent:?}");
+        assert!(sent.contains(&id::MOVE_ACTOR_ABSOLUTE), "{sent:?}");
+
+        // Landing, the entity goes before the block comes.
+        let ground = BlockPos { x: 3, y: -60, z: 3 };
+        for tick in 3..60 {
+            server.tick(tick);
+            let sent = ids(&mut viewer);
+            if server.world.block(ground) == sand {
+                let removed = sent.iter().position(|id| *id == id::REMOVE_ACTOR);
+                let placed = sent.iter().position(|id| *id == id::UPDATE_BLOCK);
+                assert!(removed.is_some() && removed < placed, "{sent:?}");
+                return;
+            }
+        }
+        panic!("the sand never landed");
+    }
+
+    #[test]
+    fn vines_and_lichen_lose_the_faces_nothing_holds() {
+        let server = test_server();
+        let stone = state("stone", &[]).network_id();
+        let at = BlockPos { x: 3, y: -60, z: 3 };
+        let north = placement::side(at, 2);
+        assert!(server.place_block(north, stone));
+        // On the floor and the wall to the north.
+        let lichen = state(
+            "glow_lichen",
+            &[("multi_face_direction_bits", StateValue::Int(1 | 16))],
+        );
+        assert!(server.place_block(at, lichen.network_id()));
+        server.break_block(north, GameMode::Creative);
+        server.check_blocks();
+        let left = server.world.block_state(at).unwrap();
+        assert_eq!(support::int(left, "multi_face_direction_bits"), Some(1));
+
+        // A vine hangs from the vine above, and falls when that goes.
+        let top = BlockPos { x: 3, y: -58, z: 3 };
+        let vine = state("vine", &[("vine_direction_bits", StateValue::Int(4))]);
+        assert!(server.place_block(placement::side(top, 2), stone));
+        assert!(server.place_block(top, vine.network_id()));
+        let below = placement::side(top, support::DOWN);
+        assert!(support::supported(&vine, below, &*server.world));
+        assert!(server.place_block(below, vine.network_id()));
+        server.break_block(placement::side(top, 2), GameMode::Creative);
+        server.check_blocks();
+        assert_eq!(server.world.block(top), server.world.air());
+        assert_eq!(server.world.block(below), vine.network_id(), "a tick later");
+        server.check_blocks();
+        assert_eq!(server.world.block(below), server.world.air());
     }
 
     #[test]
@@ -740,6 +1143,7 @@ mod tests {
         // Taking the floor away pops it, for one door again.
         assert!(place());
         server.break_block(BlockPos { x: 3, y: -61, z: 3 }, GameMode::Creative);
+        server.check_blocks();
         assert_eq!(server.world.block(lower_at), air);
         assert_eq!(server.world.block(upper_at), air);
         assert_eq!(server.items.count(), 2);

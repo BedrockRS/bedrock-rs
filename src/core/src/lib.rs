@@ -14,6 +14,7 @@ pub mod config;
 pub mod console;
 pub mod damage;
 pub mod entities;
+pub mod falling;
 pub mod game_mode;
 pub mod game_rules;
 pub mod inventory;

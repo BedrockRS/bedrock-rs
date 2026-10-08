@@ -22,7 +22,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use uuid::Uuid;
 
-use crate::entities::ItemView;
+use crate::entities::EntityView;
 use crate::game_mode::GameMode;
 use crate::shape;
 use crate::storage::{SavedInventory, SavedPlayer};
@@ -175,9 +175,9 @@ struct Online {
 }
 
 impl Online {
-    /// Shows the items in view that the client lacks, hides those gone or
-    /// out of view, and moves the rest that moved.
-    fn sync_items(&mut self, items: &[ItemView]) {
+    /// Shows the items and falling blocks in view that the client lacks,
+    /// hides those gone or out of view, and moves the rest that moved.
+    fn sync_items(&mut self, items: &[EntityView]) {
         let current: HashSet<u64> = items.iter().map(|item| item.id).collect();
         let gone: Vec<u64> = self
             .seen_items
@@ -325,9 +325,9 @@ impl Players {
             .collect()
     }
 
-    /// Updates who sees whom and which items, then sends everyone and
+    /// Updates who sees whom and which items and falling blocks, then sends everyone and
     /// everything that moved to the players who can see them.
-    pub fn tick(&self, tick: u64, items: &[ItemView]) {
+    pub fn tick(&self, tick: u64, items: &[EntityView]) {
         self.tick.store(tick, Ordering::Relaxed);
         let mut online = self.online();
         for viewer in online.values_mut() {
@@ -453,6 +453,31 @@ impl Players {
         for online in self.online().values() {
             if online.view.contains(chunk) {
                 online.send(packet.clone());
+            }
+        }
+    }
+
+    /// Removes entity `id` now from everyone who has it, rather than at the
+    /// end of the tick.
+    pub fn hide_entity(&self, id: u64) {
+        for online in self.online().values_mut() {
+            if online.seen_items.remove(&id) {
+                online.send(encode(&RemoveActor {
+                    entity_unique_id: unique_id(id),
+                }));
+            }
+        }
+    }
+
+    /// Shows entity `id` to everyone with `chunk` now, with `packets` (its
+    /// AddActor first), rather than at the end of the tick, and remembers
+    /// they have it, so the tick only moves it.
+    pub fn show_entity(&self, chunk: ChunkPos, id: u64, packets: &[Bytes]) {
+        for online in self.online().values_mut() {
+            if online.view.contains(chunk) && online.seen_items.insert(id) {
+                for packet in packets {
+                    online.send(packet.clone());
+                }
             }
         }
     }

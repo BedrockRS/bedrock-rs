@@ -13,6 +13,7 @@ pub mod id {
     pub const TEXT: u32 = 9;
     pub const START_GAME: u32 = 11;
     pub const ADD_PLAYER: u32 = 12;
+    pub const ADD_ACTOR: u32 = 13;
     pub const REMOVE_ACTOR: u32 = 14;
     pub const ADD_ITEM_ACTOR: u32 = 15;
     pub const TAKE_ITEM_ACTOR: u32 = 17;

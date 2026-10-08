@@ -1,5 +1,6 @@
-//! Item entities: stacks lying in the world, how they move, and being
-//! picked up. Layouts follow gophertunnel for protocol 2193.
+//! Item entities and other plain entities (falling blocks): showing them,
+//! how they move, and items being picked up. Layouts follow gophertunnel
+//! for protocol 2193.
 
 use crate::io::Writer;
 use crate::packet::{Encode, Packet, id};
@@ -31,6 +32,46 @@ impl Encode for AddItemActor {
         self.velocity.write(writer);
         self.metadata.write(writer);
         writer.bool(self.from_fishing);
+    }
+}
+
+/// Shows an entity that is not a player or an item, by its type, such as
+/// `minecraft:falling_block`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddActor {
+    pub entity_unique_id: i64,
+    pub entity_runtime_id: u64,
+    pub entity_type: String,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub pitch: f32,
+    pub yaw: f32,
+    pub head_yaw: f32,
+    pub body_yaw: f32,
+    pub metadata: EntityMetadata,
+}
+
+impl Packet for AddActor {
+    const ID: u32 = id::ADD_ACTOR;
+}
+
+impl Encode for AddActor {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_i64(self.entity_unique_id);
+        writer.var_u64(self.entity_runtime_id);
+        writer.string(&self.entity_type);
+        self.position.write(writer);
+        self.velocity.write(writer);
+        for angle in [self.pitch, self.yaw, self.head_yaw, self.body_yaw] {
+            writer.f32_le(angle);
+        }
+        // No attributes.
+        writer.var_u32(0);
+        self.metadata.write(writer);
+        // No integer or float entity properties, no entity links.
+        writer.var_u32(0);
+        writer.var_u32(0);
+        writer.var_u32(0);
     }
 }
 
@@ -135,6 +176,32 @@ mod tests {
         assert_eq!(bytes[..2], [14, 7]);
         assert_eq!(bytes.len(), 2 + 8 + 12 + 12 + 1 + 1);
         assert_eq!(read_header(&add.encode()).unwrap().0.id, id::ADD_ITEM_ACTOR);
+    }
+
+    #[test]
+    fn actors_are_added_by_type() {
+        let add = AddActor {
+            entity_unique_id: 7,
+            entity_runtime_id: 7,
+            entity_type: "minecraft:falling_block".into(),
+            position: Vec3::default(),
+            velocity: Vec3::default(),
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            body_yaw: 0.0,
+            metadata: EntityMetadata(vec![(
+                crate::packets::metadata_key::VARIANT,
+                crate::packets::MetadataValue::Int(-1),
+            )]),
+        };
+        let bytes = payload(&add);
+        assert_eq!(bytes[..3], [14, 7, 23]);
+        assert_eq!(&bytes[3..26], b"minecraft:falling_block");
+        // Position, velocity, four angles, no attributes, then the one
+        // metadata entry (key 2, type 2 twice, zigzag -1), then three empty lists.
+        assert_eq!(&bytes[26 + 40..], [0, 1, 2, 2, 2, 1, 0, 0, 0]);
+        assert_eq!(read_header(&add.encode()).unwrap().0.id, id::ADD_ACTOR);
     }
 
     #[test]

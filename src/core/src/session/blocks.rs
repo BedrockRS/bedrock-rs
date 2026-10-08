@@ -8,6 +8,7 @@ use bedrockrs_protocol::packets::{
 };
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 
+use crate::blocks::palette;
 use crate::entities::ItemStack;
 use crate::game_mode::GameMode;
 use crate::items::items;
@@ -95,7 +96,7 @@ impl Session {
         match self.placed_block(&use_item, target) {
             Ok(parts) => {
                 let (pos, state, replacing) = parts[0].clone();
-                tracing::debug!(player = %self.player, ?pos, block = %describe(&state), id = state.network_id(), parts = parts.len(), "placing a block");
+                tracing::debug!(player = %self.player, ?pos, block = %describe(&state), id = state.network_id(), parts = parts.len(), ?clicked, face = use_item.face, "placing a block");
                 let air = self.world.air();
                 let mut reply = Reply {
                     events: vec![
@@ -111,6 +112,14 @@ impl Session {
                     ],
                     ..Reply::default()
                 };
+                // Scaffolding grows away from the click: the client may have
+                // predicted it next to the clicked block instead.
+                let target = use_item.target();
+                if parts.iter().all(|(at, _, _)| *at != target) {
+                    reply
+                        .packets
+                        .push(server::block_update(target, self.world.block(target)).to_vec());
+                }
                 // The item is used up even if someone else fills the spot
                 // before the block goes in, which is rare.
                 if !self.game_mode.is_creative()
@@ -156,13 +165,16 @@ impl Session {
         &self,
         use_item: &UseItem,
         target: BlockPos,
-    ) -> Result<Vec<(BlockPos, BlockState, u32)>, String> {
+    ) -> Result<Parts, String> {
         let stack = self
             .inventory
             .hotbar(use_item.hotbar_slot)
             .filter(|stack| stack.item == use_item.held_item.network_id)
             .ok_or("the client holds something else")?;
         let item = items().get(stack.item).ok_or("the held item is unknown")?;
+        if let Some(extension) = self.scaffolding_extension(item, use_item) {
+            return extension;
+        }
         // Clicking grass, snow and the like places into it, as if on top of
         // the block below.
         let clicked = use_item.block_position;
@@ -192,8 +204,21 @@ impl Session {
         // ceiling around the same spot: a torch clicked onto the side of
         // another torch stands on the floor beside it.
         let fallbacks = [support::UP, 2, 3, 4, 5, support::DOWN];
+        let mut faces: Vec<u8> = std::iter::once(face)
+            .chain(fallbacks.into_iter().filter(|f| *f != face))
+            .collect();
+        // Clicking a vine or lichen with more of it adds a face, on the
+        // block the player looks towards most.
+        let adds_face = into_clicked
+            && self
+                .world
+                .block_state(clicked)
+                .is_some_and(|block| block.name == item_state.name);
+        if adds_face {
+            faces = self.looking_faces();
+        }
         let mut first_error = None;
-        for face in std::iter::once(face).chain(fallbacks.into_iter().filter(|f| *f != face)) {
+        for face in faces {
             match self.placed_parts(item, target, face, use_item) {
                 Ok(parts) => return Ok(parts),
                 Err(Unplaced::Here(reason)) => return Err(reason),
@@ -205,6 +230,52 @@ impl Session {
         Err(first_error.unwrap_or_else(|| "nothing holds it there".into()))
     }
 
+    /// Scaffolding clicked with scaffolding (or a block clicked beside it)
+    /// grows the structure, as [`placement::scaffolding_extension`] says;
+    /// `None` if this click is not that. The new scaffolding may be too far
+    /// out to stand: then it falls the next tick, as in vanilla.
+    fn scaffolding_extension(
+        &self,
+        item: &crate::items::ItemType,
+        use_item: &UseItem,
+    ) -> Option<Result<Parts, String>> {
+        let item_state = items().placed_block(item, false)?;
+        if item_state.name != "minecraft:scaffolding" {
+            return None;
+        }
+        let is_scaffolding = |pos: BlockPos| {
+            self.world
+                .block_state(pos)
+                .is_some_and(|block| block.name == item_state.name)
+        };
+        let clicked = use_item.block_position;
+        let start = [clicked, use_item.target()]
+            .into_iter()
+            .find(|pos| is_scaffolding(*pos))?;
+        if self.break_block(start).is_none() {
+            return Some(Err("the scaffolding clicked is out of reach".into()));
+        }
+        let Some(pos) = placement::scaffolding_extension(
+            start,
+            use_item.face,
+            start == clicked,
+            self.sneaking,
+            &self.world,
+        ) else {
+            return Some(Err("no room to extend the scaffolding".into()));
+        };
+        let mut state = palette().upgrade(&item_state)?;
+        if let Some((_, value)) = state.states.iter_mut().find(|(key, _)| key == "stability") {
+            *value = StateValue::Int(support::scaffolding_stability(pos, &*self.world));
+        }
+        if !self.in_view(pos) || self.body_inside(pos, &state) {
+            return Some(Err(
+                "the scaffolding would go out of view or inside the player".into(),
+            ));
+        }
+        Some(Ok(vec![(pos, state, self.world.block(pos))]))
+    }
+
     /// The blocks `item` places at `target` fixed to face `face` of the block
     /// beside it, or why not: either nothing can go there at all, or nothing
     /// would hold it up that way.
@@ -214,7 +285,7 @@ impl Session {
         target: BlockPos,
         face: u8,
         use_item: &UseItem,
-    ) -> Result<Vec<(BlockPos, BlockState, u32)>, Unplaced> {
+    ) -> Result<Parts, Unplaced> {
         let item_state = items()
             .placed_block(item, (2..6).contains(&face))
             .ok_or_else(|| Unplaced::Here("the held item places no block".into()))?;
@@ -292,6 +363,34 @@ impl Session {
         }
     }
 
+    /// The faces of the blocks around a spot the player could click to fix
+    /// something to them, the block they look towards most first: looking
+    /// north and a little down, the south face of the block to the north,
+    /// then the top of the one below, and so on.
+    fn looking_faces(&self) -> Vec<u8> {
+        let (yaw, pitch) = (
+            self.movement.yaw.to_radians(),
+            self.movement.pitch.to_radians(),
+        );
+        let look = [
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        ];
+        // The way to each block around: down, up, north, south, west, east.
+        let towards = |face: u8| match face {
+            0 => -look[1],
+            1 => look[1],
+            2 => -look[2],
+            3 => look[2],
+            4 => -look[0],
+            _ => look[0],
+        };
+        let mut faces: Vec<u8> = (0..6).collect();
+        faces.sort_by(|a, b| towards(*b).total_cmp(&towards(*a)));
+        faces.into_iter().map(placement::opposite_face).collect()
+    }
+
     /// Whether the player's own body is inside the collision of `state` at
     /// `pos`, from their latest input.
     fn body_inside(&self, pos: BlockPos, state: &BlockState) -> bool {
@@ -363,6 +462,12 @@ impl Session {
         let eyes = self.movement.position;
         let reach_squared =
             (centre.x - eyes.x).powi(2) + (centre.y - eyes.y).powi(2) + (centre.z - eyes.z).powi(2);
+        reach_squared <= MAX_REACH * MAX_REACH && self.in_view(pos)
+    }
+
+    /// Whether `pos` is inside the world's height and in a chunk the
+    /// player's client has.
+    fn in_view(&self, pos: BlockPos) -> bool {
         let in_view = self.view.centre().is_some_and(|centre| {
             View {
                 centre,
@@ -370,7 +475,7 @@ impl Session {
             }
             .contains(ChunkPos::of_block(pos))
         });
-        (MIN_Y..=MAX_Y).contains(&pos.y) && reach_squared <= MAX_REACH * MAX_REACH && in_view
+        (MIN_Y..=MAX_Y).contains(&pos.y) && in_view
     }
 
     /// Picking a block (middle click) brings its item into the hotbar, as
@@ -420,6 +525,10 @@ impl Session {
         reply
     }
 }
+
+/// The blocks a click places: where each goes, its state, and the block it
+/// replaces there.
+type Parts = Vec<(BlockPos, BlockState, u32)>;
 
 /// Why a block cannot be placed one way.
 enum Unplaced {

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::io::{DecodeError, Reader, Writer};
 
 /// A block position; each coordinate is a zigzag varint on the wire.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct BlockPos {
     pub x: i32,
     pub y: i32,

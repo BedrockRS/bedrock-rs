@@ -874,6 +874,41 @@ DTLS, SCTP, and multi-segment messages both ways.
     is sent their inventory.
   - Not yet: merging nearby items, plugin events for dropping and picking up,
     `player.give`.
+- **Falling blocks (implemented)** in `falling`, held by `Server::falling`: blocks
+  falling as entities, until they land and are blocks again.
+  - As vanilla and PocketMine: gravity 0.04 and drag 0.02 per tick, straight down from
+    the bottom centre of the block, 0.98 wide and tall. It lands on the top of the
+    highest collision box under it (`shape::collision`; a fence's top is at 1.5), and
+    goes in where its bottom is if that block is replaceable and it stays up there
+    (scaffolding working out its stability), with the place sound. Otherwise, as on a
+    torch or a bottom slab, it breaks into its item, if `dotiledrops` is on. Still
+    falling after 30 seconds, or 64 blocks below the world, it breaks too. They are
+    not saved.
+  - Shown like item entities, through the same per-player tracking: AddActor (13) of
+    `minecraft:falling_block`, 0.49 above its bottom (half its height, as PocketMine
+    sends it), with metadata Variant (2, an int) the block's network ID and a 0.98
+    box, but no flags: with HasGravity, clients fell it on their own, out of its
+    block while held and into the ground while it rested there, where it turned black
+    (found live on 2026-10-08), so they only follow the positions sent; then MoveActorAbsolute and SetActorMotion every tick. When a
+    block is found about to fall, its falling block is shown at once inside it, held
+    still, and the block stays (`Server::about_to_fall`, `FallingBlocks::hold`). On the next check,
+    if it still falls, the block's UpdateBlock (air) goes out and the entity is let go
+    (`FallingBlocks::release`); it moves its first
+    bit down that tick; if not, the held entity is removed. Clients take a frame or
+    two to draw a new entity: added only as the block went, there was a gap of a few
+    frames with neither, then the entity appeared already lower; added before the
+    block was emptied in the same batch, it was the same; with the block going a few
+    milliseconds after it was placed (12 ms in a log), clients had hardly drawn it
+    (all found live on 2026-10-08, frame by frame). Right after its AddActor, a
+    MoveActorAbsolute with the teleport flag puts it in place, so clients do not glide
+    it in from wherever they would otherwise start it. Landing, it is moved onto the
+    ground (on-ground flag) and stays there a tick before it becomes its block:
+    clients draw entities a little behind, and it snapped down from where they still
+    showed it when it became the block the tick it arrived. Landing, the entity is removed
+    (`Players::hide_entity`) before its block goes in, for the same reason.
+  - Writing this found grass blocks had no collision (`shape::is_soft` took any name
+    with `grass` for a plant, and nether stems, mushroom blocks, mangrove roots, rooted
+    dirt and flower pots likewise), so sand fell through the ground.
 - **Block placing (implemented):** placing arrives in InventoryTransaction as a UseItem
   transaction with action ClickBlock; only that part is decoded.
   - The decode fails soft: an unreadable transaction is ignored.
@@ -905,7 +940,7 @@ DTLS, SCTP, and multi-segment messages both ways.
     `trapdoor.close`, `fence_gate.open`, and so on sound plays.
   - `Server::place_blocks` refuses a block whose collision boxes are inside **any**
     online player's body; a torch or flower at someone's feet, or a fence post or pane
-    beside them, is fine.
+    beside them, is fine, and so is scaffolding, which bodies climb through.
 - **Shapes (implemented)** in `shape`: block collision boxes, by name and state as
   vanilla shapes them, for whether a block may go where a player stands. Torches,
   levers, buttons, plates, signs, banners, rails, redstone, plants, vines, frames and
@@ -948,7 +983,36 @@ DTLS, SCTP, and multi-segment messages both ways.
     dead bushes and dry grass sand, terracotta or dirt; azaleas, propagules and
     dripleaves dirt or clay; mushrooms and leaf litter any full block; sugar cane sugar
     cane, or dirt or sand with water beside it; cactus sand with nothing solid beside
-    it; bamboo bamboo, dirt, sand or gravel; lily pads and frogspawn water.
+    it; bamboo bamboo, dirt, sand or gravel; kelp kelp or a sturdy top; lily pads and
+    frogspawn water.
+  - Blocks made of faces (`support::held_faces`, as PocketMine's): each face of glow
+    lichen, sculk vein or resin clump needs a sturdy face behind it; each side of a vine
+    a sturdy face, or the same side of a vine above it, so vines hang down walls. Faces
+    nothing holds drop off; with none left the block breaks. Vines only go on walls.
+  - Scaffolding keeps its `stability` as vanilla keeps its distance
+    (`support::scaffolding_stability`): the fewest sideways steps through scaffolding
+    to scaffolding standing on a sturdy floor, going down columns for free (so 0 on
+    the floor, that of the column under it, one more beside). Vanilla works it out
+    from the neighbours' stored values, so a bridge cut from its column counts up a
+    step a tick before falling; a search through the structure (up to 4,096 blocks,
+    then the stored values) knows at once, so it breaks block by block outwards from
+    the cut (found live on 2026-10-08, when a whole layer went at once). It cannot be
+    placed at 7, except by reaching out (below); at 7 it breaks with its item, or, if
+    it was already at 7, falls.
+  - **Reaching out with scaffolding** (`placement::scaffolding_extension`): placing
+    scaffolding onto scaffolding grows it. Clicking a side of the scaffolding reaches
+    out of that side; clicking its top, or the block it stands on (placing where the
+    scaffolding is), stacks it on top of the column (found live on 2026-10-08: Java
+    reaches out along the look when the top is clicked, which is not how Bedrock
+    plays). Sneaking, it goes out of the clicked face. It goes past the scaffolding
+    already there, up to 7 sideways, into the first replaceable spot, however far
+    above (only the clicked scaffolding must be in reach). Placed too far out, it
+    falls the next tick and lands. The client also gets the block beside the click,
+    where it may have predicted it instead.
+  - **Gravity blocks** (`support::falls`): sand, red sand, gravel, the suspicious
+    ones, concrete powder, anvils and the dragon egg fall when the block under them
+    is one a block replaces (air, liquids, grass). Not yet: concrete powder setting in
+    water, anvils hurting what they land on.
   - Two-block blocks need their other half: a door's halves (the lower on a sturdy
     floor), a tall flower's or tall grass's, a pitcher plant's or small dripleaf's, and
     a bed's head and foot (which also need the floor when placed). Only one half drops
@@ -957,10 +1021,16 @@ DTLS, SCTP, and multi-segment messages both ways.
     and shapes are recomputed; a neighbour that changes has its own neighbours
     recomputed in turn, until nothing changes (a wall gaining a connection makes the
     wall under it tall: found live on 2026-10-08, when stacked walls kept stale short
-    sides and posts until something beside them changed). Any neighbour no longer
-    supported breaks, with
-    particles, and drops its item if the `dotiledrops` game rule is on; its own
-    neighbours are checked next, so a column of hanging lanterns all falls. Breaking
+    sides and posts until something beside them changed). The neighbours are then
+    checked on the next tick (`Server::check_blocks`, which `Server::tick` runs, with
+    `support::settled`): any no longer supported breaks, with its other half, with
+    particles, and drops its item if the `dotiledrops` game rule is on; vines and lichen
+    lose faces and scaffolding changes stability; gravity blocks over air, and
+    scaffolding already too far out, start falling (see Falling blocks). Changed
+    blocks are checked too, so sand placed over air falls. Its own neighbours are checked the
+    tick after, so a column of cactus, carpet or scaffolding falls one block a tick from
+    the bottom up, as in vanilla (found live on 2026-10-08: a whole stack used to go at
+    once). Breaking
     either half of a two-block block breaks both, for one item. Broken blocks drop the
     item that places them (a torch for a wall torch, a door for either half, seeds for
     a crop), also only with `dotiledrops`.
@@ -1001,7 +1071,9 @@ DTLS, SCTP, and multi-segment messages both ways.
       standing, hanging or side by the clicked face; `lever_direction`: the clicked face,
       with the axis the player looks along on floors and ceilings;
       `vine_direction_bits` (south 1, west 2, north 4, east 8) and
-      `multi_face_direction_bits` (glow lichen and the like): the face fixed to;
+      `multi_face_direction_bits` (glow lichen and the like): the face fixed to, added
+      to the faces of the same block already there (clicking one adds a face on the
+      block the player looks towards most);
       `coral_direction` (wall coral fans: west 0, east 1, north 2, south 3, as
       PocketMine numbers it); `rail_direction`: along the look; `orientation`
       (crafters): facing the player, with their top up; placed leaves are

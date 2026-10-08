@@ -82,12 +82,12 @@ struct DroppedItem {
     changed: bool,
 }
 
-/// An item entity as viewers need it this tick.
+/// An item entity or falling block as viewers need it this tick.
 #[derive(Debug, Clone)]
-pub struct ItemView {
+pub struct EntityView {
     pub id: u64,
     pub chunk: ChunkPos,
-    /// AddItemActor, for viewers that do not have it yet.
+    /// AddItemActor or AddActor, for viewers that do not have it yet.
     pub add: Bytes,
     /// Its movement this tick, for viewers that have it.
     pub movement: Option<[Bytes; 2]>,
@@ -146,7 +146,7 @@ impl ItemEntities {
 
     /// Moves every item one tick and ages it, removing the expired and the
     /// fallen, then says what viewers need to see.
-    pub fn tick(&self, world: &World, tick: u64) -> Vec<ItemView> {
+    pub fn tick(&self, world: &World, tick: u64) -> Vec<EntityView> {
         let mut items = self.items();
         items.retain(|_, item| {
             item.age += 1;
@@ -159,7 +159,7 @@ impl ItemEntities {
         items
             .iter_mut()
             .map(|(&id, item)| {
-                let view = ItemView {
+                let view = EntityView {
                     id,
                     chunk: ChunkPos::of_block(BlockPos::containing(item.position)),
                     add: add_packet(id, item),
@@ -464,7 +464,7 @@ mod tests {
     /// The superflat's grass is at y = -61, so the ground is at y = -60.
     const GROUND: f32 = -60.0;
 
-    fn settle(entities: &ItemEntities, world: &World, ticks: u64) -> Vec<ItemView> {
+    fn settle(entities: &ItemEntities, world: &World, ticks: u64) -> Vec<EntityView> {
         let mut last = Vec::new();
         for tick in 0..ticks {
             last = entities.tick(world, tick);
