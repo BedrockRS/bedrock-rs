@@ -201,6 +201,7 @@ impl Server {
                 item: item.network_id,
                 count,
                 metadata: 0,
+                nbt: None,
             };
             self.items
                 .spawn(entity_id, stack, position, velocity, entities::PICKUP_DELAY);

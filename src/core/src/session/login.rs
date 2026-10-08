@@ -19,6 +19,7 @@ use bedrockrs_protocol::{GAME_VERSION, PROTOCOL_VERSION};
 use uuid::Uuid;
 
 use crate::auth::AuthError;
+use crate::blocks::palette;
 use crate::game_mode::GameMode;
 use crate::game_rules;
 use crate::inventory::Inventory;
@@ -425,7 +426,7 @@ fn start_game(
         // Noon.
         time: 6000,
         enchantment_seed: 0,
-        blocks: Vec::new(),
+        blocks: palette().data_driven().to_vec(),
         multiplayer_correlation_id: Uuid::new_v4().to_string(),
         server_authoritative_inventory: true,
         game_version: GAME_VERSION.into(),

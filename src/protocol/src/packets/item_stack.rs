@@ -559,6 +559,8 @@ pub struct CreativeItemStack {
     pub block_runtime_id: u32,
     /// Shields carry an extra field in their user data.
     pub shield: bool,
+    /// The item's NBT, as in [`ItemInstance`](crate::packets::ItemInstance).
+    pub nbt: Option<&'static [u8]>,
 }
 
 impl CreativeItemStack {
@@ -568,7 +570,12 @@ impl CreativeItemStack {
         writer.var_u32(self.metadata);
         // The block runtime ID is signed here; hashed IDs keep their bits.
         writer.var_i32(self.block_runtime_id as i32);
-        crate::packets::inventory::write_user_data(writer, self.network_id != 0, self.shield);
+        crate::packets::inventory::write_user_data(
+            writer,
+            self.network_id != 0,
+            self.shield,
+            self.nbt,
+        );
     }
 }
 

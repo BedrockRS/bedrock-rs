@@ -4,7 +4,7 @@ Generated files the server embeds. Do not edit them by hand: rerun the scripts.
 
 | File | Script | Source |
 |---|---|---|
-| `items.json` | `tools/item_data.py` | PocketMine's [BedrockData](https://github.com/pmmp/BedrockData) `bedrock-1.26.30` (CC0 1.0): items, network IDs, components, creative inventory. Block items' states upgraded with Dragonfly's palette. |
+| `items.json` | `tools/item_data.py` | [Dragonfly](https://github.com/df-mc/dragonfly) commit `4c7b5074be94` (1.26.50, protocol 2193), `server/world/vanilla_items.nbt` and `server/item/creative/creative_items.nbt`: items, network IDs, components, creative inventory. Block items' states from the same commit's palette. |
 | `blocks.json` | `tools/block_data.py` | [Dragonfly](https://github.com/df-mc/dragonfly) commit `4c7b5074be94` (1.26.50, protocol 2193), `server/world/block_states.nbt`: every block state the client knows. |
 
 Both scripts share `tools/item_data.py`'s NBT reader. Run them from `tools/`:
@@ -16,8 +16,8 @@ python block_data.py
 
 ## Dragonfly's licence
 
-`blocks.json` and the block states in `items.json` are derived from Dragonfly, whose
-licence requires this notice:
+`blocks.json` and `items.json` are derived from Dragonfly, whose licence requires this
+notice:
 
 ```
 MIT License

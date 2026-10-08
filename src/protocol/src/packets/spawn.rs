@@ -84,7 +84,8 @@ pub struct StartGame {
     pub player_movement_settings: PlayerMovementSettings,
     pub time: i64,
     pub enchantment_seed: i32,
-    /// Custom (data-driven) blocks; vanilla blocks are never listed.
+    /// Data-driven blocks: custom ones, and the vanilla blocks Mojang defines
+    /// in JSON, which the client only knows from this list.
     pub blocks: Vec<BlockEntry>,
     pub multiplayer_correlation_id: String,
     pub server_authoritative_inventory: bool,
@@ -193,7 +194,7 @@ impl Encode for StartGame {
         w.var_u32(len_u32(self.blocks.len()));
         for block in &self.blocks {
             w.string(&block.name);
-            block.properties.write_network(w);
+            w.raw(&block.properties);
         }
         w.string(&self.multiplayer_correlation_id);
         w.bool(self.server_authoritative_inventory);
@@ -274,11 +275,12 @@ pub struct PlayerMovementSettings {
     pub server_authoritative_block_breaking: bool,
 }
 
-/// A custom block definition.
-#[derive(Debug, Clone, PartialEq)]
+/// A data-driven block's definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockEntry {
     pub name: String,
-    pub properties: Compound,
+    /// Its components and other properties, as an encoded network NBT compound.
+    pub properties: Vec<u8>,
 }
 
 /// The items the client knows, by name and network ID.

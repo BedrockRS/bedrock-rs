@@ -7,9 +7,9 @@ use crate::types::{BlockPos, Vec3};
 /// Most entries in any list read from an inventory transaction.
 const MAX_LIST: u32 = 256;
 
-/// An item stack as sent in inventories and transactions. User data (NBT,
-/// can-place-on and can-break lists) is not supported and sent empty; shields
-/// also carry a blocking tick, sent as 0.
+/// An item stack as sent in inventories and transactions. Of its user data,
+/// only NBT is supported: can-place-on and can-break lists are sent empty,
+/// and shields' blocking tick as 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ItemInstance {
     /// The item's network ID from the ItemRegistry; 0 is an empty slot.
@@ -22,6 +22,9 @@ pub struct ItemInstance {
     pub block_runtime_id: u32,
     /// Whether the item is a shield, whose user data has an extra field.
     pub shield: bool,
+    /// The item's NBT (enchantments and the like), as a little-endian NBT
+    /// compound with its root tag.
+    pub nbt: Option<&'static [u8]>,
 }
 
 impl ItemInstance {
@@ -32,6 +35,7 @@ impl ItemInstance {
         stack_network_id: None,
         block_runtime_id: 0,
         shield: false,
+        nbt: None,
     };
 
     pub fn is_empty(&self) -> bool {
@@ -47,10 +51,11 @@ impl ItemInstance {
             writer.var_i32(id);
         }
         writer.var_u32(self.block_runtime_id);
-        write_user_data(writer, !self.is_empty(), self.shield);
+        write_user_data(writer, !self.is_empty(), self.shield, self.nbt);
     }
 
-    /// Reads an item, skipping its user data.
+    /// Reads an item, skipping its user data: what the client says an item
+    /// carries is never taken from it.
     pub fn read(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let network_id = i16::from_le_bytes([reader.u8()?, reader.u8()?]);
         let count = reader.u16_le()?;
@@ -70,20 +75,36 @@ impl ItemInstance {
             block_runtime_id,
             // Only the registry knows; nothing read needs it.
             shield: false,
+            nbt: None,
         })
     }
 }
 
-/// Writes an item's empty user data: nothing for an empty slot; otherwise no
-/// NBT (length 0) and no can-place-on or can-break entries, plus a blocking
-/// tick of 0 for shields.
-pub(crate) fn write_user_data(writer: &mut Writer, present: bool, shield: bool) {
+/// Writes an item's user data, as a length-prefixed blob: nothing for an
+/// empty slot; otherwise its NBT, if any (a length of -1, version 1 and the
+/// little-endian compound; else a length of 0), no can-place-on or can-break
+/// entries, and a blocking tick of 0 for shields.
+pub(crate) fn write_user_data(
+    writer: &mut Writer,
+    present: bool,
+    shield: bool,
+    nbt: Option<&[u8]>,
+) {
     if !present {
         writer.var_u32(0);
         return;
     }
-    writer.var_u32(if shield { 18 } else { 10 });
-    writer.i16_le(0);
+    let nbt_len = nbt.map_or(0, |nbt| 1 + nbt.len());
+    let len = 2 + nbt_len + 4 + 4 + if shield { 8 } else { 0 };
+    writer.var_u32(u32::try_from(len).expect("item NBT is small"));
+    match nbt {
+        Some(nbt) => {
+            writer.i16_le(-1);
+            writer.u8(1);
+            writer.raw(nbt);
+        }
+        None => writer.i16_le(0),
+    }
     writer.u32_le(0);
     writer.u32_le(0);
     if shield {
@@ -456,7 +477,32 @@ mod tests {
             stack_network_id: Some(1),
             block_runtime_id: 12345,
             shield: false,
+            nbt: None,
         }
+    }
+
+    #[test]
+    fn nbt_goes_in_the_user_data() {
+        // An empty little-endian compound: its tag, a nameless root, the end.
+        const EMPTY_COMPOUND: &[u8] = &[10, 0, 0, 0];
+        let book = ItemInstance {
+            stack_network_id: None,
+            block_runtime_id: 0,
+            nbt: Some(EMPTY_COMPOUND),
+            ..stone()
+        };
+        let mut writer = Writer::new();
+        book.write(&mut writer);
+        let bytes = writer.into_bytes();
+        // ID, count, metadata, no stack ID, no block, then the user data:
+        // its length, -1 and version 1, the NBT, and two empty lists.
+        assert_eq!(
+            bytes[7..],
+            [15, 0xFF, 0xFF, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        // What the client says an item carries is not taken.
+        let read = ItemInstance::read(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(read, ItemInstance { nbt: None, ..book });
     }
 
     #[test]

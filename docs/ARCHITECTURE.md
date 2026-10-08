@@ -393,6 +393,13 @@ Dragonfly's values.
 - **Block network IDs** are FNV-1a-32 of little-endian NBT `{"name", "states"}`, with
   states sorted by name and no version field (Dragonfly's `network_block_hash.go`). The
   client hashes its own states, so no block palette is sent.
+- **Data-driven vanilla blocks:** since 1.26.50 Mojang defines some vanilla blocks in
+  JSON (every wool and concrete slab, double slab and stair, the red shrub and the shelf
+  mushroom: 98 in all). The client ships their textures but only knows the blocks from
+  StartGame's block list, which carries each one's definition (name and components as
+  network NBT), as Dragonfly sends them from its `data_driven_blocks.nbt`. Without them
+  (live test, 2026-10-08) the client logged "Block … couldn't be found in the registry"
+  and showed their items as untextured `item.white_wool_slab.name` squares.
 - **LevelChunk:** chunk x/z and dimension as varints; the sub-chunk count as a varuint32
   (at most 64); an optional sub-chunk limit, absent; a cache bool, false; empty blob
   hashes; then the payload.
@@ -709,19 +716,28 @@ DTLS, SCTP, and multi-segment messages both ways.
   - Breaking also sends a LevelEvent 2001 (`DESTROY_BLOCK`, with the broken block's
     network ID) to the chunk's viewers: the breaking particles and sound.
 - **Items (implemented)** in `items`: every vanilla item, loaded once from
-  `data/items.json`, which `tools/item_data.py` generates from PocketMine's BedrockData
-  (CC0 1.0), currently tag `bedrock-1.26.30`, the newest published.
-  - About 1,930 items: name, network ID, version, component-based flag with the
-    components converted to network NBT, the largest stack, and for about 1,300 block
+  `data/items.json`, which `tools/item_data.py` generates from Dragonfly's vanilla data
+  at its 1.26.50 commit (the same one the block palette comes from).
+  - About 2,080 items: name, network ID, version, component-based flag with the
+    components converted to network NBT, the largest stack, and for about 1,420 block
     items the block state they place (the state the creative inventory shows).
-  - The ItemRegistry packet tells the client every item's network ID, so data from
-    1.26.30 works with 1.26.51; items added since are simply unknown.
+  - The data must match the client's version. PocketMine's BedrockData (1.26.30, its
+    newest) was used first, but 587 network IDs changed by 1.26.50, and a live client
+    (2026-10-08) put creative items by its own IDs, whatever the ItemRegistry said: a
+    poplar boat as the harness group's icon, a cyan cushion among the hoes.
   - Largest stacks come from components where present, and otherwise from a table of
     suffixes and names in the script (tools and armour 1, pearls and signs 16, the rest
     64).
-  - The creative inventory: 127 groups (category, name, icon) and about 1,940 items.
-    Entries with NBT (enchanted books, fireworks and so on) are left out until items
-    carry user data. Creative network IDs count from 1.
+  - The creative inventory: 124 groups (category, name, icon) and 1,980 items, in
+    vanilla's order. Creative network IDs count from 1. Education Edition items
+    (elements, compounds and the like), which BedrockData's dump had, are not in
+    vanilla's creative inventory.
+  - 175 creative entries carry NBT (125 enchanted books, banners with patterns,
+    fireworks and firework stars). Items carry it as user data: a length of -1, version
+    1, then little-endian NBT, as gophertunnel writes it. The server treats it as opaque
+    bytes, kept once each for the server's life (`items::intern_nbt`) so stacks stay
+    `Copy`; stacks only merge with the same NBT, and it is saved with the player
+    (base64). What a client sends an item to carry is never taken.
   - The ItemRegistry and CreativeContent packets are encoded once and shared.
 - **Inventories (implemented)** in `inventory`: the server owns each player's 36 main
   slots (hotbar 0 to 8), four armour slots, the offhand and the cursor.
@@ -1303,8 +1319,8 @@ Later steps are proposed but not yet scheduled:
   - NAT'd or public deployments using advertised addresses
 - **Minimal registries work for spawning.** The spawn sends an empty ItemRegistry and no
   BiomeDefinitionList, mirroring gophertunnel's minimal server. A live 1.26.51 client
-  spawned with them on 2026-09-25. Vanilla item data now comes from PocketMine's
-  BedrockData, which is CC0 (step 22).
+  spawned with them on 2026-09-25. Vanilla item data now comes from Dragonfly (step
+  22, moved from PocketMine's BedrockData on 2026-10-08).
 - **str0m's SDP candidate parser is strict.** It expects the `ufrag` extension after
   `network-id`, while libwebrtc (and so our answer) writes it before. It then silently
   drops the candidate. This only affects str0m acting as a client, as in the loopback
@@ -1348,8 +1364,7 @@ Later steps are proposed but not yet scheduled:
   (the action header gained a varint type and slot stack IDs became fixed 32-bit).
   Mojang's schema omits optional-field markers, so it was used only as a cross-check.
   The container IDs are the biggest risk: if every request is rejected with "no slot",
-  the numbering is off. Item data is from 1.26.30, so blocks or items added in 1.26.40
-  and 1.26.50 are missing.
+  the numbering is off. Item data is from 1.26.50, matching the client.
 - **Players are authenticated (resolved 2026-09-26).** Login tokens
   are verified against the Minecraft authorization service (§4.5, Authentication). The
   offer's `cpk` signing its DTLS fingerprints binds the connection to the verified key.

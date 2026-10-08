@@ -17,7 +17,7 @@ use bedrockrs_protocol::packets::{
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 use bytes::Bytes;
 
-use crate::items::{SHIELD, items};
+use crate::items::{ItemNbt, SHIELD, items};
 use crate::world::{MIN_Y, World};
 
 const GRAVITY: f32 = 0.04;
@@ -47,6 +47,7 @@ pub struct ItemStack {
     pub item: i16,
     pub count: u8,
     pub metadata: u32,
+    pub nbt: ItemNbt,
 }
 
 impl ItemStack {
@@ -60,6 +61,7 @@ impl ItemStack {
             stack_network_id: None,
             block_runtime_id: item.and_then(|item| item.block_network_id).unwrap_or(0),
             shield: item.is_some_and(|item| item.name == SHIELD),
+            nbt: self.nbt,
         }
     }
 }
@@ -452,6 +454,7 @@ mod tests {
 
     fn stone(count: u8) -> ItemStack {
         ItemStack {
+            nbt: None,
             item: items().by_name("minecraft:stone").unwrap().network_id,
             count,
             metadata: 0,
@@ -589,6 +592,7 @@ mod tests {
         entities.spawn(
             3,
             ItemStack {
+                nbt: None,
                 item: 32000,
                 count: 1,
                 metadata: 0,

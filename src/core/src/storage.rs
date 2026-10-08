@@ -126,6 +126,10 @@ pub struct SavedStack {
     pub count: u8,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub meta: u32,
+    /// The item's NBT (an enchanted book's enchantment and the like), as
+    /// little-endian NBT, base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbt: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -503,6 +507,7 @@ mod tests {
             flying: true,
             inventory: Some(SavedInventory {
                 main: vec![SavedStack {
+                    nbt: None,
                     slot: 4,
                     item: "minecraft:stone".into(),
                     count: 12,

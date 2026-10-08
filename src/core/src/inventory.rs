@@ -19,8 +19,11 @@ use bedrockrs_protocol::packets::{
     container,
 };
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+
 use crate::entities::ItemStack;
-use crate::items::{SHIELD, items};
+use crate::items::{ItemNbt, SHIELD, intern_nbt, items};
 use crate::storage::{SavedInventory, SavedStack};
 
 /// Slots of the main inventory, hotbar first.
@@ -58,6 +61,7 @@ pub struct Stack {
     pub item: i16,
     pub count: u8,
     pub metadata: u32,
+    pub nbt: ItemNbt,
     /// The server's ID for this stack, which requests refer to it by. Unique
     /// per player; a stack that splits gets a new one for the part that moves.
     pub id: i32,
@@ -70,12 +74,13 @@ impl Stack {
             item: self.item,
             count: self.count,
             metadata: self.metadata,
+            nbt: self.nbt,
         }
     }
 
     /// Whether `other` is the same item and could join this stack.
     fn stacks_with(&self, other: &Stack) -> bool {
-        self.item == other.item && self.metadata == other.metadata
+        self.item == other.item && self.metadata == other.metadata && self.nbt == other.nbt
     }
 
     fn max(&self) -> u8 {
@@ -92,6 +97,7 @@ impl Stack {
             stack_network_id: Some(self.id),
             block_runtime_id: item.and_then(|item| item.block_network_id).unwrap_or(0),
             shield: item.is_some_and(|item| item.name == SHIELD),
+            nbt: self.nbt,
         }
     }
 }
@@ -173,7 +179,8 @@ impl Inventory {
         let mut inventory = Self::default();
         for (slot, name) in names.iter().enumerate() {
             let item = items().by_name(name).expect("a known item");
-            inventory.main[slot] = Some(inventory.new_stack(item.network_id, item.max_stack, 0));
+            inventory.main[slot] =
+                Some(inventory.new_stack(item.network_id, item.max_stack, 0, None));
         }
         inventory
     }
@@ -231,7 +238,11 @@ impl Inventory {
             if left == 0 {
                 break;
             }
-            if slot.item == stack.item && slot.metadata == stack.metadata && slot.count < max {
+            if slot.item == stack.item
+                && slot.metadata == stack.metadata
+                && slot.nbt == stack.nbt
+                && slot.count < max
+            {
                 let moved = left.min(max - slot.count);
                 slot.count += moved;
                 left -= moved;
@@ -243,7 +254,8 @@ impl Inventory {
             }
             if self.main[index].is_none() {
                 let count = left.min(max);
-                self.main[index] = Some(self.new_stack(stack.item, count, stack.metadata));
+                self.main[index] =
+                    Some(self.new_stack(stack.item, count, stack.metadata, stack.nbt));
                 left -= count;
             }
         }
@@ -272,21 +284,32 @@ impl Inventory {
                     continue;
                 };
                 let count = stack.count.clamp(1, item.max_stack);
-                placed.push((index, (item.network_id, count, stack.meta)));
+                let nbt = match stack.nbt.as_deref().map(|nbt| STANDARD.decode(nbt)) {
+                    None => None,
+                    Some(Ok(nbt)) => Some(intern_nbt(&nbt)),
+                    Some(Err(err)) => {
+                        tracing::warn!(
+                            "Ignored the unreadable NBT of a saved {}: {err}",
+                            stack.item
+                        );
+                        None
+                    }
+                };
+                placed.push((index, (item.network_id, count, stack.meta, nbt)));
             }
             placed
         };
         let main = restore(&saved.main, &|slot| (slot < MAIN_SLOTS).then_some(slot));
         let armor = restore(&saved.armor, &|slot| (slot < ARMOR_SLOTS).then_some(slot));
         let offhand = restore(&saved.offhand, &|slot| (slot == 0).then_some(0));
-        for (slot, (item, count, meta)) in main {
-            inventory.main[slot] = Some(inventory.new_stack(item, count, meta));
+        for (slot, (item, count, meta, nbt)) in main {
+            inventory.main[slot] = Some(inventory.new_stack(item, count, meta, nbt));
         }
-        for (slot, (item, count, meta)) in armor {
-            inventory.armor[slot] = Some(inventory.new_stack(item, count, meta));
+        for (slot, (item, count, meta, nbt)) in armor {
+            inventory.armor[slot] = Some(inventory.new_stack(item, count, meta, nbt));
         }
-        for (_, (item, count, meta)) in offhand {
-            inventory.offhand = Some(inventory.new_stack(item, count, meta));
+        for (_, (item, count, meta, nbt)) in offhand {
+            inventory.offhand = Some(inventory.new_stack(item, count, meta, nbt));
         }
         inventory
     }
@@ -311,6 +334,7 @@ impl Inventory {
                         item: items().get(stack.item)?.name.clone(),
                         count: stack.count,
                         meta: stack.metadata,
+                        nbt: stack.nbt.map(|nbt| STANDARD.encode(nbt)),
                     })
                 })
                 .collect()
@@ -500,6 +524,7 @@ impl Inventory {
                     item: entry.network_id,
                     count: max,
                     metadata: entry.metadata,
+                    nbt: entry.nbt,
                     id: request,
                 });
             }
@@ -680,11 +705,12 @@ impl Inventory {
         containers
     }
 
-    fn new_stack(&mut self, item: i16, count: u8, metadata: u32) -> Stack {
+    fn new_stack(&mut self, item: i16, count: u8, metadata: u32, nbt: ItemNbt) -> Stack {
         Stack {
             item,
             count,
             metadata,
+            nbt,
             id: self.next_stack_id(),
         }
     }
@@ -997,6 +1023,75 @@ mod tests {
     }
 
     #[test]
+    fn creative_items_keep_their_nbt_and_only_stack_with_the_same() {
+        let books: Vec<u32> = (1..)
+            .map_while(|id| items().creative(id).map(|entry| (id, entry)))
+            .filter(|(_, entry)| {
+                items().get(entry.network_id).unwrap().name == "minecraft:enchanted_book"
+            })
+            .map(|(id, _)| id)
+            .collect();
+        assert!(books.len() > 100, "one book per enchantment level");
+        let mut inventory = Inventory::default();
+        let response = inventory.handle(
+            &request(
+                -3,
+                vec![
+                    StackAction::CraftCreative {
+                        creative_item: books[0],
+                        crafts: 1,
+                    },
+                    StackAction::Take {
+                        count: 1,
+                        source: at(container::CREATED_OUTPUT, CREATED_OUTPUT_SLOT, -3),
+                        destination: at(container::CURSOR, 0, 0),
+                    },
+                ],
+            ),
+            true,
+        );
+        assert_eq!(response.status, StackResponse::OK);
+        let book = inventory.cursor.unwrap();
+        assert_eq!(book.nbt, items().creative(books[0]).unwrap().nbt);
+        assert!(book.nbt.is_some());
+        assert_eq!(book.instance().nbt, book.nbt, "the client is shown it");
+
+        // Same item, other NBT: rockets of different flights do not stack.
+        let rockets: Vec<ItemStack> = (1..)
+            .map_while(|id| items().creative(id))
+            .filter(|entry| {
+                items().get(entry.network_id).unwrap().name == "minecraft:firework_rocket"
+                    && entry.nbt.is_some()
+            })
+            .map(|entry| ItemStack {
+                item: entry.network_id,
+                count: 1,
+                metadata: entry.metadata,
+                nbt: entry.nbt,
+            })
+            .collect();
+        assert_ne!(rockets[0].nbt, rockets[1].nbt);
+        let mut inventory = Inventory::default();
+        inventory.add(rockets[0]);
+        inventory.add(rockets[1]);
+        inventory.add(rockets[0]);
+        let held = |inventory: &Inventory| -> Vec<_> {
+            inventory
+                .main
+                .iter()
+                .flatten()
+                .map(|stack| (stack.count, stack.nbt))
+                .collect()
+        };
+        assert_eq!(held(&inventory), [(2, rockets[0].nbt), (1, rockets[1].nbt)]);
+
+        // And NBT is saved.
+        let saved = inventory.saved();
+        assert!(saved.main.iter().all(|stack| stack.nbt.is_some()));
+        assert_eq!(held(&Inventory::from_saved(&saved)), held(&inventory));
+    }
+
+    #[test]
     fn later_requests_refer_to_earlier_ones_by_request_id() {
         let mut inventory = Inventory::with_hotbar(&TEST_KIT);
         let stone = *inventory.hotbar(0).unwrap();
@@ -1164,6 +1259,7 @@ mod tests {
         let mut inventory = Inventory::default();
         let stone = items().by_name("minecraft:stone").unwrap().network_id;
         let pick = |count| ItemStack {
+            nbt: None,
             item: stone,
             count,
             metadata: 0,
@@ -1178,6 +1274,7 @@ mod tests {
             .unwrap()
             .network_id;
         let swords = ItemStack {
+            nbt: None,
             item: sword,
             count: 3,
             metadata: 0,
@@ -1188,6 +1285,7 @@ mod tests {
         // A full inventory takes what fits and no more.
         for slot in inventory.main.iter_mut() {
             *slot = Some(Stack {
+                nbt: None,
                 item: sword,
                 count: 1,
                 metadata: 0,
@@ -1195,6 +1293,7 @@ mod tests {
             });
         }
         inventory.main[35] = Some(Stack {
+            nbt: None,
             item: stone,
             count: 60,
             metadata: 0,
@@ -1212,6 +1311,7 @@ mod tests {
             .network_id;
         for slot in inventory.main.iter_mut().filter(|slot| slot.is_none()) {
             *slot = Some(Stack {
+                nbt: None,
                 item: sword,
                 count: 1,
                 metadata: 0,
@@ -1219,11 +1319,13 @@ mod tests {
             });
         }
         let held = ItemStack {
+            nbt: None,
             item: sword,
             count: 1,
             metadata: 0,
         };
         inventory.cursor = Some(Stack {
+            nbt: None,
             item: sword,
             count: 1,
             metadata: 0,
@@ -1269,18 +1371,21 @@ mod tests {
         let odd = SavedInventory {
             main: vec![
                 SavedStack {
+                    nbt: None,
                     slot: 99,
                     item: "minecraft:stone".into(),
                     count: 1,
                     meta: 0,
                 },
                 SavedStack {
+                    nbt: None,
                     slot: 3,
                     item: "minecraft:no_such_item".into(),
                     count: 1,
                     meta: 0,
                 },
                 SavedStack {
+                    nbt: None,
                     slot: 4,
                     item: "minecraft:diamond_sword".into(),
                     count: 5,

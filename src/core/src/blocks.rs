@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bedrockrs_protocol::block::{BlockState, StateValue};
+use bedrockrs_protocol::packets::BlockEntry;
 use serde::Deserialize;
 
 const DATA: &str = include_str!("../data/blocks.json");
@@ -28,6 +31,8 @@ pub struct Palette {
     /// (copper ones put `double_` in the middle), and back.
     double_slabs: HashMap<String, String>,
     single_slabs: HashMap<String, String>,
+    /// The definitions of the vanilla blocks Mojang defines in JSON.
+    data_driven: Vec<BlockEntry>,
 }
 
 /// The palette, loaded on first use.
@@ -108,6 +113,12 @@ impl Palette {
         })
     }
 
+    /// The vanilla blocks Mojang defines in JSON (wool slabs and the like),
+    /// for StartGame: without their definitions the client does not know them.
+    pub fn data_driven(&self) -> &[BlockEntry] {
+        &self.data_driven
+    }
+
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
@@ -120,6 +131,13 @@ impl Palette {
         #[derive(Deserialize)]
         struct Raw {
             blocks: HashMap<String, Vec<(String, String, Vec<serde_json::Value>)>>,
+            data_driven: Vec<RawDefinition>,
+        }
+        #[derive(Deserialize)]
+        struct RawDefinition {
+            name: String,
+            /// Network NBT, base64.
+            properties: String,
         }
         let raw: Raw = serde_json::from_str(json).map_err(|err| err.to_string())?;
         let mut blocks = HashMap::with_capacity(raw.blocks.len());
@@ -151,10 +169,24 @@ impl Palette {
                 single_slabs.insert(double.clone(), single);
             }
         }
+        let data_driven = raw
+            .data_driven
+            .into_iter()
+            .map(|definition| {
+                let properties = STANDARD
+                    .decode(&definition.properties)
+                    .map_err(|err| format!("bad definition of {}: {err}", definition.name))?;
+                Ok(BlockEntry {
+                    name: definition.name,
+                    properties,
+                })
+            })
+            .collect::<Result<_, String>>()?;
         Ok(Self {
             blocks,
             double_slabs,
             single_slabs,
+            data_driven,
         })
     }
 }
@@ -212,6 +244,29 @@ mod tests {
             .with("minecraft:connection_south", StateValue::Byte(0))
             .with("minecraft:connection_west", StateValue::Byte(1));
         assert!(palette.is_valid(&bars));
+    }
+
+    #[test]
+    fn json_defined_blocks_come_with_their_definitions() {
+        let palette = palette();
+        let wool_slab = palette
+            .data_driven()
+            .iter()
+            .find(|block| block.name == "minecraft:white_wool_slab")
+            .expect("wool slabs are defined in JSON");
+        // A nameless root compound in network NBT.
+        assert_eq!(wool_slab.properties[..2], [10, 0]);
+        assert!(
+            palette
+                .data_driven()
+                .iter()
+                .all(|block| palette.blocks.contains_key(&block.name)),
+            "every definition is of a block in the palette"
+        );
+        assert_eq!(
+            palette.double_slab("minecraft:white_wool_slab"),
+            Some("minecraft:white_wool_double_slab")
+        );
     }
 
     #[test]

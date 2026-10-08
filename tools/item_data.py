@@ -1,20 +1,25 @@
-"""Generates src/core/data/items.json from PocketMine's BedrockData.
+"""Generates src/core/data/items.json from Dragonfly's vanilla data.
 
-BedrockData (https://github.com/pmmp/BedrockData, CC0 1.0) is dumped from
-vanilla Bedrock servers. This script reads one tagged release and writes what
-BedrockRS needs, in one file the server embeds:
+Dragonfly (https://github.com/df-mc/dragonfly, MIT) ships data dumped from
+vanilla Bedrock servers. This script reads it at one commit, the same one
+tools/block_data.py uses, and writes what BedrockRS needs in one file the
+server embeds:
 
-- every vanilla item: name, network ID, version, whether it is component based
-  (with its components as network NBT, base64), its largest stack, and for
-  block items the block state it places, upgraded to the client's states
-  with Dragonfly's newer palette (see tools/block_data.py): BedrockData's
-  1.26.30 states lack ones 1.26.50 added, such as stairs corners;
-- the creative inventory: groups (category, name, icon) and their items.
+- every vanilla item (server/world/vanilla_items.nbt): name, network ID,
+  version, whether it is component based (with its components as network
+  NBT, base64), its largest stack, and for block items the block state it
+  places, valid for the block palette (server/world/block_states.nbt);
+- the creative inventory (server/item/creative/creative_items.nbt): groups
+  (category, name, icon) and their items, in vanilla's order.
 
-Creative entries carrying NBT (enchanted books, fireworks and the like) are
-left out until items carry user data.
+The data must match the client's version exactly: the client places creative
+items by its own network IDs, so items from an older release land in the
+wrong groups.
 
-Usage: python tools/item_data.py [tag]   (default: the tag below)
+Creative entries carrying NBT (enchanted books, fireworks and the like) keep
+it as the item's user data: little-endian NBT, base64.
+
+Usage: python tools/item_data.py [commit]   (default: the commit below)
 """
 
 import base64
@@ -24,17 +29,18 @@ import sys
 import urllib.request
 from pathlib import Path
 
-TAG = "bedrock-1.26.30"
-# Dragonfly's "Support 1.26.50" commit (protocol 2193), for block states.
+# Dragonfly's "Support 1.26.50" commit (protocol 2193).
 DRAGONFLY = "4c7b5074be94fa83a1cd98e9c752083ad04a6e21"
-DRAGONFLY_STATES = "https://raw.githubusercontent.com/df-mc/dragonfly/{commit}/server/world/block_states.nbt"
-BASE = "https://raw.githubusercontent.com/pmmp/BedrockData/{tag}/{path}"
+DRAGONFLY_FILE = "https://raw.githubusercontent.com/df-mc/dragonfly/{commit}/{path}"
+DRAGONFLY_STATES = "server/world/block_states.nbt"
+DRAGONFLY_ITEMS = "server/world/vanilla_items.nbt"
+DRAGONFLY_CREATIVE = "server/item/creative/creative_items.nbt"
 OUTPUT = Path(__file__).resolve().parent.parent / "src/core/data/items.json"
 
 # Creative inventory categories, as the protocol numbers them.
 CATEGORIES = {"construction": 1, "nature": 2, "equipment": 3, "items": 4}
 
-# Largest stacks of items that are not component based, which BedrockData does
+# Largest stacks of items that are not component based, which the data does
 # not record. Everything else stacks to 64.
 STACK_OF_1_SUFFIXES = (
     "_sword", "_shovel", "_pickaxe", "_axe", "_hoe", "_spear",
@@ -63,10 +69,15 @@ STACK_OF_16 = {
 STACK_OF_64_SUFFIXES = ("_spawn_egg",)
 
 
-def fetch(tag, path):
-    url = BASE.format(tag=tag, path=path)
+def fetch(commit, path):
+    url = DRAGONFLY_FILE.format(commit=commit, path=path)
     with urllib.request.urlopen(url) as response:
         return response.read()
+
+
+def read_nbt(commit, path):
+    """A Dragonfly file's root tag, in network NBT."""
+    return NbtReader(fetch(commit, path), network=True).root()
 
 
 class NbtReader:
@@ -173,6 +184,13 @@ class NetworkWriter:
     def varint(self, value):
         self.varuint((value << 1) ^ (value >> 63) if value < 0 else value << 1)
 
+    def int32(self, value):
+        """An int, or a length."""
+        self.varint(value)
+
+    def int64(self, value):
+        self.varint(value)
+
     def string(self, value):
         data = value.encode("utf-8")
         self.varuint(len(data))
@@ -184,20 +202,22 @@ class NetworkWriter:
             self.out += struct.pack("<b", tag[1])
         elif kind == "short":
             self.out += struct.pack("<h", tag[1])
-        elif kind in ("int", "long"):
-            self.varint(tag[1])
+        elif kind == "int":
+            self.int32(tag[1])
+        elif kind == "long":
+            self.int64(tag[1])
         elif kind == "float":
             self.out += struct.pack("<f", tag[1])
         elif kind == "double":
             self.out += struct.pack("<d", tag[1])
         elif kind == "byte_array":
-            self.varint(len(tag[1]))
+            self.int32(len(tag[1]))
             self.out += bytes(tag[1])
         elif kind == "string":
             self.string(tag[1])
         elif kind == "list":
             self.out.append(tag[1])
-            self.varint(len(tag[2]))
+            self.int32(len(tag[2]))
             for element in tag[2]:
                 self.payload(element)
         elif kind == "compound":
@@ -206,10 +226,14 @@ class NetworkWriter:
                 self.string(name)
                 self.payload(value)
             self.out.append(0)
-        elif kind in ("int_array", "long_array"):
-            self.varint(len(tag[1]))
+        elif kind == "int_array":
+            self.int32(len(tag[1]))
             for value in tag[1]:
-                self.varint(value)
+                self.int32(value)
+        elif kind == "long_array":
+            self.int32(len(tag[1]))
+            for value in tag[1]:
+                self.int64(value)
         else:
             raise ValueError(kind)
 
@@ -218,6 +242,22 @@ class NetworkWriter:
         self.string("")
         self.payload(compound)
         return bytes(self.out)
+
+
+class LittleEndianWriter(NetworkWriter):
+    """Writes NBT in the little-endian (disk) flavour, as item user data
+    carries it."""
+
+    def int32(self, value):
+        self.out += struct.pack("<i", value)
+
+    def int64(self, value):
+        self.out += struct.pack("<q", value)
+
+    def string(self, value):
+        data = value.encode("utf-8")
+        self.out += struct.pack("<H", len(data))
+        self.out += data
 
 
 def states_of(compound):
@@ -230,18 +270,17 @@ def states_of(compound):
     return states
 
 
-def le_states(b64):
-    return states_of(NbtReader(base64.b64decode(b64), network=False).root())
-
-
 def load_palette(commit):
-    """Every block's states and their values in Dragonfly's palette."""
-    with urllib.request.urlopen(DRAGONFLY_STATES.format(commit=commit)) as response:
-        reader = NbtReader(response.read(), network=True)
+    """Every block's states and their values in Dragonfly's palette, and each
+    block's first state, which is its default."""
+    reader = NbtReader(fetch(commit, DRAGONFLY_STATES), network=True)
     palette = {}
+    first_state = {}
     while reader.pos < len(reader.data):
         compound = dict(reader.root()[1])
-        states = palette.setdefault(compound["name"][1], {})
+        name = compound["name"][1]
+        first_state.setdefault(name, states_of(compound["states"]))
+        states = palette.setdefault(name, {})
         for state, (kind, value) in compound["states"][1]:
             entry = states.setdefault(state, [kind, []])
             if value not in entry[1]:
@@ -249,7 +288,7 @@ def load_palette(commit):
     for states in palette.values():
         for entry in states.values():
             entry[1].sort(key=lambda value: (isinstance(value, str), value))
-    return palette
+    return palette, first_state
 
 
 def upgrade(block, palette):
@@ -296,57 +335,52 @@ def find(compound, path):
     return tag[1]
 
 
+def is_block_item(name, items, palette):
+    """Whether an item places the block of the same name. Some blocks have an
+    item of their own (`minecraft:item.bed` for the bed); doors and hanging
+    signs share their block's name but are placed as items, as vanilla's
+    block-to-item map has them."""
+    if name not in palette or name == "minecraft:air":
+        return False
+    if name.replace("minecraft:", "minecraft:item.", 1) in items:
+        return False
+    door = name.endswith("_door") and not name.endswith("trapdoor")
+    return not (door or name.endswith("_hanging_sign"))
+
+
 def main():
-    tag = sys.argv[1] if len(sys.argv) > 1 else TAG
-    palette = load_palette(DRAGONFLY)
-    required = json.loads(fetch(tag, "required_item_list.json"))
-    block_to_item = json.loads(fetch(tag, "block_id_to_item_id_map.json"))
-    creative_files = {
-        category: json.loads(fetch(tag, f"creative/{category}.json"))
-        for category in CATEGORIES
-    }
+    commit = sys.argv[1] if len(sys.argv) > 1 else DRAGONFLY
+    palette, first_state = load_palette(commit)
+    vanilla = {name: dict(entry[1]) for name, entry in read_nbt(commit, DRAGONFLY_ITEMS)[1]}
+    creative_root = dict(read_nbt(commit, DRAGONFLY_CREATIVE)[1])
+    creative_groups = [dict(group[1]) for group in creative_root["groups"][2]]
+    creative_entries = [dict(entry[1]) for entry in creative_root["items"][2]]
 
-    # The first canonical state of every block, for block items the creative
-    # inventory does not give a state for.
-    canonical = NbtReader(fetch(tag, "canonical_block_states.nbt"), network=True)
-    first_state = {}
-    while canonical.pos < len(canonical.data):
-        state = canonical.root()
-        name = find(state, ["name"])
-        if name not in first_state:
-            first_state[name] = states_of(dict(state[1])["states"])
-
-    # Block items: an item that places the block of the same name.
-    item_blocks = {item: block for block, item in block_to_item.items() if item == block}
-
-    def block_for(item, states_b64=None):
-        block = item_blocks.get(item)
-        if block is None:
+    def block_for(item, properties=None):
+        if not is_block_item(item, vanilla, palette):
             return None
-        states = le_states(states_b64) if states_b64 else first_state.get(block)
-        if states is None:
-            return None
-        return upgrade({"name": block, "states": states}, palette)
+        states = states_of(properties) if properties and properties[1] else first_state[item]
+        return upgrade({"name": item, "states": states}, palette)
 
     # The block state the creative inventory shows first for each block item.
     creative_state = {}
-    for groups in creative_files.values():
-        for group in groups:
-            for entry in group["items"]:
-                if isinstance(entry, dict) and "block_states" in entry and "nbt" not in entry:
-                    creative_state.setdefault(entry["name"], entry["block_states"])
+    for entry in creative_entries:
+        if "block_properties" in entry and "nbt" not in entry:
+            creative_state.setdefault(entry["name"][1], entry["block_properties"])
 
     items = []
-    for name, entry in sorted(required.items(), key=lambda kv: kv[1]["runtime_id"]):
-        components = None
+    for name, entry in sorted(vanilla.items(), key=lambda kv: kv[1]["runtime_id"][1]):
         item = {
             "name": name,
-            "id": entry["runtime_id"],
-            "version": entry["version"],
-            "component_based": entry["component_based"],
+            "id": entry["runtime_id"][1],
+            "version": entry["version"][1],
+            "component_based": bool(entry["component_based"][1]),
         }
-        if "component_nbt" in entry:
-            components = NbtReader(base64.b64decode(entry["component_nbt"]), network=False).root()
+        # Items without components have an empty compound.
+        components = entry.get("data")
+        if components is not None and not components[1]:
+            components = None
+        if components is not None:
             item["components"] = base64.b64encode(NetworkWriter().root(components)).decode()
         item["max_stack"] = max_stack(name, components)
         block = block_for(name, creative_state.get(name))
@@ -355,31 +389,33 @@ def main():
         items.append(item)
 
     groups = []
+    for group in creative_groups:
+        icon = dict(group["icon"][1])
+        icon_name = icon.get("name", ("string", ""))[1]
+        groups.append({
+            "category": group["category"][1],
+            "name": group["name"][1],
+            "icon": {"item": icon_name, "block": block_for(icon_name, icon.get("block_properties"))}
+            if icon_name else None,
+        })
+
     creative = []
-    skipped = 0
-    for category, category_groups in creative_files.items():
-        for group in category_groups:
-            icon = group.get("group_icon")
-            if isinstance(icon, str):
-                icon = {"item": icon}
-            elif isinstance(icon, dict):
-                icon = {"item": icon["name"], "block": block_for(icon["name"], icon.get("block_states"))}
-            groups.append({"category": CATEGORIES[category], "name": group["group_name"], "icon": icon})
-            for entry in group["items"]:
-                if isinstance(entry, str):
-                    entry = {"name": entry}
-                if "nbt" in entry:
-                    skipped += 1
-                    continue
-                creative.append({
-                    "item": entry["name"],
-                    "meta": entry.get("meta", 0),
-                    "block": block_for(entry["name"], entry.get("block_states")),
-                    "group": len(groups) - 1,
-                })
+    for entry in creative_entries:
+        name = entry["name"][1]
+        row = {
+            "item": name,
+            "meta": entry.get("meta", ("short", 0))[1],
+            "block": block_for(name, entry.get("block_properties")),
+            "group": entry.get("group_index", ("int", 0))[1],
+        }
+        # Enchanted books, fireworks and the like: the item's user data, as
+        # little-endian NBT (base64), the form the client reads it in.
+        if "nbt" in entry and entry["nbt"][1]:
+            row["nbt"] = base64.b64encode(LittleEndianWriter().root(entry["nbt"])).decode()
+        creative.append(row)
 
     data = {
-        "source": f"pmmp/BedrockData {tag} (CC0 1.0), block states from df-mc/dragonfly {DRAGONFLY[:12]} (MIT), generated by tools/item_data.py",
+        "source": f"df-mc/dragonfly {commit[:12]} (MIT), generated by tools/item_data.py",
         "items": items,
         "creative_groups": groups,
         "creative_items": creative,
@@ -398,7 +434,7 @@ def main():
     print(
         f"{len(items)} items ({sum('block' in i for i in items)} blocks), "
         f"{len(groups)} creative groups, {len(creative)} creative items "
-        f"({skipped} with NBT skipped) -> {OUTPUT}"
+        f"({sum('nbt' in c for c in creative)} with NBT) -> {OUTPUT}"
     )
 
 
