@@ -86,8 +86,10 @@ impl Session {
             events.push(SessionEvent::Swing);
         }
         if flags.contains(&input_flag::START_SNEAKING) {
+            self.sneaking = true;
             events.push(SessionEvent::Sneaking(true));
         } else if flags.contains(&input_flag::STOP_SNEAKING) {
+            self.sneaking = false;
             events.push(SessionEvent::Sneaking(false));
         }
 

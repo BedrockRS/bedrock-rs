@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use bedrockrs_protocol::block::BlockState;
 use bedrockrs_protocol::packet::Encode;
 use bedrockrs_protocol::packets::{
     ActorEvent, AddPlayer, Animate, EntityMetadata, INVENTORY_WINDOW, ItemInstance, MetadataValue,
@@ -23,6 +24,7 @@ use uuid::Uuid;
 
 use crate::entities::ItemView;
 use crate::game_mode::GameMode;
+use crate::shape;
 use crate::storage::{SavedInventory, SavedPlayer};
 
 /// Packets that may wait for one player before more are dropped.
@@ -433,16 +435,16 @@ impl Players {
         }
     }
 
-    /// Whether any player's body overlaps the block at `pos`, so a block
-    /// placed there would trap them.
-    pub fn occupies(&self, pos: BlockPos) -> bool {
+    /// Whether any player's body is inside the collision of `state` placed
+    /// at `pos`, so placing it there would trap them.
+    pub fn in_the_way(&self, pos: BlockPos, state: &BlockState) -> bool {
         self.online().values().any(|player| {
             let height = if player.sneaking {
                 SNEAKING_HEIGHT
             } else {
                 STANDING_HEIGHT
             };
-            body_overlaps(player.movement.feet(), height, pos)
+            shape::body_inside(player.movement.feet(), HALF_WIDTH, height, pos, state)
         })
     }
 
@@ -761,7 +763,7 @@ pub fn player_metadata(name: &str, sneaking: bool) -> EntityMetadata {
 }
 
 /// Half a player's width: their box is 0.6 blocks wide around their feet.
-const HALF_WIDTH: f32 = 0.3;
+pub const HALF_WIDTH: f32 = 0.3;
 
 /// Whether a player box standing on `feet`, `height` tall, overlaps the block
 /// at `pos`. Touching a face does not count, so standing on a block is fine.

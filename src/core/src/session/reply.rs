@@ -59,7 +59,13 @@ pub enum SessionEvent {
         pos: BlockPos,
         block: u32,
         replacing: Option<u32>,
+        /// The other half of a door, bed or tall flower: where it goes, the
+        /// block, and what it replaces there (air, or a plant it covers).
+        other_half: Option<(BlockPos, u32, u32)>,
     },
+    /// The player opened or closed the door, trapdoor or fence gate at
+    /// `pos`, looking at `yaw`.
+    Toggled { pos: BlockPos, yaw: f32 },
     /// The player swung their arm.
     Swing,
     /// The player started or stopped sneaking.

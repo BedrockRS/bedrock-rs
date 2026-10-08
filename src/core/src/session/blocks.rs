@@ -11,9 +11,11 @@ use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
 use crate::entities::ItemStack;
 use crate::game_mode::GameMode;
 use crate::items::items;
-use crate::placement::{self, Placing};
-use crate::players::{STANDING_HEIGHT, View, body_overlaps};
+use crate::placement::{self, Placing, Refusal};
+use crate::players::{HALF_WIDTH, SNEAKING_HEIGHT, STANDING_HEIGHT, View};
 use crate::server;
+use crate::shape;
+use crate::support;
 use crate::world::{MAX_Y, MIN_Y};
 
 use super::{Reply, Session, SessionEvent};
@@ -59,19 +61,51 @@ impl Session {
         if use_item.action == use_item_action::CLICK_AIR {
             return self.use_in_air();
         }
-        if use_item.action != use_item_action::CLICK_BLOCK || use_item.held_item.is_empty() {
+        if use_item.action != use_item_action::CLICK_BLOCK {
+            return Reply::default();
+        }
+        // Using a door, trapdoor or gate opens or closes it; sneaking places
+        // against it instead.
+        let clicked = use_item.block_position;
+        let opens = self
+            .world
+            .block_state(clicked)
+            .is_some_and(placement::openable);
+        if opens
+            && !self.sneaking
+            && !self.is_dead()
+            && self.game_mode != GameMode::Spectator
+            && self.within_reach(clicked)
+        {
+            return Reply {
+                events: vec![
+                    SessionEvent::Toggled {
+                        pos: clicked,
+                        yaw: self.movement.yaw,
+                    },
+                    SessionEvent::Swing,
+                ],
+                ..Reply::default()
+            };
+        }
+        if use_item.held_item.is_empty() {
             return Reply::default();
         }
         let target = use_item.target();
         match self.placed_block(&use_item, target) {
-            Ok((pos, state, replacing)) => {
-                tracing::debug!(player = %self.player, ?pos, block = %describe(&state), id = state.network_id(), "placing a block");
+            Ok(parts) => {
+                let (pos, state, replacing) = parts[0].clone();
+                tracing::debug!(player = %self.player, ?pos, block = %describe(&state), id = state.network_id(), parts = parts.len(), "placing a block");
+                let air = self.world.air();
                 let mut reply = Reply {
                     events: vec![
                         SessionEvent::PlacedBlock {
                             pos,
                             block: state.network_id(),
-                            replacing,
+                            replacing: (replacing != air).then_some(replacing),
+                            other_half: parts.get(1).map(|(pos, state, replacing)| {
+                                (*pos, state.network_id(), *replacing)
+                            }),
                         },
                         SessionEvent::Swing,
                     ],
@@ -92,60 +126,154 @@ impl Session {
             }
             // Whatever the reason, the client already shows its prediction,
             // next to the clicked block or in it (a slab it expected to
-            // double): both get what is really there, or they stay out of step.
+            // double, grass it covered), with any other half around it: all
+            // get what is really there, or they stay out of step.
             Err(reason) => {
                 tracing::debug!(player = %self.player, ?target, slot = use_item.hotbar_slot, %reason, "refusing a placement");
-                let clicked = use_item.block_position;
-                Reply::send(vec![
-                    server::block_update(target, self.world.block(target)).to_vec(),
-                    server::block_update(clicked, self.world.block(clicked)).to_vec(),
-                ])
+                // Second halves go above or beside, never below.
+                let mut shown = vec![target, clicked];
+                for face in 1..6 {
+                    let pos = placement::side(target, face);
+                    if !shown.contains(&pos) {
+                        shown.push(pos);
+                    }
+                }
+                Reply::send(
+                    shown
+                        .into_iter()
+                        .map(|pos| server::block_update(pos, self.world.block(pos)).to_vec())
+                        .collect(),
+                )
             }
         }
     }
 
-    /// Where this click places a block (next to the clicked one, or over a
-    /// half slab it doubles), the state the placement rules give it and the
-    /// block it replaces, or why it cannot be placed.
+    /// The blocks this click places: where each goes (next to the clicked
+    /// block, into a plant or snow it clicked, or over a half slab it
+    /// doubles), its state, and the block it replaces there. Two-block blocks
+    /// place both halves. Or why nothing can be placed.
     pub(super) fn placed_block(
         &self,
         use_item: &UseItem,
         target: BlockPos,
-    ) -> Result<(BlockPos, BlockState, Option<u32>), String> {
+    ) -> Result<Vec<(BlockPos, BlockState, u32)>, String> {
         let stack = self
             .inventory
             .hotbar(use_item.hotbar_slot)
             .filter(|stack| stack.item == use_item.held_item.network_id)
             .ok_or("the client holds something else")?;
+        let item = items().get(stack.item).ok_or("the held item is unknown")?;
+        // Clicking grass, snow and the like places into it, as if on top of
+        // the block below.
+        let clicked = use_item.block_position;
+        let into_clicked = self
+            .world
+            .block_state(clicked)
+            .is_some_and(support::replaceable);
+        let (target, face) = if into_clicked {
+            (clicked, support::UP)
+        } else {
+            (target, use_item.face)
+        };
         let item_state = items()
-            .get(stack.item)
-            .and_then(|item| item.block.as_ref())
-            .ok_or("the held item is not a block")?;
-        if let Some((pos, state, replacing)) = placement::slab_merge(
-            item_state,
-            use_item.block_position,
-            use_item.face,
-            &self.world,
-        ) {
-            if self.break_block(pos).is_none()
-                || body_overlaps(self.movement.feet(), STANDING_HEIGHT, pos)
-            {
+            .placed_block(item, (2..6).contains(&face))
+            .ok_or("the held item places no block")?;
+        if !into_clicked
+            && let Some((pos, state, replacing)) =
+                placement::slab_merge(&item_state, clicked, face, &self.world)
+        {
+            if self.break_block(pos).is_none() || self.body_inside(pos, &state) {
                 return Err("the slab to double is out of reach or the player is in it".into());
             }
-            return Ok((pos, state, Some(replacing)));
+            return Ok(vec![(pos, state, replacing)]);
         }
-        if !self.may_place(target) {
-            return Err("the spot is taken, out of reach or inside the player".into());
+        // What it is fixed to is the clicked face if that holds it, or else,
+        // as vanilla tries each way a block can go, the floor, a wall, or the
+        // ceiling around the same spot: a torch clicked onto the side of
+        // another torch stands on the floor beside it.
+        let fallbacks = [support::UP, 2, 3, 4, 5, support::DOWN];
+        let mut first_error = None;
+        for face in std::iter::once(face).chain(fallbacks.into_iter().filter(|f| *f != face)) {
+            match self.placed_parts(item, target, face, use_item) {
+                Ok(parts) => return Ok(parts),
+                Err(Unplaced::Here(reason)) => return Err(reason),
+                Err(Unplaced::Unheld(reason)) => {
+                    first_error.get_or_insert(reason);
+                }
+            }
         }
+        Err(first_error.unwrap_or_else(|| "nothing holds it there".into()))
+    }
+
+    /// The blocks `item` places at `target` fixed to face `face` of the block
+    /// beside it, or why not: either nothing can go there at all, or nothing
+    /// would hold it up that way.
+    fn placed_parts(
+        &self,
+        item: &crate::items::ItemType,
+        target: BlockPos,
+        face: u8,
+        use_item: &UseItem,
+    ) -> Result<Vec<(BlockPos, BlockState, u32)>, Unplaced> {
+        let item_state = items()
+            .placed_block(item, (2..6).contains(&face))
+            .ok_or_else(|| Unplaced::Here("the held item places no block".into()))?;
         let placing = Placing {
-            face: use_item.face,
+            face,
             click: use_item.clicked_position,
             pitch: self.movement.pitch,
             yaw: self.movement.yaw,
         };
-        placement::placed_state(item_state, target, &placing, &self.world)
-            .map(|state| (target, state, None))
-            .map_err(|err| err.to_string())
+        let parts =
+            placement::placed_parts(&item_state, target, &placing, &self.world).map_err(|err| {
+                match err {
+                    Refusal::OnCeiling | Refusal::WrongFace | Refusal::NoValidState => {
+                        Unplaced::Unheld(err.to_string())
+                    }
+                    err => Unplaced::Here(err.to_string()),
+                }
+            })?;
+        for (pos, state) in &parts {
+            if !self.may_place(*pos, state) {
+                return Err(Unplaced::Here(
+                    "a spot is taken, out of reach or inside the player".into(),
+                ));
+            }
+        }
+        // Each part stays up where it goes: torches on walls, doors on the
+        // floor, ladders on full blocks.
+        let placed = support::WithParts {
+            world: &self.world,
+            parts: &parts,
+        };
+        if let Some((pos, state)) = parts
+            .iter()
+            .find(|(pos, state)| !support::supported(state, *pos, &placed))
+        {
+            return Err(Unplaced::Unheld(format!(
+                "nothing would hold {} up at {pos:?}",
+                state.name
+            )));
+        }
+        // Beds also need the floor, though they stay once placed.
+        let bed = support::int(&parts[0].1, "head_piece_bit").is_some();
+        let floored = |pos: BlockPos| {
+            self.world
+                .block_state(placement::side(pos, support::DOWN))
+                .is_some_and(|below| support::sturdy(below, support::UP))
+        };
+        if bed && !parts.iter().all(|(pos, _)| floored(*pos)) {
+            return Err(Unplaced::Here(
+                "a bed needs the floor under both halves".into(),
+            ));
+        }
+        Ok(parts
+            .into_iter()
+            .map(|(pos, state)| {
+                let replacing = self.world.block(pos);
+                (pos, state, replacing)
+            })
+            .collect())
     }
 
     /// A swing the client animated: others see it too, unless it came from
@@ -164,15 +292,31 @@ impl Session {
         }
     }
 
-    /// Whether a block may go at `pos`: reachable, in a loaded chunk, into
-    /// air, and not inside the player placing it.
-    pub(super) fn may_place(&self, pos: BlockPos) -> bool {
-        if self.break_block(pos).is_none() || self.world.block(pos) != self.world.air() {
+    /// Whether the player's own body is inside the collision of `state` at
+    /// `pos`, from their latest input.
+    fn body_inside(&self, pos: BlockPos, state: &BlockState) -> bool {
+        let height = if self.sneaking {
+            SNEAKING_HEIGHT
+        } else {
+            STANDING_HEIGHT
+        };
+        shape::body_inside(self.movement.feet(), HALF_WIDTH, height, pos, state)
+    }
+
+    /// Whether `state` may go at `pos`: reachable, in a loaded chunk, into
+    /// air or something it replaces, and, if it blocks bodies, not inside
+    /// the player placing it.
+    pub(super) fn may_place(&self, pos: BlockPos, state: &BlockState) -> bool {
+        let free = self
+            .world
+            .block_state(pos)
+            .is_some_and(support::replaceable);
+        if self.break_block(pos).is_none() || !free {
             return false;
         }
         // A quick check against the placer's own box, from their latest
-        // input; `Server::place_block` checks every player's.
-        !body_overlaps(self.movement.feet(), STANDING_HEIGHT, pos)
+        // input; `Server::place_blocks` checks every player's.
+        !self.body_inside(pos, state)
     }
 
     /// A PlayerAction: creative clients report instant breaks this way too.
@@ -275,6 +419,14 @@ impl Session {
         reply.events.extend(self.held_event());
         reply
     }
+}
+
+/// Why a block cannot be placed one way.
+enum Unplaced {
+    /// Not there at all: the spot is taken or out of reach.
+    Here(String),
+    /// Not fixed to that face; another may hold it.
+    Unheld(String),
 }
 
 /// A block state for logs: `minecraft:oak_stairs[upside_down_bit=0,…]`.

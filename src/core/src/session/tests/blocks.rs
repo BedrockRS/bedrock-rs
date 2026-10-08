@@ -1,5 +1,16 @@
 use super::*;
 
+/// A refused placement shows the client what is really at the target, the
+/// clicked block, and above and beside the target, where a second half might
+/// be: six or seven blocks, as the clicked one is beside it or below.
+fn assert_rolled_back(reply: &Reply) {
+    let ids = ids(reply);
+    assert!(
+        (6..=7).contains(&ids.len()) && ids.iter().all(|id| *id == id::UPDATE_BLOCK),
+        "{ids:?}"
+    );
+}
+
 fn place(slot: i32, block_position: BlockPos, face: u8) -> Vec<u8> {
     let held_item =
         Inventory::with_hotbar(&TEST_KIT).content()[0].content[slot.clamp(0, 35) as usize];
@@ -32,6 +43,7 @@ fn places_hotbar_blocks_against_the_clicked_face() {
                 pos: BlockPos { x: 2, y: -60, z: 0 },
                 block: stone,
                 replacing: None,
+                other_half: None,
             },
             SessionEvent::Swing
         ]
@@ -85,6 +97,7 @@ fn placed_blocks_take_the_state_the_player_placed_them_in() {
             pos: BlockPos { x: 2, y: -60, z: 0 },
             block: stairs.network_id(),
             replacing: None,
+            other_half: None,
         }
     );
 
@@ -94,7 +107,7 @@ fn placed_blocks_take_the_state_the_player_placed_them_in() {
         .handle(&use_on_block(&session, 1, grass, 0, 0.0))
         .unwrap();
     assert!(reply.events.is_empty());
-    assert_eq!(ids(&reply), [id::UPDATE_BLOCK, id::UPDATE_BLOCK]);
+    assert_rolled_back(&reply);
 }
 
 #[test]
@@ -121,6 +134,7 @@ fn clicking_the_top_of_a_bottom_slab_doubles_it_in_place() {
             pos: slab_at,
             block: double.network_id(),
             replacing: Some(bottom.network_id()),
+            other_half: None,
         }
     );
 }
@@ -158,7 +172,7 @@ fn placing_uses_what_the_server_says_is_held() {
     let grass = BlockPos { x: 2, y: -61, z: 0 };
     let reply = session.handle(&place(0, grass, 1)).unwrap();
     assert!(reply.events.is_empty());
-    assert_eq!(ids(&reply), [id::UPDATE_BLOCK, id::UPDATE_BLOCK]);
+    assert_rolled_back(&reply);
 
     // Holding what the server has there, dirt, places dirt.
     let held = session.inventory().hotbar(0).unwrap().instance();
@@ -180,6 +194,7 @@ fn placing_uses_what_the_server_says_is_held() {
         pos: BlockPos { x: 2, y: -60, z: 0 },
         block: dirt,
         replacing: None,
+        other_half: None,
     }));
 }
 
@@ -210,11 +225,7 @@ fn refused_placements_are_undone_on_the_client() {
     let reply = session
         .handle(&place(0, BlockPos { x: 0, y: -61, z: 0 }, 1))
         .unwrap();
-    assert_eq!(
-        ids(&reply),
-        [id::UPDATE_BLOCK, id::UPDATE_BLOCK],
-        "the target and the clicked block"
-    );
+    assert_rolled_back(&reply);
 }
 
 #[test]
@@ -445,5 +456,150 @@ fn survival_players_only_pick_what_they_carry() {
     assert_eq!(
         ids(&session.handle(&pick(grass, false)).unwrap()),
         [id::PLAYER_HOTBAR]
+    );
+}
+
+#[test]
+fn doors_place_both_halves_and_open_unless_sneaking() {
+    let mut session = in_game_session();
+    session.inventory = Inventory::with_hotbar(&["minecraft:wooden_door", "minecraft:stone"]);
+    let grass = BlockPos { x: 2, y: -61, z: 0 };
+    let reply = session
+        .handle(&use_on_block(&session, 0, grass, 1, 1.0))
+        .unwrap();
+    let Some(SessionEvent::PlacedBlock {
+        pos,
+        block,
+        other_half: Some((upper_at, upper, _)),
+        ..
+    }) = reply.events.first().cloned()
+    else {
+        panic!("expected a door, got {:?}", reply.events);
+    };
+    let door_at = BlockPos { x: 2, y: -60, z: 0 };
+    assert_eq!(pos, door_at);
+    assert_eq!(upper_at, BlockPos { x: 2, y: -59, z: 0 });
+    session.world.set_block(pos, block);
+    session.world.set_block(upper_at, upper);
+
+    // Using it, even holding stone, opens it.
+    let reply = session
+        .handle(&use_on_block(&session, 1, door_at, 4, 0.5))
+        .unwrap();
+    assert!(matches!(
+        reply.events[0],
+        SessionEvent::Toggled { pos, .. } if pos == door_at
+    ));
+    // Sneaking places the stone against it instead.
+    session.sneaking = true;
+    let reply = session
+        .handle(&use_on_block(&session, 1, door_at, 4, 0.5))
+        .unwrap();
+    assert!(matches!(
+        reply.events[0],
+        SessionEvent::PlacedBlock { pos, .. } if pos == BlockPos { x: 1, y: -60, z: 0 }
+    ));
+}
+
+#[test]
+fn ladders_go_on_full_blocks_only_and_grass_is_placed_into() {
+    let mut session = in_game_session();
+    session.inventory = Inventory::with_hotbar(&["minecraft:ladder", "minecraft:stone"]);
+    let stone_at = BlockPos { x: 2, y: -60, z: 0 };
+    let stone = items().by_name("minecraft:stone").unwrap();
+    session
+        .world
+        .set_block(stone_at, stone.block_network_id.unwrap());
+    // On the stone's east face: a ladder.
+    let reply = session
+        .handle(&use_on_block(&session, 0, stone_at, 5, 0.5))
+        .unwrap();
+    let Some(SessionEvent::PlacedBlock { pos, block, .. }) = reply.events.first().cloned() else {
+        panic!("expected a ladder, got {:?}", reply.events);
+    };
+    session.world.set_block(pos, block);
+    // On that ladder's east face: refused, it would float.
+    let reply = session
+        .handle(&use_on_block(&session, 0, pos, 5, 0.5))
+        .unwrap();
+    assert!(reply.events.is_empty(), "{:?}", reply.events);
+
+    // Clicking short grass places into it, replacing it.
+    let grass_at = BlockPos { x: 4, y: -60, z: 0 };
+    let short_grass = crate::blocks::palette()
+        .upgrade(&BlockState::new("minecraft:short_grass"))
+        .unwrap()
+        .network_id();
+    session.world.set_block(grass_at, short_grass);
+    let reply = session
+        .handle(&use_on_block(&session, 1, grass_at, 4, 0.5))
+        .unwrap();
+    assert!(matches!(
+        reply.events[0],
+        SessionEvent::PlacedBlock { pos, replacing: Some(replaced), .. }
+            if pos == grass_at && replaced == short_grass
+    ));
+}
+
+#[test]
+fn a_torch_clicked_onto_a_torch_stands_beside_it_if_it_can() {
+    let mut session = in_game_session();
+    session.inventory = Inventory::with_hotbar(&["minecraft:torch", "minecraft:trapdoor"]);
+    let torch_at = BlockPos { x: 2, y: -60, z: 0 };
+    let standing = crate::blocks::palette()
+        .upgrade(
+            &BlockState::new("minecraft:torch")
+                .with("torch_facing_direction", StateValue::String("top".into())),
+        )
+        .unwrap();
+    session.world.set_block(torch_at, standing.network_id());
+    // Its east side: no wall to hang on, so it stands on the grass there.
+    let reply = session
+        .handle(&use_on_block(&session, 0, torch_at, 5, 0.5))
+        .unwrap();
+    let Some(SessionEvent::PlacedBlock { pos, block, .. }) = reply.events.first() else {
+        panic!("expected a torch, got {:?}", reply.events);
+    };
+    assert_eq!(*pos, BlockPos { x: 3, y: -60, z: 0 });
+    let placed = session.world.state_of(*block).unwrap();
+    assert_eq!(placed.name, "minecraft:torch");
+    assert_eq!(
+        crate::support::text(placed, "torch_facing_direction"),
+        Some("top")
+    );
+    // On top of the torch, nothing holds one: refused.
+    let reply = session
+        .handle(&use_on_block(&session, 0, torch_at, 1, 1.0))
+        .unwrap();
+    assert!(reply.events.is_empty(), "{:?}", reply.events);
+
+    // A trapdoor faces away from the player (looking south, yaw 0: it faces
+    // north), so it opens towards them: Dragonfly's 3 minus north's 0.
+    let grass = BlockPos { x: 2, y: -61, z: 2 };
+    let reply = session
+        .handle(&use_on_block(&session, 1, grass, 1, 1.0))
+        .unwrap();
+    let Some(SessionEvent::PlacedBlock { block, .. }) = reply.events.first() else {
+        panic!("expected a trapdoor, got {:?}", reply.events);
+    };
+    let trapdoor = session.world.state_of(*block).unwrap();
+    assert_eq!(crate::support::int(trapdoor, "direction"), Some(3));
+}
+
+#[test]
+fn players_cannot_place_what_would_trap_them_but_can_what_misses_them() {
+    let mut session = in_game_session();
+    session.inventory = Inventory::with_hotbar(&["minecraft:stone", "minecraft:torch"]);
+    // The player stands at the spawn, feet in the block above this grass.
+    let grass = BlockPos { x: 0, y: -61, z: 0 };
+    let reply = session.handle(&place(0, grass, 1)).unwrap();
+    assert!(reply.events.is_empty(), "stone would trap them");
+    let reply = session
+        .handle(&use_on_block(&session, 1, grass, 1, 1.0))
+        .unwrap();
+    assert!(
+        matches!(reply.events[0], SessionEvent::PlacedBlock { .. }),
+        "a torch at their feet is fine: {:?}",
+        reply.events
     );
 }

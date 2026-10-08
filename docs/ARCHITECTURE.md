@@ -728,6 +728,12 @@ DTLS, SCTP, and multi-segment messages both ways.
   - Largest stacks come from components where present, and otherwise from a table of
     suffixes and names in the script (tools and armour 1, pearls and signs 16, the rest
     64).
+  - A block item's block is the one the client shows for a tick when it places it,
+    until the server's answer arrives; vanilla's data gives walls neither a post nor
+    sides, which flashed into view, so wall items hold a lone wall, a post (found live
+    on 2026-10-08). The server sends each placed block once, already in its final
+    state, and the transport adds about 0.2 ms; a block whose shape depends on its
+    neighbours can still change shape a tick after the client shows it.
   - The creative inventory: 124 groups (category, name, icon) and 1,980 items, in
     vanilla's order. Creative network IDs count from 1. Education Edition items
     (elements, compounds and the like), which BedrockData's dump had, are not in
@@ -871,25 +877,97 @@ DTLS, SCTP, and multi-segment messages both ways.
 - **Block placing (implemented):** placing arrives in InventoryTransaction as a UseItem
   transaction with action ClickBlock; only that part is decoded.
   - The decode fails soft: an unreadable transaction is ignored.
-  - The block goes against the clicked face. It is the block of the server's stack in
-    the hotbar slot, which must be the item the client says it holds; non-block items
-    place nothing. Creative placing uses nothing up. Its state comes from the placement
-    rules (see Block states and placement). The target must be reachable, in a loaded
-    chunk, air, and not inside the placing player's own box (a quick check in the
-    session).
-  - `Server::place_block` refuses a block that overlaps **any** online player's box.
+  - The block goes against the clicked face, or into the clicked block if that is
+    replaceable (air, liquids, fire, short grass, ferns, dead bushes, vines, glow
+    lichen, roots, light blocks), as if on top of the block below. It is the block the
+    server's stack in the hotbar slot places, which must be the item the client says
+    it holds: a block item's own block, or for other items the block that picks as
+    them (`Items::placed_block`, built from the pick rules): doors, beds, cake,
+    cauldrons and hanging signs by their own name, signs and banners as standing or,
+    against a wall, wall blocks, seeds as their crop, redstone as wire, string as
+    tripwire, glow berries as cave vines, repeaters and comparators unpowered. A wall
+    form goes on walls for block items too (coral fans). Creative placing uses nothing
+    up. Its state comes from the placement rules (see Block states and placement).
+    Each block placed must go somewhere reachable, in a loaded chunk, replaceable, and
+    stay up (see Support), and none of its collision boxes (see Shapes) may be inside
+    the placing player's own body (a quick check in the session). Kelp and seagrass
+    only go into water.
+  - What a block is fixed to is the clicked face if that holds it; otherwise, as
+    vanilla tries each way a block can go, the same spot is tried on the floor, each
+    wall, then the ceiling, and the first that holds wins. A torch clicked onto the
+    side of a torch stands on the floor beside it, or is refused if nothing holds it
+    there (found live on 2026-10-08: torches stacked onto torches). Ladders, wall signs,
+    wall banners and tripwire hooks only go on walls.
+  - **Doors, trapdoors and fence gates** open and close when used (UseItem on them),
+    unless the player sneaks, which places against them instead; iron ones do not
+    (redstone does not exist yet). Both halves of a door move together, a gate swings
+    away from the player opening it (Dragonfly), and the `door.open`,
+    `trapdoor.close`, `fence_gate.open`, and so on sound plays.
+  - `Server::place_blocks` refuses a block whose collision boxes are inside **any**
+    online player's body; a torch or flower at someone's feet, or a fence post or pane
+    beside them, is fine.
+- **Shapes (implemented)** in `shape`: block collision boxes, by name and state as
+  vanilla shapes them, for whether a block may go where a player stands. Torches,
+  levers, buttons, plates, signs, banners, rails, redstone, plants, vines, frames and
+  doors have none; fences, walls, panes and bars a post plus arms to their
+  connections (1.5 tall for fences and walls); chains and rods a thin pillar along
+  their axis; closed fence gates a bar across, open ones none; trapdoors a 3/16 slab,
+  at the bottom, the top, or upright when open; slabs their half; ladders a 3/16 slab
+  against their wall; carpets, snow layers, beds, repeaters and other low blocks their
+  height; lanterns, candles, skulls, cake, cactus and chests a smaller box; anything
+  else solid, and stairs, a full block. A player's body is 0.6 wide and 1.8 tall (1.5
+  sneaking).
     `Players::occupies` uses a box 0.6 wide and 1.8 tall (1.5 while sneaking); touching a
     face is fine. A block inside another player traps them, and their client fights it
     with rapid snapping (found live on 2026-09-26).
-  - Otherwise it places only into air, checked under the world lock. It then sends
-    viewers an UpdateBlock and a LevelSoundEvent `place` (sounds are named by string in
-    2193).
+  - Otherwise each block goes in only where what it replaces still is, checked under
+    the world lock; the two halves of a door or bed go in together or not at all. It
+    then sends viewers an UpdateBlock for each and a LevelSoundEvent `place` (sounds
+    are named by string in 2193).
   - The client places a block before hearing back, so a refused placement is undone
-    whatever the reason (not a block, spot taken, no valid state, not supported yet):
-    the placer gets an UpdateBlock with what is really there, both where the block
-    would go and at the clicked block, where the client may have predicted a double
-    slab. Each placement and
-    refusal is logged at debug level with the state and reason.
+    whatever the reason (places nothing, spot taken, no valid state, nothing holding
+    it up): the placer gets an UpdateBlock with what is really there where the block
+    would go, at the clicked block, where the client may have predicted a double slab,
+    and above and beside the target, where it may have predicted a second half. Each
+    placement and refusal is logged at debug level with the state and reason.
+- **Support (implemented)** in `support`: what a block needs to stay where it is.
+  Without shape data, shapes are judged by name, as for connections: `solid` blocks
+  (fences and walls connect to them; plants and flowers are not), `full_cube`s (every
+  face sturdy) and `sturdy` faces (also a top slab's top, a bottom slab's bottom, and a
+  stairs block's back unless it is an outer corner).
+  - Ladders, buttons, tripwire hooks, wall torches, levers and amethyst need a sturdy
+    face behind them; wall signs, wall banners and item frames a solid block. Torches,
+    lanterns, candles and pressure plates stand on a sturdy top or a fence or wall post;
+    doors, rails, redstone wire, repeaters, comparators, snow and floor coral fans on a
+    sturdy top; carpets, cake and turtle eggs on anything; standing signs and banners
+    on a solid block. Hanging lanterns and signs, cave and weeping vines, spore
+    blossoms and hanging roots need the block above; pointed dripstone the block it
+    grows from; cocoa a jungle log; bells the block they stand on or hang from.
+  - Plants need their soil: flowers, grass, saplings and bushes grass or dirt-likes;
+    crops farmland; nether wart soul sand; fungi and roots nylium, soul soil or dirt;
+    dead bushes and dry grass sand, terracotta or dirt; azaleas, propagules and
+    dripleaves dirt or clay; mushrooms and leaf litter any full block; sugar cane sugar
+    cane, or dirt or sand with water beside it; cactus sand with nothing solid beside
+    it; bamboo bamboo, dirt, sand or gravel; lily pads and frogspawn water.
+  - Two-block blocks need their other half: a door's halves (the lower on a sturdy
+    floor), a tall flower's or tall grass's, a pitcher plant's or small dripleaf's, and
+    a bed's head and foot (which also need the floor when placed). Only one half drops
+    the item: the lower one, or the bed's foot.
+  - After every change (placing, breaking, opening), the six neighbours' connections
+    and shapes are recomputed; a neighbour that changes has its own neighbours
+    recomputed in turn, until nothing changes (a wall gaining a connection makes the
+    wall under it tall: found live on 2026-10-08, when stacked walls kept stale short
+    sides and posts until something beside them changed). Any neighbour no longer
+    supported breaks, with
+    particles, and drops its item if the `dotiledrops` game rule is on; its own
+    neighbours are checked next, so a column of hanging lanterns all falls. Breaking
+    either half of a two-block block breaks both, for one item. Broken blocks drop the
+    item that places them (a torch for a wall torch, a door for either half, seeds for
+    a crop), also only with `dotiledrops`.
+  - A test places every item that places a block (over 1,400) in typical setups (on
+    grass, farmland, sand, soul sand and stone, against a wall, under a ceiling, on a
+    jungle log, on sand by water): each must place, with every part held up, except
+    kelp, seagrass, lily pads and frogspawn, which need water.
 - **Block states and placement (implemented)** in `blocks` and `placement`.
   - `data/blocks.json` (from Dragonfly's 1.26.50 palette via `tools/block_data.py`)
     lists every block's states and their values: 1,477 blocks, 22,091 states, exactly
@@ -908,21 +986,46 @@ DTLS, SCTP, and multi-segment messages both ways.
     - `weirdo_direction` (stairs): the way the player looks (east 0, west 1, south 2,
       north 3); `upside_down_bit` and `minecraft:vertical_half` (slabs): the upper half
       when placed on a ceiling or the upper half of a side.
-    - `minecraft:cardinal_direction` (chests, furnaces, …): facing the player;
-      `direction`: the way the player looks (south 0, west 1, north 2, east 3);
-      `ground_sign_direction`: the player's yaw in sixteenths.
+    - `minecraft:cardinal_direction` (chests, furnaces, …): facing the player; doors
+      the way the player looks turned right (Dragonfly), with `door_hinge_bit` set
+      when a door is on their left so the two open as a pair; fence gates the way the
+      player looks. `direction`: the way the player looks (south 0, west 1, north 2,
+      east 3); cocoa faces its log, tripwire hooks and bells or grindstones on walls
+      face out of the wall; trapdoors face away from the player, so they open towards
+      them, numbered as Dragonfly does (3 minus its north 0, south 1, west 2, east 3,
+      which is PocketMine's 5 minus the face; found live on 2026-10-08, the legacy
+      numbering opened them away, a wrong guess at Dragonfly's order sideways).
+      Glazed terracotta only turns around the vertical, facing the player. `ground_sign_direction`: the player's yaw in sixteenths.
+    - `hanging`: lanterns, hanging signs and pointed dripstone hang when placed on a
+      ceiling (hanging signs do not stand on floors); `attachment` (bells, grindstones):
+      standing, hanging or side by the clicked face; `lever_direction`: the clicked face,
+      with the axis the player looks along on floors and ceilings;
+      `vine_direction_bits` (south 1, west 2, north 4, east 8) and
+      `multi_face_direction_bits` (glow lichen and the like): the face fixed to;
+      `coral_direction` (wall coral fans: west 0, east 1, north 2, south 3, as
+      PocketMine numbers it); `rail_direction`: along the look; `orientation`
+      (crafters): facing the player, with their top up; placed leaves are
+      `persistent_bit`; a lone big dripleaf is its head; dripstone is a `tip`. Hoppers
+      point into the clicked block, or down; stems keep pointing at no fruit.
     - `facing_direction` and `minecraft:facing_direction`: the clicked face for things
       that attach (ladders, end rods, lightning rods, amethyst, wall signs and banners,
-      tripwire hooks); otherwise towards the player, up or down when they look more than
+      tripwire hooks, buttons, item frames, skulls and heads, which do not hang from
+      ceilings); otherwise towards the player, up or down when they look more than
       45° down or up; observers the other way. `minecraft:block_face`: the clicked face.
     - `torch_facing_direction`: `top` on floors, otherwise opposite the clicked face;
       torches cannot hang from ceilings.
     - Stairs corners from the stairs in front and behind (Dragonfly's rules).
     - Connections: fences (wooden with wooden, nether brick with nether brick) connect
       to fences, fence gates and solid blocks; panes and iron bars to each other, walls
-      and solid blocks; walls to walls, panes, bars, fence gates and solid blocks, as
-      `short`, with a post unless they run straight through. Without shape data,
-      "solid" rules out a list of known non-full blocks.
+      and solid blocks; walls to walls, panes, bars, fence gates and solid blocks. As
+      Dragonfly does, a wall's connection is `tall` where the block above covers it (a
+      full block, the bottom of a slab or stairs, a wall or thin block connecting that
+      way) and otherwise `short`; it has a post unless it runs straight through, or
+      when a standing torch, lantern or sign, or another wall's post, is on top. Fence
+      gates between walls are lowered (`in_wall_bit`). Neighbours above and below are
+      updated too, so a block placed on a wall makes it tall (found live on
+      2026-10-08: a wall under a full block stopped short of it). Without shape data,
+      "solid" rules out a list of known non-full blocks (see Support).
     - Slabs double up as Dragonfly does: a slab placed on the open half of a matching
       slab (the top of a bottom one, the bottom of a top one), or into a spot a
       matching half slab fills, turns that slab into its double slab in place
@@ -930,9 +1033,11 @@ DTLS, SCTP, and multi-segment messages both ways.
       `…double_cut_copper_slab`). The palette pairs all 101 slabs. The merge is placed
       over the exact slab it replaces, and refused if a player is inside it. Breaking
       a double slab drops two slabs.
-    - Two-block-tall plants are refused for now; doors and beds are not block items.
-      Signs are not supported yet: they need block entities, their edit screen and
-      their standing, wall and hanging variants.
+    - Two-block blocks place both halves: doors and tall flowers and grass the upper
+      half above, beds the head in the direction the player looks; both must fit.
+      Signs, banners and beds are placed, but what block entities hold (sign text and
+      its edit screen, banner patterns, bed colours) waits for block entities, so beds
+      show the default colour.
   - After any block is placed or broken, the neighbours whose connections or corners
     depend on it are recomputed and sent to everyone with their chunks.
   - Breaking drops the item named like the block, whatever state it was in.

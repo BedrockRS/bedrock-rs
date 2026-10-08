@@ -17,6 +17,7 @@ pub const GAME_RULES_FILE: &str = "game_rules.json";
 /// A true-or-false game rule, by its vanilla name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
+    DoTileDrops,
     FallDamage,
     KeepInventory,
     NaturalRegeneration,
@@ -25,7 +26,8 @@ pub enum Rule {
 }
 
 impl Rule {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
+        Self::DoTileDrops,
         Self::FallDamage,
         Self::KeepInventory,
         Self::NaturalRegeneration,
@@ -36,6 +38,7 @@ impl Rule {
     /// The rule's vanilla name, as `/gamerule` takes it.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::DoTileDrops => "dotiledrops",
             Self::FallDamage => "falldamage",
             Self::KeepInventory => "keepinventory",
             Self::NaturalRegeneration => "naturalregeneration",
@@ -56,6 +59,9 @@ impl Rule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Values {
+    /// Whether broken blocks drop their item, and blocks that lose their
+    /// support pop off as one.
+    pub dotiledrops: bool,
     pub falldamage: bool,
     pub keepinventory: bool,
     pub naturalregeneration: bool,
@@ -67,6 +73,7 @@ pub struct Values {
 impl Default for Values {
     fn default() -> Self {
         Self {
+            dotiledrops: true,
             falldamage: true,
             keepinventory: false,
             naturalregeneration: true,
@@ -79,6 +86,7 @@ impl Default for Values {
 impl Values {
     pub fn get(&self, rule: Rule) -> bool {
         match rule {
+            Rule::DoTileDrops => self.dotiledrops,
             Rule::FallDamage => self.falldamage,
             Rule::KeepInventory => self.keepinventory,
             Rule::NaturalRegeneration => self.naturalregeneration,
@@ -89,6 +97,7 @@ impl Values {
 
     fn slot(&mut self, rule: Rule) -> &mut bool {
         match rule {
+            Rule::DoTileDrops => &mut self.dotiledrops,
             Rule::FallDamage => &mut self.falldamage,
             Rule::KeepInventory => &mut self.keepinventory,
             Rule::NaturalRegeneration => &mut self.naturalregeneration,
@@ -209,7 +218,9 @@ mod tests {
         assert_eq!(Rule::from_name("dofiretick"), None);
         let rules = Values::default().packet_rules();
         assert_eq!(rules.len(), Rule::ALL.len());
-        assert_eq!(rules[1].name, "keepinventory");
-        assert_eq!(rules[1].value, GameRuleValue::Bool(false));
+        assert_eq!(rules[0].name, "dotiledrops");
+        assert_eq!(rules[0].value, GameRuleValue::Bool(true));
+        assert_eq!(rules[2].name, "keepinventory");
+        assert_eq!(rules[2].value, GameRuleValue::Bool(false));
     }
 }

@@ -326,12 +326,11 @@ impl Link<'_> {
                 pos,
                 block,
                 replacing,
+                other_half,
             } => {
-                let placed = match replacing {
-                    Some(old) => server.place_block_over(pos, block, old),
-                    None => server.place_block(pos, block),
-                };
-                if placed {
+                let mut parts = vec![(pos, block, replacing.unwrap_or(server.world.air()))];
+                parts.extend(other_half);
+                if server.place_blocks(&parts) {
                     if let Some(player) = &self.plugin_player {
                         server
                             .plugins
@@ -340,6 +339,15 @@ impl Link<'_> {
                 } else {
                     // Someone may have filled the spot since it was checked;
                     // undo the client's prediction.
+                    for (pos, _, _) in parts {
+                        let _ = self
+                            .outbound
+                            .try_send(server::block_update(pos, server.world.block(pos)));
+                    }
+                }
+            }
+            SessionEvent::Toggled { pos, yaw } => {
+                if !server.toggle_block(pos, yaw) {
                     let _ = self
                         .outbound
                         .try_send(server::block_update(pos, server.world.block(pos)));

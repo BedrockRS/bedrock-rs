@@ -145,6 +145,9 @@ pub struct Session {
     view: ChunkView,
     /// Whether the player is flying, as their client last said.
     flying: bool,
+    /// Whether the player is sneaking, which places blocks against doors
+    /// rather than opening them.
+    sneaking: bool,
     /// Where the player is, as last reported.
     movement: Movement,
     /// What the player carries; empty until a saved one is loaded.
@@ -203,6 +206,7 @@ impl Session {
             },
             view: ChunkView::new(),
             flying: false,
+            sneaking: false,
             inventory: Inventory::default(),
             skin: None,
             held_slot: 0,

@@ -6,7 +6,7 @@
 //! ItemRegistry packet says, so older data puts items in the wrong groups.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -79,6 +79,16 @@ pub struct Items {
     creative: Vec<(CreativeEntry, u32)>,
     /// The items the creative inventory offers, by network ID.
     in_creative: HashSet<i16>,
+    /// The blocks items place, by network ID, built on first use.
+    places: OnceLock<HashMap<i16, Places>>,
+}
+
+/// The blocks an item places: on the floor (or anywhere), and against a wall
+/// if it has a wall form (wall signs, wall banners, wall coral fans).
+#[derive(Debug, Default)]
+struct Places {
+    floor: Option<BlockState>,
+    wall: Option<BlockState>,
 }
 
 /// The registry, loaded on first use.
@@ -97,6 +107,11 @@ impl Items {
         self.by_name.get(name).map(|&index| &self.types[index])
     }
 
+    /// Every item.
+    pub fn iter(&self) -> impl Iterator<Item = &ItemType> {
+        self.types.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.types.len()
     }
@@ -109,6 +124,66 @@ impl Items {
     pub fn creative(&self, id: u32) -> Option<CreativeEntry> {
         let index = usize::try_from(id.checked_sub(1)?).ok()?;
         self.creative.get(index).map(|(entry, _)| *entry)
+    }
+
+    /// The block `item` places, against a wall (`on_wall`) or otherwise: a
+    /// block item's own block, or for other items the block that picks as
+    /// them (wheat seeds plant wheat, a sign is a standing or wall sign). Its
+    /// wall form, if it has one, goes on walls.
+    pub fn placed_block(&self, item: &ItemType, on_wall: bool) -> Option<BlockState> {
+        let places = self
+            .places
+            .get_or_init(|| self.build_places())
+            .get(&item.network_id);
+        let wall = places.and_then(|places| places.wall.clone());
+        if on_wall && wall.is_some() {
+            return wall;
+        }
+        item.block
+            .clone()
+            .or_else(|| places.and_then(|places| places.floor.clone()))
+            .or(wall)
+    }
+
+    /// Every item's blocks, from the blocks that pick as it.
+    fn build_places(&self) -> HashMap<i16, Places> {
+        let mut by_item: HashMap<i16, Vec<&str>> = HashMap::new();
+        for block in palette().names() {
+            if let Some(item) = self.pick(block) {
+                by_item.entry(item.network_id).or_default().push(block);
+            }
+        }
+        let state = |name: &str| palette().upgrade(&BlockState::new(name));
+        by_item
+            .into_iter()
+            .map(|(id, mut blocks)| {
+                blocks.sort_unstable();
+                let item = self.get(id).expect("picked items exist");
+                let is_wall = |block: &str| block.contains("wall_");
+                let wall = blocks
+                    .iter()
+                    .find(|block| is_wall(block))
+                    .and_then(|block| state(block));
+                // A block of the item's own name, or else its plain form: not
+                // lit, powered or bearing fruit.
+                let floor = blocks
+                    .iter()
+                    .find(|block| **block == item.name)
+                    .or_else(|| {
+                        blocks.iter().find(|block| {
+                            let name = block.trim_start_matches("minecraft:");
+                            !is_wall(block)
+                                && !["lit_", "unlit_", "powered_"]
+                                    .iter()
+                                    .any(|p| name.starts_with(p))
+                                && !name.contains("_with_berries")
+                                && !name.ends_with("candle_cake")
+                        })
+                    })
+                    .and_then(|block| state(block));
+                (id, Places { floor, wall })
+            })
+            .collect()
     }
 
     /// The item picking `block` (a block name) gives, as vanilla's pick block
@@ -216,9 +291,14 @@ impl Items {
             creative_groups: Vec::new(),
             creative: Vec::new(),
             in_creative: HashSet::new(),
+            places: OnceLock::new(),
         };
         for raw in data.items {
-            let block = raw.block.map(RawBlock::state).transpose()?;
+            let block = raw
+                .block
+                .map(RawBlock::state)
+                .transpose()?
+                .map(standing_alone);
             let components = raw
                 .components
                 .map(|encoded| STANDARD.decode(encoded).map_err(|err| err.to_string()))
@@ -321,6 +401,23 @@ pub fn equip_sound(name: &str) -> &'static str {
         .iter()
         .find(|(prefix, _)| name.starts_with(prefix))
         .map_or("armor.equip_generic", |(_, sound)| sound)
+}
+
+/// A block item's block as it stands alone. The client shows a block it
+/// places as the held item's block until the server answers, a tick later;
+/// vanilla's creative data gives walls neither a post nor sides, a shape no
+/// placed wall has, which flashed into view (found live on 2026-10-08). A
+/// lone wall is a post.
+fn standing_alone(state: BlockState) -> BlockState {
+    let mut state = state;
+    if let Some((_, post)) = state
+        .states
+        .iter_mut()
+        .find(|(key, _)| key == "wall_post_bit")
+    {
+        *post = StateValue::Byte(1);
+    }
+    state
 }
 
 /// Blocks picking gives nothing for, as in vanilla.
@@ -480,6 +577,20 @@ mod tests {
                     .with("pillar_axis", StateValue::String("y".into()))
             )
         );
+    }
+
+    #[test]
+    fn wall_items_hold_a_lone_wall() {
+        let wall = items().by_name("minecraft:cobblestone_wall").unwrap();
+        let post = wall
+            .block
+            .as_ref()
+            .unwrap()
+            .states
+            .iter()
+            .find(|(key, _)| key == "wall_post_bit")
+            .map(|(_, value)| value.clone());
+        assert_eq!(post, Some(StateValue::Byte(1)));
     }
 
     #[test]

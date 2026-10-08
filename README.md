@@ -52,7 +52,9 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 ### Milestone 3: Build ✅
 
 - [x] Block breaking and placing, with reach and overlap checks
-- [x] Full 1.26.50 block palette with placement rules (facing, slabs, stairs, connections)
+- [x] Full 1.26.50 block palette with placement rules (facing, slabs, stairs, connections, tall walls)
+- [x] Every block and block-placing item can be placed: doors, beds and tall flowers as two blocks, signs, seeds, redstone and the like
+- [x] Support: ladders, torches, plants and the like need something to hold them, and pop off without it
 - [x] Mojang's JSON-defined vanilla blocks (wool and concrete slabs and stairs, red shrub, shelf mushroom)
 - [x] World persistence (compressed chunk files, versioned format)
 - [x] Player persistence (position, rotation, flying state, inventory, game mode)
@@ -88,10 +90,11 @@ BedrockRS is in **early development**. A vanilla 26.51 client can join, build, c
 - [x] Fall damage and the void, with vanilla's numbers
 - [x] Death screen, death messages, drops, and respawning at the world spawn
 - [x] Regeneration (the world is peaceful for now)
-- [x] Game rules: `falldamage`, `keepinventory`, `naturalregeneration`, `showcoordinates`, `showdeathmessages`
+- [x] Game rules: `dotiledrops`, `falldamage`, `keepinventory`, `naturalregeneration`, `showcoordinates`, `showdeathmessages`
 - [ ] Difficulty, hunger and food
 - [ ] Combat (PvP) and armour
-- [ ] Block interactions
+- [x] Opening doors, trapdoors and fence gates
+- [ ] Other block interactions
 - [ ] Mobs and entity AI
 - [ ] Vanilla biome data
 

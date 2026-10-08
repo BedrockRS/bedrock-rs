@@ -1,9 +1,11 @@
 //! State every session shares, and what plugins ask of it.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bedrockrs_plugins::{Action, Dispatcher};
+use bedrockrs_protocol::block::BlockState;
 use bedrockrs_protocol::packet::Encode as _;
 use bedrockrs_protocol::packets::{LevelEvent, LevelSoundEvent, UpdateBlock};
 use bedrockrs_protocol::types::{BlockPos, ChunkPos, Vec3};
@@ -24,6 +26,7 @@ use crate::ops::Operators;
 use crate::placement;
 use crate::players::Players;
 use crate::storage::SavedPlayer;
+use crate::support;
 use crate::world::World;
 
 /// Ticks between saves of changed chunks: every 5 seconds.
@@ -179,11 +182,38 @@ impl Server {
         }
     }
 
-    /// Replaces the block at `pos` with air. Every player whose client has
-    /// that chunk sees the change and the breaking particles, and hears it,
-    /// and, if `game_mode` collects broken blocks, the block's item pops out.
-    /// Breaking air does nothing. Returns the block broken, if any.
+    /// Replaces the block at `pos` with air, with the other half of a door,
+    /// bed or tall flower. Every player whose client has that chunk sees the
+    /// change and the breaking particles, and hears it, and, if `game_mode`
+    /// collects broken blocks and `dotiledrops` is on, the block's item pops
+    /// out, once. Blocks that stood on or hung from it pop off too. Breaking
+    /// air does nothing. Returns the block broken, if any.
     pub fn break_block(&self, pos: BlockPos, game_mode: GameMode) -> Option<u32> {
+        let broken = self.remove_block(pos)?;
+        let state = self.world.state_of(broken).cloned();
+        let mut changed = vec![pos];
+        if let Some(state) = &state
+            && let Some((other_pos, _)) = support::partner(state, pos)
+            && self
+                .world
+                .block_state(other_pos)
+                .is_some_and(|other| other.name == state.name)
+            && self.remove_block(other_pos).is_some()
+        {
+            changed.push(other_pos);
+        }
+        if game_mode.drops_broken_blocks()
+            && let Some(state) = &state
+        {
+            self.drop_block(pos, state);
+        }
+        self.settle(&changed);
+        Some(broken)
+    }
+
+    /// Sets `pos` to air for everyone with its chunk, with the breaking
+    /// particles and sound. Returns the block that was there, if any.
+    fn remove_block(&self, pos: BlockPos) -> Option<u32> {
         let broken = self.world.replace_block(pos, self.world.air())?;
         let chunk = ChunkPos::of_block(pos);
         self.players
@@ -195,33 +225,123 @@ impl Server {
         };
         self.players
             .send_to_viewers(chunk, &Bytes::from(effect.encode()));
-        self.update_neighbours(pos);
-        if !game_mode.drops_broken_blocks() {
-            return Some(broken);
-        }
-        // The block's own item, whatever state it was in; a double slab is
-        // two of its slab.
-        let name = self.world.state_of(broken).map(|state| state.name.as_str());
-        let (name, count) = match name.and_then(|name| palette().single_slab(name)) {
-            Some(slab) => (Some(slab), 2),
-            None => (name, 1),
-        };
-        let item = name
-            .and_then(|name| items().by_name(name))
-            .filter(|item| item.block.is_some());
-        if let Some(item) = item {
-            let entity_id = self.players.allocate_entity_id();
-            let (position, velocity) = entities::block_drop(pos, entity_id ^ self.current_tick());
-            let stack = ItemStack {
-                item: item.network_id,
-                count,
-                metadata: 0,
-                nbt: None,
-            };
-            self.items
-                .spawn(entity_id, stack, position, velocity, entities::PICKUP_DELAY);
-        }
         Some(broken)
+    }
+
+    /// Pops the item of a broken block out at `pos`, if `dotiledrops` is on:
+    /// the item that places it (a door for either half, seeds for a crop, a
+    /// torch for a wall torch); a double slab is two of its slab.
+    fn drop_block(&self, pos: BlockPos, state: &BlockState) {
+        if !self.game_rules.values().dotiledrops {
+            return;
+        }
+        let (item, count) = match palette().single_slab(&state.name) {
+            Some(slab) => (items().by_name(slab), 2),
+            None => (items().pick(&state.name), 1),
+        };
+        let Some(item) = item else { return };
+        let entity_id = self.players.allocate_entity_id();
+        let (position, velocity) = entities::block_drop(pos, entity_id ^ self.current_tick());
+        let stack = ItemStack {
+            item: item.network_id,
+            count,
+            metadata: 0,
+            nbt: None,
+        };
+        self.items
+            .spawn(entity_id, stack, position, velocity, entities::PICKUP_DELAY);
+    }
+
+    /// After the blocks at `changed` changed: their neighbours' connections
+    /// and shapes follow, and neighbours left without support (a torch whose
+    /// wall is gone, the top of a door whose bottom broke) pop off, dropping
+    /// their item, and so on outwards.
+    fn settle(&self, changed: &[BlockPos]) {
+        let mut queue: VecDeque<BlockPos> = changed.iter().copied().collect();
+        // A long ladder or tall cactus pops block by block; a bound keeps a
+        // mistake in the rules from running away.
+        let mut budget = 4096;
+        while let Some(pos) = queue.pop_front() {
+            // A neighbour whose shape changed changes what its own neighbours
+            // should be in turn: a wall gaining a connection makes the wall
+            // under it taller (found live on 2026-10-08).
+            for changed in self.update_neighbours(pos) {
+                if budget == 0 {
+                    tracing::warn!(?changed, "stopped updating neighbouring blocks");
+                    return;
+                }
+                budget -= 1;
+                queue.push_back(changed);
+            }
+            for face in 0..6 {
+                let neighbour = placement::side(pos, face);
+                let Some(state) = self.world.block_state(neighbour).cloned() else {
+                    continue;
+                };
+                if state.name == "minecraft:air"
+                    || support::supported(&state, neighbour, &*self.world)
+                {
+                    continue;
+                }
+                if budget == 0 {
+                    tracing::warn!(?neighbour, "stopped popping unsupported blocks");
+                    return;
+                }
+                budget -= 1;
+                if self.remove_block(neighbour).is_some() {
+                    if support::drops_item(&state) {
+                        self.drop_block(neighbour, &state);
+                    }
+                    queue.push_back(neighbour);
+                }
+            }
+        }
+    }
+
+    /// Opens or closes the door, trapdoor or fence gate at `pos` for a player
+    /// looking at `yaw`, with both halves of a door, and the sound of it.
+    /// Returns whether there was one to open.
+    pub fn toggle_block(&self, pos: BlockPos, yaw: f32) -> bool {
+        let Some(state) = self.world.block_state(pos).cloned() else {
+            return false;
+        };
+        if !placement::openable(&state) {
+            return false;
+        }
+        let toggled = placement::toggled(&state, yaw);
+        let mut changes = vec![(pos, toggled.clone())];
+        if let Some((other_pos, _)) = support::partner(&state, pos)
+            && let Some(other) = self.world.block_state(other_pos)
+            && other.name == state.name
+        {
+            changes.push((other_pos, placement::toggled(other, yaw)));
+        }
+        for (at, new) in &changes {
+            let block = new.network_id();
+            if self.world.set_block(*at, block) {
+                self.players
+                    .send_to_viewers(ChunkPos::of_block(*at), &block_update(*at, block));
+            }
+        }
+        let name = support::short(&state.name);
+        let kind = if name.ends_with("trapdoor") {
+            "trapdoor"
+        } else if name.ends_with("fence_gate") {
+            "fence_gate"
+        } else {
+            "door"
+        };
+        let open = support::int(&toggled, "open_bit") == Some(1);
+        let sound = LevelSoundEvent {
+            sound: format!("{kind}.{}", if open { "open" } else { "close" }),
+            position: centre(pos),
+            data: toggled.network_id() as i32,
+        };
+        self.players
+            .send_to_viewers(ChunkPos::of_block(pos), &Bytes::from(sound.encode()));
+        let positions: Vec<BlockPos> = changes.iter().map(|(at, _)| *at).collect();
+        self.settle(&positions);
+        true
     }
 
     /// Throws items a player dropped the way they look.
@@ -252,38 +372,52 @@ impl Server {
     /// placed. Returns whether it was placed; the caller undoes a refused
     /// placement the client already predicted.
     pub fn place_block(&self, pos: BlockPos, block: u32) -> bool {
-        self.put_block(pos, block, None)
+        self.place_blocks(&[(pos, block, self.world.air())])
     }
 
     /// Like [`Server::place_block`], but over `replacing` rather than air, as
     /// when a slab becomes a double slab.
     pub fn place_block_over(&self, pos: BlockPos, block: u32, replacing: u32) -> bool {
-        self.put_block(pos, block, Some(replacing))
+        self.place_blocks(&[(pos, block, replacing)])
     }
 
-    fn put_block(&self, pos: BlockPos, block: u32, replacing: Option<u32>) -> bool {
-        // A block inside a player traps them, and their client fights it.
-        if self.players.occupies(pos) {
-            return false;
-        }
-        let placed = match replacing {
-            Some(expected) => self.world.replace_exact(pos, expected, block),
-            None => self.world.place_block(pos, block),
+    /// Places blocks that go in together, such as the two halves of a door:
+    /// each `(pos, block, replacing)` goes where `replacing` (air, or a plant
+    /// it covers) still is, with no player's body in the way, or none does.
+    pub fn place_blocks(&self, parts: &[(BlockPos, u32, u32)]) -> bool {
+        // A block inside a player traps them, and their client fights it; a
+        // torch at their feet, or a fence post beside them, is fine.
+        let in_the_way = |(pos, block, _): &(BlockPos, u32, u32)| {
+            self.world
+                .state_of(*block)
+                .is_some_and(|state| self.players.in_the_way(*pos, state))
         };
-        if !placed {
+        if parts.iter().any(in_the_way) {
             return false;
         }
-        let chunk = ChunkPos::of_block(pos);
-        self.players
-            .send_to_viewers(chunk, &block_update(pos, block));
+        for (done, (pos, block, replacing)) in parts.iter().enumerate() {
+            if !self.world.replace_exact(*pos, *replacing, *block) {
+                // Someone got there first: undo the parts already in.
+                for (pos, block, replacing) in &parts[..done] {
+                    self.world.replace_exact(*pos, *block, *replacing);
+                }
+                return false;
+            }
+        }
+        for (pos, block, _) in parts {
+            self.players
+                .send_to_viewers(ChunkPos::of_block(*pos), &block_update(*pos, *block));
+        }
+        let (pos, block, _) = parts[0];
         let sound = LevelSoundEvent {
             sound: LevelSoundEvent::PLACE.into(),
             position: centre(pos),
             data: block as i32,
         };
         self.players
-            .send_to_viewers(chunk, &Bytes::from(sound.encode()));
-        self.update_neighbours(pos);
+            .send_to_viewers(ChunkPos::of_block(pos), &Bytes::from(sound.encode()));
+        let positions: Vec<BlockPos> = parts.iter().map(|(pos, _, _)| *pos).collect();
+        self.settle(&positions);
         true
     }
 
@@ -302,9 +436,10 @@ impl Server {
     }
 
     /// Recomputes the blocks around `pos` whose connections or shape depend
-    /// on it (fences, panes, bars, walls, stairs corners), and shows the
-    /// changes to everyone who has those chunks.
-    fn update_neighbours(&self, pos: BlockPos) {
+    /// on it, shows the changes to everyone who has those chunks, and
+    /// returns where blocks changed.
+    fn update_neighbours(&self, pos: BlockPos) -> Vec<BlockPos> {
+        let mut changed = Vec::new();
         for (neighbour, state) in placement::neighbour_updates(pos, &self.world) {
             let block = state.network_id();
             if self.world.set_block(neighbour, block) {
@@ -312,8 +447,10 @@ impl Server {
                     ChunkPos::of_block(neighbour),
                     &block_update(neighbour, block),
                 );
+                changed.push(neighbour);
             }
         }
+        changed
     }
 
     /// Carries out one plugin action.
@@ -437,7 +574,10 @@ mod tests {
     use bedrockrs_protocol::packets::DisconnectReason;
     use uuid::Uuid;
 
+    use bedrockrs_protocol::block::StateValue;
+
     use super::*;
+    use crate::game_rules;
     use crate::players::{EYE_HEIGHT, Joining, Movement, Profile, View};
     use crate::world::World;
 
@@ -522,6 +662,157 @@ mod tests {
         // Air has no item.
         server.break_block(grass, GameMode::Survival);
         assert_eq!(server.items.count(), 1);
+    }
+
+    fn state(name: &str, states: &[(&str, StateValue)]) -> BlockState {
+        let mut state = palette()
+            .upgrade(&BlockState::new(format!("minecraft:{name}")))
+            .unwrap();
+        for (key, value) in states {
+            let (_, slot) = state.states.iter_mut().find(|(k, _)| k == key).unwrap();
+            *slot = value.clone();
+        }
+        state
+    }
+
+    fn test_server() -> Server {
+        Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        )
+    }
+
+    #[test]
+    fn blocks_left_without_support_pop_off() {
+        let server = test_server();
+        let wall = BlockPos { x: 3, y: -55, z: 3 };
+        let ladder_at = BlockPos { x: 3, y: -55, z: 4 };
+        let stone = state("stone", &[]).network_id();
+        // Facing south, fixed to the stone on its north.
+        let ladder = state("ladder", &[("facing_direction", StateValue::Int(3))]).network_id();
+        assert!(server.place_block(wall, stone));
+        assert!(server.place_block(ladder_at, ladder));
+
+        // Even a creative break pops the ladder, as an item.
+        server.break_block(wall, GameMode::Creative);
+        assert_eq!(server.world.block(ladder_at), server.world.air());
+        assert_eq!(server.items.count(), 1);
+
+        // Without tile drops, it pops and drops nothing.
+        server.game_rules.set(game_rules::Rule::DoTileDrops, false);
+        assert!(server.place_block(wall, stone));
+        assert!(server.place_block(ladder_at, ladder));
+        server.break_block(wall, GameMode::Survival);
+        assert_eq!(server.world.block(ladder_at), server.world.air());
+        assert_eq!(server.items.count(), 1, "nothing new");
+    }
+
+    #[test]
+    fn doors_break_open_and_close_as_one() {
+        let server = test_server();
+        let lower_at = BlockPos { x: 3, y: -60, z: 3 };
+        let upper_at = BlockPos { x: 3, y: -59, z: 3 };
+        let lower = state("wooden_door", &[]);
+        let upper = state("wooden_door", &[("upper_block_bit", StateValue::Byte(1))]);
+        let air = server.world.air();
+        let place = || {
+            server.place_blocks(&[
+                (lower_at, lower.network_id(), air),
+                (upper_at, upper.network_id(), air),
+            ])
+        };
+        assert!(place());
+
+        // Opening either half opens both.
+        assert!(server.toggle_block(upper_at, 0.0));
+        let opened = |pos| {
+            let state = server.world.block_state(pos).unwrap();
+            support::int(state, "open_bit") == Some(1)
+        };
+        assert!(opened(lower_at) && opened(upper_at));
+
+        // Breaking the top breaks the bottom, for one door.
+        server.break_block(upper_at, GameMode::Survival);
+        assert_eq!(server.world.block(lower_at), air);
+        assert_eq!(server.items.count(), 1);
+
+        // Taking the floor away pops it, for one door again.
+        assert!(place());
+        server.break_block(BlockPos { x: 3, y: -61, z: 3 }, GameMode::Creative);
+        assert_eq!(server.world.block(lower_at), air);
+        assert_eq!(server.world.block(upper_at), air);
+        assert_eq!(server.items.count(), 2);
+    }
+
+    #[test]
+    fn stacked_walls_settle_whatever_the_order() {
+        // Pillars three high, and between them walls two high and three
+        // wide, placed bottom row first, then top row, left to right.
+        let server = test_server();
+        let place = |x: i32, y: i32, name: &str| {
+            let item = items().by_name(name).unwrap().block.clone().unwrap();
+            let placing = crate::placement::Placing {
+                face: 1,
+                click: Vec3 {
+                    x: 0.5,
+                    y: 1.0,
+                    z: 0.5,
+                },
+                pitch: 10.0,
+                yaw: 0.0,
+            };
+            let pos = BlockPos { x, y, z: 0 };
+            let state =
+                crate::placement::placed_state(&item, pos, &placing, &server.world).unwrap();
+            assert!(
+                server.place_block(pos, state.network_id()),
+                "{name} at {pos:?}"
+            );
+        };
+        for y in -60..=-58 {
+            place(0, y, "minecraft:cobblestone");
+            place(4, y, "minecraft:cobblestone");
+        }
+        for y in [-60, -59] {
+            for x in 1..=3 {
+                place(x, y, "minecraft:cobblestone_wall");
+            }
+        }
+        // Every wall is as its neighbours make it: nothing left to update.
+        for y in [-60, -59] {
+            for x in 1..=3 {
+                let pos = BlockPos { x, y, z: 0 };
+                assert!(
+                    crate::placement::neighbour_updates(
+                        BlockPos { x, y: y + 1, z: 0 },
+                        &server.world
+                    )
+                    .iter()
+                    .chain(&crate::placement::neighbour_updates(
+                        BlockPos { x: x + 1, y, z: 0 },
+                        &server.world
+                    ))
+                    .all(|(at, _)| *at != pos),
+                    "{pos:?} is stale: {:?}",
+                    server.world.block_state(pos)
+                );
+            }
+        }
+        // The bottom row, under walls running the same way, is tall.
+        let bottom = server
+            .world
+            .block_state(BlockPos { x: 1, y: -60, z: 0 })
+            .unwrap();
+        assert_eq!(
+            support::text(bottom, "wall_connection_type_east"),
+            Some("tall")
+        );
+        assert_eq!(
+            support::text(bottom, "wall_connection_type_west"),
+            Some("tall")
+        );
+        assert_eq!(support::int(bottom, "wall_post_bit"), Some(0));
     }
 
     #[test]
